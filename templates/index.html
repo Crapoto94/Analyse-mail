@@ -50,6 +50,20 @@
                             </div>
                         </div>
                     </div>
+                    <div class="row text-center mb-3">
+                        <div class="col">
+                            <div class="stat-card p-2 bg-light">
+                                <h6>{{ stats[boite.id].nb_ivry }}</h6>
+                                <small class="text-success">@ivry94.fr</small>
+                            </div>
+                        </div>
+                        <div class="col">
+                            <div class="stat-card p-2 bg-light">
+                                <h6>{{ stats[boite.id].nb_external }}</h6>
+                                <small class="text-warning">Extérieur</small>
+                            </div>
+                        </div>
+                    </div>
                     <div class="d-grid gap-2">
                         <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-outline-primary btn-sm">
                             <i class="bi bi-eye"></i> Voir les détails

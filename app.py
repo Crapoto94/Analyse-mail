@@ -157,11 +157,16 @@ def index():
     stats = {}
     for b in boites:
         bid = b['id']
+        messages = conn.execute('SELECT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
+        nb_ivry = sum(1 for m in messages if '@ivry94.fr' in m['recipient_address'].lower())
+        nb_external = len(messages) - nb_ivry
         stats[bid] = {
-            'nb_messages': conn.execute('SELECT COUNT(*) as c FROM messages WHERE boite_id=?', (bid,)).fetchone()['c'],
+            'nb_messages': len(messages),
             'nb_recipients': conn.execute('SELECT COUNT(DISTINCT recipient_address) as c FROM messages WHERE boite_id=?', (bid,)).fetchone()['c'],
             'nb_ips': conn.execute('SELECT COUNT(DISTINCT from_ip) as c FROM messages WHERE boite_id=? AND from_ip!=""', (bid,)).fetchone()['c'],
-            'statuts': dict(conn.execute('SELECT status, COUNT(*) as c FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall())
+            'statuts': dict(conn.execute('SELECT status, COUNT(*) as c FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall()),
+            'nb_ivry': nb_ivry,
+            'nb_external': nb_external
         }
     conn.close()
     return render_template('index.html', boites=boites, stats=stats)
@@ -594,4 +599,10 @@ def send_emails_to_recipients(bid):
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5050)
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--dev':
+        app.run(host='0.0.0.0', debug=True, port=5050)
+    else:
+        from waitress import serve
+        print("Démarrage avec Waitress (stable)...")
+        serve(app, host='0.0.0.0', port=5050, threads=4)
