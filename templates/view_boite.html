@@ -189,33 +189,42 @@
 
 <script>
 function sendEmails() {
-    if (!confirm('Envoyer le message configuré à tous les destinataires de cette boîte ?')) {
-        return;
-    }
-    
-    const resultDiv = document.getElementById('send-result');
-    resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '<div class="alert alert-info"><i class="bi bi-hourglass-split"></i> Envoi en cours...</div>';
-    
-    fetch('{{ url_for("send_emails_to_recipients", bid=boite.id) }}', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'}
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
-        } else {
-            let errorDetails = '';
-            if (data.details && data.details.errors && data.details.errors.length > 0) {
-                errorDetails = '<ul class="mb-0 mt-2"><li>' + data.details.errors.slice(0, 3).join('</li><li>') + '</li></ul>';
+    fetch('{{ url_for("get_recipients_count", bid=boite.id) }}')
+        .then(response => response.json())
+        .then(data => {
+            const count = data.count;
+            if (count === 0) {
+                alert('Aucun destinataire trouvé pour cette boîte.');
+                return;
             }
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + errorDetails + '</div>';
-        }
-    })
-    .catch(error => {
-        resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur lors de l\'envoi: ' + error + '</div>';
-    });
+            if (!confirm(`Envoyer le message configuré à ${count} destinataire(s) de cette boîte ?`)) {
+                return;
+            }
+            
+            const resultDiv = document.getElementById('send-result');
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-info"><i class="bi bi-hourglass-split"></i> Envoi en cours...</div>';
+            
+            fetch('{{ url_for("send_emails_to_recipients", bid=boite.id) }}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'}
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+                } else {
+                    let errorDetails = '';
+                    if (data.details && data.details.errors && data.details.errors.length > 0) {
+                        errorDetails = '<ul class="mb-0 mt-2"><li>' + data.details.errors.slice(0, 3).join('</li><li>') + '</li></ul>';
+                    }
+                    resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + errorDetails + '</div>';
+                }
+            })
+            .catch(error => {
+                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur lors de l\'envoi: ' + error + '</div>';
+            });
+        });
 }
 </script>
 {% endblock %}

@@ -41,6 +41,12 @@
                     </div>
                     
                     <div class="mb-3">
+                        <label for="custom_message_cc" class="form-label">Adresses en copie (CC)</label>
+                        <input type="text" class="form-control" id="custom_message_cc" name="custom_message_cc" value="{{ custom_message_cc }}" placeholder="email1@example.com, email2@example.com">
+                        <div class="form-text">Séparer les adresses par des virgules</div>
+                    </div>
+                    
+                    <div class="mb-3">
                         <label for="custom_message" class="form-label">Message</label>
                         <div id="editor-container" style="height: 200px;">{{ custom_message|safe }}</div>
                         <input type="hidden" name="custom_message" id="custom_message">

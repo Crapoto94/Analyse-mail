@@ -234,6 +234,7 @@ def config():
             set_config('custom_message_header1', request.form.get('custom_message_header1', ''))
             set_config('custom_message_header2', request.form.get('custom_message_header2', ''))
             set_config('custom_message_header3', request.form.get('custom_message_header3', ''))
+            set_config('custom_message_cc', request.form.get('custom_message_cc', ''))
             set_config('custom_message', request.form.get('custom_message', ''))
             flash('Message enregistré avec succès')
         elif 'api_ville_token' in request.form or 'api_ville_doc_url' in request.form or 'api_ville_url' in request.form:
@@ -250,6 +251,7 @@ def config():
         custom_message_header1=get_config('custom_message_header1', ''),
         custom_message_header2=get_config('custom_message_header2', ''),
         custom_message_header3=get_config('custom_message_header3', ''),
+        custom_message_cc=get_config('custom_message_cc', ''),
         custom_message=get_config('custom_message', ''),
         api_ville_url=get_config('api_ville_url', 'https://api-ville.toulouse.fr/api'),
         api_ville_doc_url=get_config('api_ville_doc_url', 'https://api-ville.toulouse.fr/docs'),
@@ -270,7 +272,7 @@ def test_api_ville():
     try:
         req = urllib.request.Request(
             api_url.rstrip('/') + '/ping',
-            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+            headers={'X-API-KEY': token, 'Accept': 'application/json'}
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             return jsonify({'success': True, 'message': f'API accessible (HTTP {response.status})'})
@@ -302,7 +304,7 @@ def test_send_email():
             url,
             data=data,
             headers={
-                'Authorization': f'Bearer {token}',
+                'X-API-KEY': token,
                 'Content-Type': 'application/json'
             },
             method='POST'
@@ -325,6 +327,13 @@ def test_send_email():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e), 'url': api_url.rstrip('/') + '/api/v1/mail/send'})
+
+@app.route('/boite/<int:bid>/recipients-count')
+def get_recipients_count(bid):
+    conn = get_db()
+    count = conn.execute('SELECT COUNT(DISTINCT recipient_address) as cnt FROM messages WHERE boite_id=?', (bid,)).fetchone()['cnt']
+    conn.close()
+    return jsonify({'count': count})
 
 @app.route('/boite/<int:bid>/send-emails', methods=['POST'])
 def send_emails_to_recipients(bid):
@@ -355,6 +364,8 @@ def send_emails_to_recipients(bid):
     header1 = get_config('custom_message_header1', '')
     header2 = get_config('custom_message_header2', '')
     header3 = get_config('custom_message_header3', '')
+    cc_raw = get_config('custom_message_cc', '')
+    cc_list = [addr.strip() for addr in cc_raw.split(',') if addr.strip()] if cc_raw else []
     message_body = get_config('custom_message', '')
     
     results = {'success': 0, 'failed': 0, 'errors': [], 'debug': []}
@@ -364,6 +375,7 @@ def send_emails_to_recipients(bid):
         try:
             email_data = {
                 'to': recipient,
+                'cc': cc_list,
                 'from_name': emetteur_nom,
                 'from_email': emetteur_email,
                 'subject': titre,
@@ -382,7 +394,7 @@ def send_emails_to_recipients(bid):
                 full_url,
                 data=data,
                 headers={
-                    'Authorization': f'Bearer {token}',
+                    'X-API-KEY': token,
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 },
