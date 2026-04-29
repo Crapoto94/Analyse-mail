@@ -66,13 +66,22 @@ def init_db():
         continent TEXT,
         continent_code TEXT,
         currency TEXT,
+        hostname TEXT,
         query_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    
+    # Migration: ajouter colonne hostname si elle n'existe pas
+    try:
+        c.execute('ALTER TABLE ip_info ADD COLUMN hostname TEXT')
+    except:
+        pass  # La colonne existe déjà
     conn.commit()
     conn.close()
 
 def get_ip_info(ip):
     import urllib.request
+    import socket
+    import time
     
     conn = get_db()
     row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
@@ -81,29 +90,41 @@ def get_ip_info(ip):
         return dict(row)
     
     try:
-        url = "http://ip-api.com/json/" + ip + "?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,continent,continentCode,currency,query"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Analyse-Compromis'})
+        # Utiliser ipwho.is (pas de rate limit strict)
+        url = "https://ipwho.is/" + ip
+        req = urllib.request.Request(url, headers={'User-Agent': 'Analyse-Compromis/1.0'})
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
-            if data.get('status') == 'success':
-                isp = data.get('isp', '').lower()
-                org = data.get('org', '').lower()
-                as_name = data.get('as', '').lower()
-                is_vpn = any(kw in (isp + ' ' + org + ' ' + as_name) for kw in ['vpn', 'proxy', 'tor', 'nord', 'express', 'surfshark', 'cyberghost'])
-                
-                conn.execute('''INSERT OR REPLACE INTO ip_info 
-                    (ip, country, country_code, region, region_name, city, zip, lat, lon, isp, org, as_name, is_vpn, timezone, continent, continent_code, currency)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                    (ip, data.get('country'), data.get('countryCode'), data.get('region'),
-                     data.get('regionName'), data.get('city'), data.get('zip'),
-                     data.get('lat'), data.get('lon'), data.get('isp'),
-                     data.get('org'), data.get('as'), is_vpn,
-                     data.get('timezone'), data.get('continent'), data.get('continentCode'),
-                     data.get('currency')))
-                conn.commit()
-                row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
-                conn.close()
-                return dict(row) if row else None
+            
+            if not data.get('success'):
+                raise Exception(data.get('message', 'Unknown error'))
+            
+            # Récupérer le hostname via reverse DNS
+            hostname = ''
+            try:
+                hostname = socket.gethostbyaddr(ip)[0]
+            except:
+                hostname = ''
+            
+            isp = (data.get('connection', {}).get('isp', '') or '').lower()
+            org = (data.get('connection', {}).get('org', '') or '').lower()
+            asn = data.get('connection', {}).get('asn', '')
+            
+            is_vpn = any(kw in (isp + ' ' + org) for kw in ['vpn', 'proxy', 'tor', 'nord', 'express', 'surfshark', 'cyberghost'])
+            
+            conn.execute('''INSERT OR REPLACE INTO ip_info 
+                (ip, country, country_code, region, region_name, city, zip, lat, lon, isp, org, as_name, is_vpn, timezone, continent, continent_code, currency, hostname)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (ip, data.get('country', ''), data.get('country_code', ''), data.get('region_code', ''),
+                 data.get('region', ''), data.get('city', ''), data.get('postal', ''),
+                 data.get('latitude'), data.get('longitude'), data.get('connection', {}).get('isp', ''),
+                 data.get('connection', {}).get('org', ''), asn, is_vpn,
+                 data.get('timezone', {}).get('id', ''), data.get('continent_code', ''), data.get('continent_code', ''),
+                 data.get('currency', {}).get('code', ''), hostname))
+            conn.commit()
+            row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
+            conn.close()
+            return dict(row) if row else None
     except Exception as e:
         print("Erreur IP info pour " + ip + ": " + str(e))
     
@@ -437,9 +458,10 @@ def test_send_custom():
     message_body = data.get('message', '')
     
     try:
+        test_recipient = cc_list[0] if cc_list else 'test@example.com'
         email_data = {
-            'to': 'test@example.com',
-            'cc': cc_list,
+            'to': test_recipient,
+            'cc': [],
             'from_name': emetteur_nom,
             'from_email': emetteur_email,
             'subject': titre,

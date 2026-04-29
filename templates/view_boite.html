@@ -103,20 +103,39 @@
         <h5 class="mb-3">Géolocalisation des IPs</h5>
         <div class="row mb-3">
             {% for info in ip_info_list %}
-            <div class="col-md-6 col-lg-4 mb-2">
+            <div class="col-md-6 col-lg-4 mb-3">
                 <div class="card h-100">
-                    <div class="card-body">
-                        <h6 class="card-title"><code>{{ info.ip }}</code></h6>
-                        <p class="mb-1"><small><strong>Pays:</strong> {{ info.country }} ({{ info.country_code }})</small></p>
-                        <p class="mb-1"><small><strong>Ville:</strong> {{ info.city }} ({{ info.zip }})</small></p>
-                        <p class="mb-1"><small><strong>Région:</strong> {{ info.region_name }}</small></p>
-                        <p class="mb-1"><small><strong>Continent:</strong> {{ info.continent }} ({{ info.continent_code }})</small></p>
-                        <p class="mb-1"><small><strong>Fuseau horaire:</strong> {{ info.timezone }}</small></p>
-                        <p class="mb-1"><small><strong>ISP:</strong> {{ info.isp }}</small></p>
-                        <p class="mb-1"><small><strong>Organisation:</strong> {{ info.org }}</small></p>
-                        <p class="mb-1"><small><strong>Monnaie:</strong> {{ info.currency }}</small></p>
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <code class="mb-0">{{ info.ip }}</code>
                         {% if info.is_vpn %}
-                        <span class="badge bg-warning">VPN/Proxy détecté</span>
+                        <span class="badge bg-warning">VPN/Proxy</span>
+                        {% endif %}
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-2">
+                            <small><strong><i class="bi bi-geo-alt"></i> Localisation:</strong></small>
+                            <p class="mb-1">{{ info.city }} ({{ info.zip }}), {{ info.region_name }}</p>
+                            <p class="mb-1">{{ info.country }} ({{ info.country_code }}) - {{ info.continent }}</p>
+                        </div>
+                        <div class="mb-2">
+                            <small><strong><i class="bi bi-clock"></i> Fuseau horaire:</strong></small>
+                            <p class="mb-1">{{ info.timezone }}</p>
+                        </div>
+                        <div class="mb-2">
+                            <small><strong><i class="bi bi-hdd-network"></i> Réseau:</strong></small>
+                            <p class="mb-1">{{ info.isp }}</p>
+                            <p class="mb-1"><small>{{ info.org }}</small></p>
+                            <p class="mb-1"><small>ASN: {{ info.as_name or 'N/A' }}</small></p>
+                        </div>
+                        <div class="mb-2">
+                            <small><strong><i class="bi bi-currency-exchange"></i> Monnaie:</strong></small>
+                            <p class="mb-1">{{ info.currency }}</p>
+                        </div>
+                        {% if info.hostname %}
+                        <div class="mb-2">
+                            <small><strong><i class="bi bi-pc-display"></i> Hostname:</strong></small>
+                            <p class="mb-1"><code>{{ info.hostname }}</code></p>
+                        </div>
                         {% endif %}
                     </div>
                 </div>
@@ -230,10 +249,18 @@ var ips = {{ ip_info_list|tojson }};
 ips.forEach(function(ip) {
     if (ip.lat && ip.lon) {
         var vpnBadge = ip.is_vpn ? ' <span class="badge bg-warning">VPN/Proxy</span>' : '';
+        var popupContent = '<div style="min-width:200px">' +
+            '<strong>' + ip.ip + '</strong>' + vpnBadge + '<br>' +
+            '<i class="bi bi-geo-alt"></i> ' + ip.city + ' (' + ip.zip + '), ' + ip.country + '<br>' +
+            '<i class="bi bi-hdd-network"></i> ' + ip.isp + '<br>' +
+            '<small><i class="bi bi-clock"></i> ' + ip.timezone + '</small>';
+        if (ip.hostname) {
+            popupContent += '<br><small><i class="bi bi-pc-display"></i> ' + ip.hostname + '</small>';
+        }
+        popupContent += '</div>';
+        
         var marker = L.marker([ip.lat, ip.lon]).addTo(map)
-            .bindPopup('<strong>' + ip.ip + '</strong>' + vpnBadge + '<br>' +
-                       ip.city + ', ' + ip.country + '<br>' +
-                       '<small>' + ip.isp + '</small>');
+            .bindPopup(popupContent);
     }
 });
 {% endif %}
