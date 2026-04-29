@@ -206,11 +206,15 @@ function sendEmails() {
         if (data.success) {
             resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
         } else {
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            let errorDetails = '';
+            if (data.details && data.details.errors && data.details.errors.length > 0) {
+                errorDetails = '<ul class="mb-0 mt-2"><li>' + data.details.errors.slice(0, 3).join('</li><li>') + '</li></ul>';
+            }
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + errorDetails + '</div>';
         }
     })
     .catch(error => {
-        resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur lors de l\'envoi</div>';
+        resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur lors de l\'envoi: ' + error + '</div>';
     });
 }
 </script>

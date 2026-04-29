@@ -277,9 +277,59 @@ def test_api_ville():
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
 
+@app.route('/api/test-send')
+def test_send_email():
+    import urllib.request
+    token = get_config('api_ville_token', '')
+    api_url = get_config('api_ville_url', '')
+    
+    if not token or not api_url:
+        return jsonify({'error': 'Configuration manquante'})
+    
+    try:
+        test_data = {
+            'to': 'test@example.com',
+            'subject': 'Test',
+            'content': 'Test message',
+            'from_name': 'Test',
+            'from_email': 'test@example.com'
+        }
+        
+        data = json.dumps(test_data).encode('utf-8')
+        url = api_url.rstrip('/') + '/api/v1/mail/send'
+        
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            },
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return jsonify({
+                'success': True,
+                'status': response.status,
+                'response': response.read().decode('utf-8'),
+                'url': url,
+                'data': test_data
+            })
+    except urllib.error.HTTPError as e:
+        return jsonify({
+            'success': False,
+            'status': e.code,
+            'error': e.read().decode('utf-8'),
+            'url': api_url.rstrip('/') + '/api/v1/mail/send'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'url': api_url.rstrip('/') + '/api/v1/mail/send'})
+
 @app.route('/boite/<int:bid>/send-emails', methods=['POST'])
 def send_emails_to_recipients(bid):
     import urllib.request
+    import traceback
     
     conn = get_db()
     boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
@@ -307,7 +357,7 @@ def send_emails_to_recipients(bid):
     header3 = get_config('custom_message_header3', '')
     message_body = get_config('custom_message', '')
     
-    results = {'success': 0, 'failed': 0, 'errors': []}
+    results = {'success': 0, 'failed': 0, 'errors': [], 'debug': []}
     
     for r in recipients:
         recipient = r['recipient_address']
@@ -317,15 +367,19 @@ def send_emails_to_recipients(bid):
                 'from_name': emetteur_nom,
                 'from_email': emetteur_email,
                 'subject': titre,
-                'header1': header1,
-                'header2': header2,
-                'header3': header3,
-                'body': message_body
+                'content': message_body,
+                'is_raw': False,
+                'footer1': header1,
+                'footer2': header2,
+                'footer3': header3
             }
             
             data = json.dumps(email_data).encode('utf-8')
+            full_url = api_url.rstrip('/') + '/api/v1/mail/send'
+            results['debug'].append(f'Tentative envoi vers {full_url} pour {recipient}')
+            
             req = urllib.request.Request(
-                api_url.rstrip('/') + '/send',
+                full_url,
                 data=data,
                 headers={
                     'Authorization': f'Bearer {token}',
@@ -335,14 +389,23 @@ def send_emails_to_recipients(bid):
                 method='POST'
             )
             with urllib.request.urlopen(req, timeout=30) as response:
+                response_text = response.read().decode('utf-8')
+                results['debug'].append(f'Success: {response.status} - {response_text}')
                 results['success'] += 1
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else str(e)
+            results['failed'] += 1
+            results['errors'].append(f'{recipient}: HTTP {e.code} - {error_body}')
+            results['debug'].append(f'HTTP Error: {e.code} - {error_body}')
         except Exception as e:
             results['failed'] += 1
             results['errors'].append(f'{recipient}: {str(e)}')
+            results['debug'].append(f'Error: {traceback.format_exc()}')
     
+    error_details = ' | '.join(results['errors'][:3]) if results['errors'] else ''
     return jsonify({
-        'success': True,
-        'message': f'{results["success"]} emails envoyés, {results["failed"]} échecs',
+        'success': results['failed'] == 0,
+        'message': f'{results["success"]} emails envoyés, {results["failed"]} échecs. Détails: {error_details}',
         'details': results
     })
 
