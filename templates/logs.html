@@ -49,12 +49,12 @@
         </thead>
         <tbody>
             {% for log in logs %}
-            <tr class="{% if log.level=='ERROR' %}table-danger{% elif log.level=='WARNING' %}table-warning{% endif %}">
+            <tr class="{% if log.level=='ERROR' %}table-danger{% elif log.level=='WARNING' %}table-warning{% endif %} clickable-row" onclick="window.location='{{ url_for('view_log_detail', log_id=log.id) }}'" style="cursor: pointer;">
                 <td><small>{{ log.timestamp }}</small></td>
                 <td><span class="badge {% if log.level=='ERROR' %}bg-danger{% elif log.level=='WARNING' %}bg-warning{% else %}bg-info{% endif %}">{{ log.level }}</span></td>
                 <td>{{ log.category }}</td>
                 <td>{{ log.message }}</td>
-                <td><small class="text-muted">{{ log.details[:100] if log.details else '' }}</small></td>
+                <td><small class="text-muted">{{ log.details[:150] if log.details else '' }}{% if log.details and log.details|length > 150 %}...{% endif %}</small></td>
                 <td><small>{{ log.recipient or '' }}</small></td>
             </tr>
             {% else %}

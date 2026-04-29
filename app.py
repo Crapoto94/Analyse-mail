@@ -547,6 +547,17 @@ def clear_logs():
     flash('Logs supprimés')
     return redirect(url_for('view_logs'))
 
+@app.route('/log/<int:log_id>')
+@login_required
+def view_log_detail(log_id):
+    conn = get_db()
+    log = conn.execute('SELECT * FROM logs WHERE id=?', (log_id,)).fetchone()
+    conn.close()
+    if not log:
+        flash('Log non trouvé')
+        return redirect(url_for('view_logs'))
+    return render_template('log_detail.html', log=log)
+
 @app.route('/compare')
 def compare_boites():
     conn = get_db()

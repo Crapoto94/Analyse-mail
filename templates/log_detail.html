@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Détail Log #{{ log.id }}{% endblock %}
+{% block content %}
+<h2><i class="bi bi-journal-text"></i> Détail du Log #{{ log.id }}</h2>
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <div>
+            <span class="badge {% if log.level=='ERROR' %}bg-danger{% elif log.level=='WARNING' %}bg-warning{% else %}bg-info{% endif %}">{{ log.level }}</span>
+            <strong>{{ log.category }}</strong>
+        </div>
+        <small class="text-muted">{{ log.timestamp }}</small>
+    </div>
+    <div class="card-body">
+        <h5 class="card-title">{{ log.message }}</h5>
+        
+        {% if log.details %}
+        <div class="mb-3">
+            <label class="form-label"><strong>Détails :</strong></label>
+            <pre class="bg-light p-3 rounded" style="white-space: pre-wrap; word-break: break-word;">{{ log.details }}</pre>
+        </div>
+        {% endif %}
+        
+        {% if log.recipient %}
+        <div class="mb-3">
+            <label class="form-label"><strong>Destinataire :</strong></label>
+            <p>{{ log.recipient }}</p>
+        </div>
+        {% endif %}
+        
+        {% if log.boite_id %}
+        <div class="mb-3">
+            <label class="form-label"><strong>Boîte liée :</strong></label>
+            <p><a href="{{ url_for('view_boite', bid=log.boite_id) }}">Voir la boîte #{{ log.boite_id }}</a></p>
+        </div>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <a href="{{ url_for('view_logs') }}" class="btn btn-secondary"><i class="bi bi-arrow-left"></i> Retour aux logs</a>
+    </div>
+</div>
+{% endblock %}
