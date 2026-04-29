@@ -11,4 +11,4 @@ RUN mkdir -p uploads templates
 
 EXPOSE 5050
 
-CMD ["python", "app.py"]
+CMD ["waitress-serve", "--host=0.0.0.0", "--port=5050", "app:app"]
