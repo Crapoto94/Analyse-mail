@@ -309,11 +309,15 @@ def add_boite():
 
 @app.route('/boite/<int:bid>')
 def view_boite(bid):
-    conn = get_db()
-    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
-    if not boite:
-        flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+    import traceback
+    conn = None
+    try:
+        conn = get_db()
+        boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+        if not boite:
+            conn.close()
+            flash('Boîte non trouvée')
+            return redirect(url_for('index'))
     messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
     ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
     recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
@@ -778,7 +782,7 @@ def send_emails_to_recipients(bid):
     token = get_config('api_ville_token', '')
 
     if not api_url or not token:
-        add_log('ERROR', 'EMAIL', f'Configuration API Ville incomplète pour la boîte {bid}', f'api_url: {api_url}, token présent: {bool(token)}', bid)
+        add_log('ERROR', 'EMAIL', f'Configuration API Ville incomplète pour la boîte {bid} ({boite["user_email"]})', f'api_url: {api_url}, token présent: {bool(token)}', bid)
         return jsonify({'success': False, 'message': 'Configuration API Ville incomplète'})
 
     emetteur_nom = get_config('custom_message_emetteur_nom', '')
@@ -797,6 +801,7 @@ def send_emails_to_recipients(bid):
 
     for r in recipients:
         recipient = r['recipient_address']
+        full_url = api_url.rstrip('/') + '/api/v1/mail/send'
         try:
             email_data = {
                 'to': recipient,
@@ -812,7 +817,6 @@ def send_emails_to_recipients(bid):
             }
 
             data = json.dumps(email_data).encode('utf-8')
-            full_url = api_url.rstrip('/') + '/api/v1/mail/send'
             results['debug'].append(f'Tentative envoi vers {full_url} pour {recipient}')
 
             req = urllib.request.Request(
@@ -829,18 +833,18 @@ def send_emails_to_recipients(bid):
                 response_text = response.read().decode('utf-8')
                 results['debug'].append(f'Success: {response.status} - {response_text}')
                 results['success'] += 1
-                add_log('INFO', 'EMAIL', f'Email envoyé avec succès', f'HTTP {response.status} - {response_text}', bid, recipient)
+                add_log('INFO', 'EMAIL', f'Email envoyé avec succès vers {recipient}', f'Boîte: {boite["user_email"]}, Sujet: {titre}, HTTP {response.status}, Réponse: {response_text}', bid, recipient)
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8') if e.fp else str(e)
             results['failed'] += 1
             results['errors'].append(f'{recipient}: HTTP {e.code} - {error_body}')
             results['debug'].append(f'HTTP Error: {e.code} - {error_body}')
-            add_log('ERROR', 'EMAIL', f'Échec envoi email vers {recipient}', f'HTTP {e.code} - {error_body}', bid, recipient)
+            add_log('ERROR', 'EMAIL', f'Échec envoi email vers {recipient}', f'Boîte: {boite["user_email"]}, Sujet: {titre}, API: {full_url}, HTTP {e.code}: {error_body}', bid, recipient)
         except Exception as e:
             results['failed'] += 1
             results['errors'].append(f'{recipient}: {str(e)}')
             results['debug'].append(f'Error: {traceback.format_exc()}')
-            add_log('ERROR', 'EMAIL', f'Échec envoi email vers {recipient}', f'{str(e)}\n{traceback.format_exc()}', bid, recipient)
+            add_log('ERROR', 'EMAIL', f'Échec envoi email vers {recipient}', f'Boîte: {boite["user_email"]}, Sujet: {titre}, API: {full_url}, Erreur: {str(e)}\n{traceback.format_exc()}', bid, recipient)
 
     error_details = ' | '.join(results['errors'][:3]) if results['errors'] else ''
     add_log('INFO', 'EMAIL', f'Fin envoi emails pour boîte {bid}', f'{results["success"]} succès, {results["failed"]} échecs', bid)
