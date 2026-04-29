@@ -295,14 +295,16 @@ function filterMessages() {
     var filter = input.value.toLowerCase();
     var table = document.getElementById('messages-table');
     if (!table) return;
-    var rows = table.getElementsByTagName('tbody')[0].getElementsByTagName('tr');
+    var tbody = table.getElementsByTagName('tbody')[0];
+    if (!tbody) return;
+    var rows = tbody.getElementsByTagName('tr');
     var matchCount = 0;
     
     for (var i = 0; i < rows.length; i++) {
         var cells = rows[i].getElementsByTagName('td');
         if (cells.length > 1) {
-            var address = cells[1].textContent || cells[1].innerText;
-            if (filter === '' || address.toLowerCase().indexOf(filter) > -1) {
+            var address = (cells[1].textContent || cells[1].innerText).toLowerCase();
+            if (filter === '' || address.indexOf(filter) > -1) {
                 rows[i].style.display = '';
                 matchCount++;
             } else {
@@ -311,7 +313,12 @@ function filterMessages() {
         }
     }
     
-    document.getElementById('match-count').textContent = matchCount + ' / ' + rows.length;
+    var matchCountElem = document.getElementById('match-count');
+    if (matchCountElem) {
+        matchCountElem.textContent = matchCount + ' / ' + rows.length;
+    }
+    
+    return false;
 }
 
 
