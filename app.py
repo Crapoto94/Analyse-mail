@@ -777,44 +777,27 @@ def send_emails_to_recipients(bid):
     import traceback
     import ssl
 
-    def make_ssl_context():
-        """Crée un contexte SSL qui ignore la vérification si api_verify_ssl=False"""
-        verify_ssl = get_config('api_verify_ssl', 'True') == 'True'
-        if verify_ssl:
-            return ssl.create_default_context()
-        else:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            return ctx
-
-    def make_opener():
-        """Crée un opener avec le contexte SSL approprié"""
-        ctx = make_ssl_context()
-        https_handler = urllib.request.HTTPSHandler(context=ctx)
-        return urllib.request.build_opener(https_handler)
-
     conn = get_db()
     boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
     if not boite:
         conn.close()
         add_log('ERROR', 'EMAIL', f'Boîte {bid} non trouvée lors de l\'envoi d\'emails')
         return jsonify({'success': False, 'message': 'Boîte non trouvée'})
-
+    
     recipients = conn.execute('SELECT DISTINCT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
     conn.close()
-
+    
     if not recipients:
         add_log('WARNING', 'EMAIL', f'Aucun destinataire trouvé pour la boîte {bid}')
         return jsonify({'success': False, 'message': 'Aucun destinataire trouvé'})
-
+    
     api_url = get_config('api_ville_url', '')
     token = get_config('api_ville_token', '')
-
+    
     if not api_url or not token:
         add_log('ERROR', 'EMAIL', f'Configuration API Ville incomplète pour la boîte {bid} ({boite["user_email"]})', f'api_url: {api_url}, token présent: {bool(token)}', bid)
         return jsonify({'success': False, 'message': 'Configuration API Ville incomplète'})
-
+    
     emetteur_nom = get_config('custom_message_emetteur_nom', '')
     emetteur_email = get_config('custom_message_emetteur_email', '')
     titre = get_config('custom_message_titre', '')
@@ -824,11 +807,18 @@ def send_emails_to_recipients(bid):
     cc_raw = get_config('custom_message_cc', '')
     cc_list = [addr.strip() for addr in cc_raw.split(',') if addr.strip()] if cc_raw else []
     message_body = get_config('custom_message', '')
-
+    
     add_log('INFO', 'EMAIL', f'Début envoi emails pour boîte {bid}', f'{len(recipients)} destinataires, sujet: {titre}', bid)
-
+    
     results = {'success': 0, 'failed': 0, 'errors': [], 'debug': []}
-
+    
+    # Contexte SSL qui ignore totalement la vérification
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    https_handler = urllib.request.HTTPSHandler(context=ctx)
+    opener = urllib.request.build_opener(https_handler)
+    
     for r in recipients:
         recipient = r['recipient_address']
         full_url = api_url.rstrip('/') + '/api/v1/mail/send'
@@ -847,7 +837,6 @@ def send_emails_to_recipients(bid):
             }
             
             data = json.dumps(email_data).encode('utf-8')
-            full_url = api_url.rstrip('/') + '/api/v1/mail/send'
             results['debug'].append(f'Tentative envoi vers {full_url} pour {recipient}')
             
             req = urllib.request.Request(
@@ -860,15 +849,6 @@ def send_emails_to_recipients(bid):
                 },
                 method='POST'
             )
-            
-            # Contexte SSL selon config
-            ctx = ssl.create_default_context()
-            if not verify_ssl:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            
-            https_handler = urllib.request.HTTPSHandler(context=ctx)
-            opener = urllib.request.build_opener(https_handler)
             
             with opener.open(req, timeout=30) as response:
                 response_text = response.read().decode('utf-8')
