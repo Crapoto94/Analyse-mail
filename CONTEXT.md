@@ -14,78 +14,66 @@ Application web d'analyse de compromission de boîtes email (investigation de s�
 
 ### Objectif en cours
 Analyse et gestion d'incidents de compromission de boîtes email :
-- Import de logs CSV (格式 Microsoft 365 / Exchange)
+- Import de logs CSV (format Microsoft 365 / Exchange)
 - Analyse temporelle, géographique (IPs), domaines
 - Envoi d'emails de remédiation aux destinataires
-- Suivi via système de logs
+- Suivi via système de logs détaillés
 
 ### Ce qui a été fait
 - Création de l'application Flask avec auth basic (admin/Admin94200!!!2025)
 - Import CSV avec détection automatique du délimiteur (; ou ,)
 - Timeline par tranches de 15 min
 - Géolocalisation des IPs via ipwho.is
-- Vérification SPF/DKIM/DMARC
-- Système de logs (table logs, route /logs)
+- Vérification SPF/DKIM/DMARC (nécessite dnspython)
+- Système de logs (table logs, route /logs, /log/<id>)
 - Envoi d'emails via API Ville (route /boite/<id>/send-emails)
 - Configuration personnalisée des messages (route /config)
 - Export CSV, comparaison de boîtes
-- Correction du filtre adresses (commit 2955310)
-- **Dernier commit (47cd055)** : Ajout système de logs avec interface
+- **Dernier commit (c26bf64)** : Vue détaillée des logs + logs cliquables
 
-### Modifications en cours (non committées)
-**Fichier : app.py**
-- Modification de la route `/boite/<int:bid>` (view_boite)
-- Ajout d'un bloc try/except et gestion de fermeture de connexion
-- **⚠️ INCOHÉRENCE DÉTECTÉE** : Le code après le `if not boite:` n'est PAS dans le bloc try. Si une erreur survient plus loin, la connexion DB ne sera pas fermée correctement.
-
-```python
-# Code actuel (problématique) :
-try:
-    conn = get_db()
-    boite = conn.execute(...).fetchone()
-    if not boite:
-        conn.close()
-        flash(...)
-        return redirect(...)
-# <-- Le bloc try se termine ici implicitement
-messages = conn.execute(...)  # Hors du try !
-```
+### Modifications récentes (committées et poussées)
+1. **Fix critique (cfcd977)** : Correction bloc try/except dans view_boite (SyntaxError)
+2. **Fix Docker (2b86100)** : Dockerfile avec waitress-serve écoutant sur 0.0.0.0
+3. **Fix docker-compose (24bab8f)** : Retrait montage compromis.db (cause REFUSED)
+4. **Ajout dnspython (73562b3)** : Résout erreur 500 sur /boite/x en Docker
+5. **Logs détaillés (c26bf64)** : Nouvelle route /log/<id>, template cliquable
 
 ### Ce qui reste à faire
-1. **Corriger l'incohérence dans view_boite** (fermeture correcte de la connexion)
-2. Tester l'envoi d'emails avec l'API Ville
-3. Vérifier que tous les handlers de route ferment correctement les connexions DB
-4. Documenter l'API Ville (endpoints disponibles)
+1. **Tester l'envoi d'emails en Docker** (actuellement KO, URL API tronquée dans logs)
+2. Vérifier que tous les handlers de route ferment correctement les connexions DB
+3. Documenter l'API Ville (endpoints disponibles)
+
+### Problème actuel : Envoi d'emails KO en Docker
+- Les logs affichent l'URL tronquée : `API: https://api.`
+- Cela indique que `api_url` est vide ou mal configurée dans le conteneur
+- **Solution** : Vérifier la config dans la base ou passer via variables d'environnement
 
 ### Hypothèses de travail
-- Les CSV importés proviennent de Microsoft 365 (champs : MessageId, Received, SenderAddress, RecipientAddress, etc.)
-- L'API Ville est une API municipale d'envoi d'emails (endpoint : /api/v1/mail/send)
-- La base contient des données de test (Compromission_test.csv, etc.)
+- Les CSV importés proviennent de Microsoft 365
+- L'API Ville est une API municipale (endpoint : /api/v1/mail/send)
+- La base contient des données de test
 
 ### Risques et points bloquants
-- **Risque majeur** : Fuite de connexions DB dans view_boite (modification en cours)
+- **Point bloquant** : Envoi d'emails échoue en Docker (config API manquante ?)
 - **Risque** : Pas de gestion d'erreur globale pour les connexions DB
-- **Point bloquant** : Nécessite des identifiants API Ville valides pour tester l'envoi d'emails
-- **Todo** : Vérifier si d'autres routes ont le même problème de gestion de connexion
 
 ### Fichiers clés
-- `app.py` (910 lignes) - Application principale
-- `templates/` - 7 templates HTML (base, index, view_boite, upload, config, logs, compare, add_boite)
-- `compromis.db` - Base SQLite (1 MB environ)
-- `requirements.txt` - 4 dépendances (Flask, Werkzeug, waitress, flask-httpauth)
+- `app.py` (909 lignes) - Application principale
+- `templates/` - 8 templates HTML (dont log_detail.html nouveau)
+- `compromis.db` - Base SQLite
+- `requirements.txt` - 5 dépendances (ajout dnspython)
 - `docker-compose.yml` - Déploiement sur port 5050
 
 ### Décisions prises
-- Auth basic plutôt que session-based (simplicité)
+- Auth basic (simplicité)
 - Stockage config dans la DB (table config)
-- Géolocalisation via ipwho.is (pas de clé API requise)
-- Timeline par tranches de 15 min (commit 2955310)
+- Géolocalisation via ipwho.is (pas de clé API)
+- Timeline par tranches de 15 min
 
 ### Prochaine action recommandée
-1. Lire la suite de app.py (lignes 850-910) pour comprendre la fin des routes
-2. Corriger le bloc try/except dans view_boite
-3. Committer les modifications avec un message clair
+1. Debugger l'envoi d'emails en Docker : vérifier la valeur de `api_ville_url` dans la base
+2. Si nécessaire, passer l'URL via variable d'environnement dans docker-compose.yml
 
 ### Questions bloquantes éventuelles
-- L'API Ville fonctionne-t-elle avec l'URL par défaut (https://api-ville.toulouse.fr/api) ?
-- Faut-il committer les modifications de app.py actuelles ou les corriger d'abord ?
+- La variable d'environnement `API_VILLE_URL` est-elle correctement passée au conteneur ?
+- La config en base est-elle correcte (table config, key='api_ville_url') ?
