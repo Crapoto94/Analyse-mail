@@ -4,7 +4,7 @@ services:
   web:
     build: .
     ports:
-      - "5000:5000"
+      - "5050:5050"
     volumes:
       - ./compromis.db:/app/compromis.db
       - ./uploads:/app/uploads

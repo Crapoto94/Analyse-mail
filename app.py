@@ -73,7 +73,6 @@ def init_db():
 
 def get_ip_info(ip):
     import urllib.request
-    import time
     
     conn = get_db()
     row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
@@ -186,11 +185,16 @@ def view_boite(bid):
     
     # Géolocalisation des IPs
     ip_info_list = []
+    print(f"DEBUG: {len(ips)} IPs trouvées")
     for ip_row in ips:
         ip = ip_row['from_ip']
+        print(f"DEBUG: Géolocalisation de {ip}")
         info = get_ip_info(ip)
         if info:
+            print(f"DEBUG: Info reçue pour {ip}: {info.get('city')}, {info.get('country')}")
             ip_info_list.append(info)
+        else:
+            print(f"DEBUG: Pas d'info pour {ip}")
     
     conn.close()
     return render_template('view_boite.html', boite=boite, messages=messages, ips=ips, recipients=recipients, statuts=statuts, top_domains=top_domains, ip_info_list=ip_info_list)
@@ -490,4 +494,4 @@ def send_emails_to_recipients(bid):
     })
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5050)
