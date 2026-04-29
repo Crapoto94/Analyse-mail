@@ -400,6 +400,65 @@ def test_send_email():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e), 'url': api_url.rstrip('/') + '/api/v1/mail/send'})
 
+@app.route('/api/test-send-custom', methods=['POST'])
+def test_send_custom():
+    import urllib.request
+    
+    token = get_config('api_ville_token', '')
+    api_url = get_config('api_ville_url', '')
+    
+    if not token or not api_url:
+        return jsonify({'success': False, 'message': 'Configuration API manquante'})
+    
+    emetteur_nom = get_config('custom_message_emetteur_nom', '')
+    emetteur_email = get_config('custom_message_emetteur_email', '')
+    titre = get_config('custom_message_titre', '')
+    header1 = get_config('custom_message_header1', '')
+    header2 = get_config('custom_message_header2', '')
+    header3 = get_config('custom_message_header3', '')
+    message_body = get_config('custom_message', '')
+    
+    try:
+        email_data = {
+            'to': 'test@example.com',
+            'from_name': emetteur_nom,
+            'from_email': emetteur_email,
+            'subject': titre,
+            'content': message_body,
+            'is_raw': False,
+            'footer1': header1,
+            'footer2': header2,
+            'footer3': header3
+        }
+        
+        data = json.dumps(email_data).encode('utf-8')
+        url = api_url.rstrip('/') + '/api/v1/mail/send'
+        
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                'X-API-KEY': token,
+                'Content-Type': 'application/json'
+            },
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return jsonify({
+                'success': True,
+                'message': f'Test réussi (HTTP {response.status})',
+                'response': response.read().decode('utf-8')
+            })
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8')
+        return jsonify({
+            'success': False,
+            'message': f'Erreur HTTP {e.code}: {error_body}'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
+
 @app.route('/boite/<int:bid>/recipients-count')
 def get_recipients_count(bid):
     conn = get_db()
@@ -494,4 +553,4 @@ def send_emails_to_recipients(bid):
     })
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5050)
+    app.run(host='0.0.0.0', debug=True, port=5050)
