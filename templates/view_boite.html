@@ -110,8 +110,11 @@
                         <p class="mb-1"><small><strong>Pays:</strong> {{ info.country }} ({{ info.country_code }})</small></p>
                         <p class="mb-1"><small><strong>Ville:</strong> {{ info.city }} ({{ info.zip }})</small></p>
                         <p class="mb-1"><small><strong>Région:</strong> {{ info.region_name }}</small></p>
+                        <p class="mb-1"><small><strong>Continent:</strong> {{ info.continent }} ({{ info.continent_code }})</small></p>
+                        <p class="mb-1"><small><strong>Fuseau horaire:</strong> {{ info.timezone }}</small></p>
                         <p class="mb-1"><small><strong>ISP:</strong> {{ info.isp }}</small></p>
                         <p class="mb-1"><small><strong>Organisation:</strong> {{ info.org }}</small></p>
+                        <p class="mb-1"><small><strong>Monnaie:</strong> {{ info.currency }}</small></p>
                         {% if info.is_vpn %}
                         <span class="badge bg-warning">VPN/Proxy détecté</span>
                         {% endif %}

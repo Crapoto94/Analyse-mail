@@ -62,6 +62,10 @@ def init_db():
         org TEXT,
         as_name TEXT,
         is_vpn BOOLEAN DEFAULT 0,
+        timezone TEXT,
+        continent TEXT,
+        continent_code TEXT,
+        currency TEXT,
         query_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     conn.commit()
@@ -78,7 +82,7 @@ def get_ip_info(ip):
         return dict(row)
     
     try:
-        url = f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,isp,org,as,query'
+        url = f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,continent,continentCode,currency,query'
         req = urllib.request.Request(url, headers={'User-Agent': 'Analyse-Compromis'})
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
@@ -89,12 +93,14 @@ def get_ip_info(ip):
                 is_vpn = any(kw in f'{isp} {org} {as_name}' for kw in ['vpn', 'proxy', 'tor', 'nord', 'express', 'surfshark', 'cyberghost'])
                 
                 conn.execute('''INSERT OR REPLACE INTO ip_info 
-                    (ip, country, country_code, region, region_name, city, zip, lat, lon, isp, org, as_name, is_vpn)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (ip, country, country_code, region, region_name, city, zip, lat, lon, isp, org, as_name, is_vpn, timezone, continent, continent_code, currency)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                     (ip, data.get('country'), data.get('countryCode'), data.get('region'),
                      data.get('regionName'), data.get('city'), data.get('zip'),
                      data.get('lat'), data.get('lon'), data.get('isp'),
-                     data.get('org'), data.get('as'), is_vpn))
+                     data.get('org'), data.get('as'), is_vpn,
+                     data.get('timezone'), data.get('continent'), data.get('continentCode'),
+                     data.get('currency')))
                 conn.commit()
                 row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
                 conn.close()
