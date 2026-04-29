@@ -48,8 +48,62 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ip_info (
+        ip TEXT PRIMARY KEY,
+        country TEXT,
+        country_code TEXT,
+        region TEXT,
+        region_name TEXT,
+        city TEXT,
+        zip TEXT,
+        lat REAL,
+        lon REAL,
+        isp TEXT,
+        org TEXT,
+        as_name TEXT,
+        is_vpn BOOLEAN DEFAULT 0,
+        query_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
     conn.commit()
     conn.close()
+
+def get_ip_info(ip):
+    import urllib.request
+    import time
+    
+    conn = get_db()
+    row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
+    if row:
+        conn.close()
+        return dict(row)
+    
+    try:
+        url = f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,isp,org,as,query'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Analyse-Compromis'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if data.get('status') == 'success':
+                isp = data.get('isp', '').lower()
+                org = data.get('org', '').lower()
+                as_name = data.get('as', '').lower()
+                is_vpn = any(kw in f'{isp} {org} {as_name}' for kw in ['vpn', 'proxy', 'tor', 'nord', 'express', 'surfshark', 'cyberghost'])
+                
+                conn.execute('''INSERT OR REPLACE INTO ip_info 
+                    (ip, country, country_code, region, region_name, city, zip, lat, lon, isp, org, as_name, is_vpn)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (ip, data.get('country'), data.get('countryCode'), data.get('region'),
+                     data.get('regionName'), data.get('city'), data.get('zip'),
+                     data.get('lat'), data.get('lon'), data.get('isp'),
+                     data.get('org'), data.get('as'), is_vpn))
+                conn.commit()
+                row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
+                conn.close()
+                return dict(row) if row else None
+    except Exception as e:
+        print(f"Erreur IP info pour {ip}: {e}")
+    
+    conn.close()
+    return None
 
 def get_config(key, default=''):
     conn = get_db()
@@ -124,8 +178,16 @@ def view_boite(bid):
             domains[domain] = domains.get(domain, 0) + 1
     top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:50]
     
+    # Géolocalisation des IPs
+    ip_info_list = []
+    for ip_row in ips:
+        ip = ip_row['from_ip']
+        info = get_ip_info(ip)
+        if info:
+            ip_info_list.append(info)
+    
     conn.close()
-    return render_template('view_boite.html', boite=boite, messages=messages, ips=ips, recipients=recipients, statuts=statuts, top_domains=top_domains)
+    return render_template('view_boite.html', boite=boite, messages=messages, ips=ips, recipients=recipients, statuts=statuts, top_domains=top_domains, ip_info_list=ip_info_list)
 
 @app.route('/boite/<int:bid>/upload', methods=['GET', 'POST'])
 def upload_csv(bid):
