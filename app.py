@@ -81,7 +81,7 @@ def get_ip_info(ip):
         return dict(row)
     
     try:
-        url = f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,continent,continentCode,currency,query'
+        url = "http://ip-api.com/json/" + ip + "?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,continent,continentCode,currency,query"
         req = urllib.request.Request(url, headers={'User-Agent': 'Analyse-Compromis'})
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
@@ -89,7 +89,7 @@ def get_ip_info(ip):
                 isp = data.get('isp', '').lower()
                 org = data.get('org', '').lower()
                 as_name = data.get('as', '').lower()
-                is_vpn = any(kw in f'{isp} {org} {as_name}' for kw in ['vpn', 'proxy', 'tor', 'nord', 'express', 'surfshark', 'cyberghost'])
+                is_vpn = any(kw in (isp + ' ' + org + ' ' + as_name) for kw in ['vpn', 'proxy', 'tor', 'nord', 'express', 'surfshark', 'cyberghost'])
                 
                 conn.execute('''INSERT OR REPLACE INTO ip_info 
                     (ip, country, country_code, region, region_name, city, zip, lat, lon, isp, org, as_name, is_vpn, timezone, continent, continent_code, currency)
@@ -105,7 +105,7 @@ def get_ip_info(ip):
                 conn.close()
                 return dict(row) if row else None
     except Exception as e:
-        print(f"Erreur IP info pour {ip}: {e}")
+        print("Erreur IP info pour " + ip + ": " + str(e))
     
     conn.close()
     return None
