@@ -309,92 +309,91 @@ def add_boite():
 
 @app.route('/boite/<int:bid>')
 def view_boite(bid):
-    import traceback
-    conn = None
+    conn = get_db()
     try:
-        conn = get_db()
         boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
         if not boite:
-            conn.close()
             flash('Boîte non trouvée')
             return redirect(url_for('index'))
-    messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
-    ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
-    recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
-    all_recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
-    statuts = conn.execute('SELECT status, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall()
-    
-    # Extraire les domaines (top 50)
-    domain_rows = conn.execute('SELECT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
-    domains = {}
-    for row in domain_rows:
-        email = row['recipient_address']
-        if '@' in email:
-            domain = email.split('@')[1].lower()
-            domains[domain] = domains.get(domain, 0) + 1
-    top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:50]
-    all_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)
-    
-    # Géolocalisation des IPs
-    ip_info_list = []
-    print(f"DEBUG: {len(ips)} IPs trouvées")
-    for ip_row in ips:
-        ip = ip_row['from_ip']
-        print(f"DEBUG: Géolocalisation de {ip}")
-        info = get_ip_info(ip)
-        if info:
-            print(f"DEBUG: Info reçue pour {ip}: {info.get('city')}, {info.get('country')}")
-            # S'assurer que c'est un dictionnaire sérialisable
-            if isinstance(info, dict):
-                ip_info_list.append(info)
+        
+        messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
+        ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
+        recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
+        all_recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
+        statuts = conn.execute('SELECT status, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall()
+        
+        # Extraire les domaines (top 50)
+        domain_rows = conn.execute('SELECT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
+        domains = {}
+        for row in domain_rows:
+            email = row['recipient_address']
+            if '@' in email:
+                domain = email.split('@')[1].lower()
+                domains[domain] = domains.get(domain, 0) + 1
+        top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:50]
+        all_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)
+        
+        # Géolocalisation des IPs
+        ip_info_list = []
+        print(f"DEBUG: {len(ips)} IPs trouvées")
+        for ip_row in ips:
+            ip = ip_row['from_ip']
+            print(f"DEBUG: Géolocalisation de {ip}")
+            info = get_ip_info(ip)
+            if info:
+                print(f"DEBUG: Info reçue pour {ip}: {info.get('city')}, {info.get('country')}")
+                if isinstance(info, dict):
+                    ip_info_list.append(info)
+                else:
+                    ip_info_list.append(dict(info))
             else:
-                ip_info_list.append(dict(info))
-        else:
-            print(f"DEBUG: Pas d'info pour {ip}")
+                print(f"DEBUG: Pas d'info pour {ip}")
+        
+        # Vérification SPF/DKIM/DMARC pour le domaine expéditeur
+        sender_domain = ''
+        spf_dkim_dmarc = None
+        if messages:
+            sender_email = messages[0]['sender_address'] if messages else ''
+            if '@' in sender_email:
+                sender_domain = sender_email.split('@')[1].lower()
+                spf_dkim_dmarc = check_spf_dkim_dmarc(sender_domain)
+        
+        # Analyse temporelle (par tranches de 15 min)
+        timeline_rows = conn.execute('''SELECT 
+            CASE 
+                WHEN strftime('%M', received) < '15' THEN strftime('%Y-%m-%d %H:00', received)
+                WHEN strftime('%M', received) < '30' THEN strftime('%Y-%m-%d %H:15', received)
+                WHEN strftime('%M', received) < '45' THEN strftime('%Y-%m-%d %H:30', received)
+                ELSE strftime('%Y-%m-%d %H:45', received)
+            END as time_slot,
+            COUNT(*) as cnt 
+            FROM messages WHERE boite_id=? 
+            GROUP BY time_slot
+            ORDER BY time_slot''', (bid,)).fetchall()
+        timeline = [{'hour': row['time_slot'], 'cnt': row['cnt']} for row in timeline_rows]
+        
+        # Analyse par domaine de destinataire
+        domain_analysis = {}
+        for row in domain_rows:
+            email = row['recipient_address']
+            if '@' in email:
+                domain = email.split('@')[1].lower()
+                if domain not in domain_analysis:
+                    domain_analysis[domain] = {'count': 0, 'recipients': set()}
+                domain_analysis[domain]['count'] += 1
+                domain_analysis[domain]['recipients'].add(email)
+        
+        domain_stats = [{'domain': k, 'count': v['count'], 'recipients': len(v['recipients'])} 
+                       for k, v in domain_analysis.items()]
+        domain_stats.sort(key=lambda x: x['count'], reverse=True)
+        
+        # Calculer la fenetre d'attaque
+        first_msg = conn.execute('SELECT MIN(received) as first FROM messages WHERE boite_id=?', (bid,)).fetchone()['first']
+        last_msg = conn.execute('SELECT MAX(received) as last FROM messages WHERE boite_id=?', (bid,)).fetchone()['last']
+        
+    finally:
+        conn.close()
     
-    # Vérification SPF/DKIM/DMARC pour le domaine expéditeur
-    sender_domain = ''
-    spf_dkim_dmarc = None
-    if messages:
-        sender_email = messages[0]['sender_address'] if messages else ''
-        if '@' in sender_email:
-            sender_domain = sender_email.split('@')[1].lower()
-            spf_dkim_dmarc = check_spf_dkim_dmarc(sender_domain)
-    
-    # Analyse temporelle (par tranches de 15 min)
-    timeline_rows = conn.execute('''SELECT 
-        CASE 
-            WHEN strftime('%M', received) < '15' THEN strftime('%Y-%m-%d %H:00', received)
-            WHEN strftime('%M', received) < '30' THEN strftime('%Y-%m-%d %H:15', received)
-            WHEN strftime('%M', received) < '45' THEN strftime('%Y-%m-%d %H:30', received)
-            ELSE strftime('%Y-%m-%d %H:45', received)
-        END as time_slot,
-        COUNT(*) as cnt 
-        FROM messages WHERE boite_id=? 
-        GROUP BY time_slot
-        ORDER BY time_slot''', (bid,)).fetchall()
-    timeline = [{'hour': row['time_slot'], 'cnt': row['cnt']} for row in timeline_rows]
-    
-    # Analyse par domaine de destinataire
-    domain_analysis = {}
-    for row in domain_rows:
-        email = row['recipient_address']
-        if '@' in email:
-            domain = email.split('@')[1].lower()
-            if domain not in domain_analysis:
-                domain_analysis[domain] = {'count': 0, 'recipients': set()}
-            domain_analysis[domain]['count'] += 1
-            domain_analysis[domain]['recipients'].add(email)
-    
-    domain_stats = [{'domain': k, 'count': v['count'], 'recipients': len(v['recipients'])} 
-                   for k, v in domain_analysis.items()]
-    domain_stats.sort(key=lambda x: x['count'], reverse=True)
-    
-    # Calculer la fenetre d'attaque
-    first_msg = conn.execute('SELECT MIN(received) as first FROM messages WHERE boite_id=?', (bid,)).fetchone()['first']
-    last_msg = conn.execute('SELECT MAX(received) as last FROM messages WHERE boite_id=?', (bid,)).fetchone()['last']
-    
-    conn.close()
     return render_template('view_boite.html', 
                          boite=boite, messages=messages, ips=ips, 
                          recipients=recipients, statuts=statuts, 

@@ -11,4 +11,4 @@ RUN mkdir -p uploads templates
 
 EXPOSE 5050
 
-CMD ["waitress-serve", "--host=0.0.0.0", "--port=5050", "app:app"]
+CMD ["python", "-c", "from waitress import serve; from app import app; serve(app, host='0.0.0.0', port=5050, threads=4)"]
