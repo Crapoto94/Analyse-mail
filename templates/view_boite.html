@@ -3,7 +3,10 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h1><i class="bi bi-envelope-exclamation"></i> {{ boite.user_email }}</h1>
-    <div>
+    <div class="d-flex gap-2">
+        <button onclick="sendEmails()" class="btn btn-warning">
+            <i class="bi bi-envelope-paper"></i> Envoyer mails aux destinataires
+        </button>
         <a href="{{ url_for('upload_csv', bid=boite.id) }}" class="btn btn-success">
             <i class="bi bi-cloud-upload"></i> Importer CSV
         </a>
@@ -12,6 +15,8 @@
         </a>
     </div>
 </div>
+
+<div id="send-result" class="mb-3" style="display:none;"></div>
 
 <div class="row mb-4">
     <div class="col-md-4">
@@ -181,4 +186,32 @@
         {% endif %}
     </div>
 </div>
+
+<script>
+function sendEmails() {
+    if (!confirm('Envoyer le message configuré à tous les destinataires de cette boîte ?')) {
+        return;
+    }
+    
+    const resultDiv = document.getElementById('send-result');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-info"><i class="bi bi-hourglass-split"></i> Envoi en cours...</div>';
+    
+    fetch('{{ url_for("send_emails_to_recipients", bid=boite.id) }}', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'}
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+        } else {
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+        }
+    })
+    .catch(error => {
+        resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur lors de l\'envoi</div>';
+    });
+}
+</script>
 {% endblock %}

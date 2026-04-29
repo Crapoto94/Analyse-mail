@@ -277,5 +277,74 @@ def test_api_ville():
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
 
+@app.route('/boite/<int:bid>/send-emails', methods=['POST'])
+def send_emails_to_recipients(bid):
+    import urllib.request
+    
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Boîte non trouvée'})
+    
+    recipients = conn.execute('SELECT DISTINCT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
+    conn.close()
+    
+    if not recipients:
+        return jsonify({'success': False, 'message': 'Aucun destinataire trouvé'})
+    
+    api_url = get_config('api_ville_url', '')
+    token = get_config('api_ville_token', '')
+    
+    if not api_url or not token:
+        return jsonify({'success': False, 'message': 'Configuration API Ville incomplète'})
+    
+    emetteur_nom = get_config('custom_message_emetteur_nom', '')
+    emetteur_email = get_config('custom_message_emetteur_email', '')
+    titre = get_config('custom_message_titre', '')
+    header1 = get_config('custom_message_header1', '')
+    header2 = get_config('custom_message_header2', '')
+    header3 = get_config('custom_message_header3', '')
+    message_body = get_config('custom_message', '')
+    
+    results = {'success': 0, 'failed': 0, 'errors': []}
+    
+    for r in recipients:
+        recipient = r['recipient_address']
+        try:
+            email_data = {
+                'to': recipient,
+                'from_name': emetteur_nom,
+                'from_email': emetteur_email,
+                'subject': titre,
+                'header1': header1,
+                'header2': header2,
+                'header3': header3,
+                'body': message_body
+            }
+            
+            data = json.dumps(email_data).encode('utf-8')
+            req = urllib.request.Request(
+                api_url.rstrip('/') + '/send',
+                data=data,
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                results['success'] += 1
+        except Exception as e:
+            results['failed'] += 1
+            results['errors'].append(f'{recipient}: {str(e)}')
+    
+    return jsonify({
+        'success': True,
+        'message': f'{results["success"]} emails envoyés, {results["failed"]} échecs',
+        'details': results
+    })
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
