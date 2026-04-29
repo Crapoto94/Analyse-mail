@@ -56,11 +56,15 @@
                     <button type="submit" class="btn btn-primary">
                         <i class="bi bi-check-lg"></i> Enregistrer le message
                     </button>
+                    <button type="button" class="btn btn-outline-info" onclick="testCustomMessage()">
+                        <i class="bi bi-send"></i> Tester l'envoi
+                    </button>
                 </form>
+                <div id="test-result-message" class="mt-3" style="display:none;"></div>
             </div>
         </div>
 
-        <div class="card">
+        <div class="card mt-4">
             <div class="card-header bg-secondary text-white">
                 <h4 class="mb-0"><i class="bi bi-cloud"></i> Configuration API Ville</h4>
             </div>
@@ -86,17 +90,12 @@
                     
                     <div class="d-flex gap-2">
                         <button type="submit" class="btn btn-primary">
-                            <i class="bi bi-check-lg"></i> Enregistrer le message
+                            <i class="bi bi-check-lg"></i> Enregistrer l'API
                         </button>
-                        <button type="button" class="btn btn-outline-info" onclick="testCustomMessage()">
-                            <i class="bi bi-send"></i> Tester l'envoi
+                        <button type="button" class="btn btn-outline-info" onclick="testApi()">
+                            <i class="bi bi-cloud-check"></i> Tester l'API
                         </button>
                     </div>
-                </form>
-                
-                <div id="test-result-message" class="mt-3" style="display:none;"></div>
-            </div>
-        </div>
                 </form>
                 
                 <div id="test-result" class="mt-3" style="display:none;"></div>
@@ -134,13 +133,21 @@ function testApi() {
         .then(response => response.json())
         .then(data => {
             if (data.success) {
-                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+                let html = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+                if (data.response) {
+                    html += '<div class="mt-2"><small><strong>Réponse:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+                }
+                resultDiv.innerHTML = html;
             } else {
-                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+                let html = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+                if (data.response) {
+                    html += '<div class="mt-2"><small><strong>Erreur:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+                }
+                resultDiv.innerHTML = html;
             }
         })
         .catch(error => {
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion</div>';
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
         });
 }
 
@@ -148,17 +155,37 @@ function testCustomMessage() {
     const resultDiv = document.getElementById('test-result-message');
     resultDiv.style.display = 'block';
     resultDiv.innerHTML = '<div class="alert alert-info">Envoi du message de test en cours...</div>';
+
+    const testData = {
+        emetteur_nom: document.getElementById('custom_message_emetteur_nom').value,
+        emetteur_email: document.getElementById('custom_message_emetteur_email').value,
+        titre: document.getElementById('custom_message_titre').value,
+        header1: document.getElementById('custom_message_header1').value,
+        header2: document.getElementById('custom_message_header2').value,
+        header3: document.getElementById('custom_message_header3').value,
+        cc: document.getElementById('custom_message_cc').value,
+        message: quill.root.innerHTML
+    };
     
     fetch('{{ url_for("test_send_custom") }}', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'}
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(testData)
     })
     .then(response => response.json())
     .then(data => {
         if (data.success) {
-            resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            let html = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            if (data.response) {
+                html += '<div class="mt-2"><small><strong>Réponse API:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+            }
+            resultDiv.innerHTML = html;
         } else {
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            let html = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            if (data.response) {
+                html += '<div class="mt-2"><small><strong>Erreur:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+            }
+            resultDiv.innerHTML = html;
         }
     })
     .catch(error => {

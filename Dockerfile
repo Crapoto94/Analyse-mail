@@ -9,6 +9,6 @@ COPY . .
 
 RUN mkdir -p uploads templates
 
-EXPOSE 5000
+EXPOSE 5050
 
 CMD ["python", "app.py"]

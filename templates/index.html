@@ -43,6 +43,12 @@
                                 <small class="text-muted">Destinataires</small>
                             </div>
                         </div>
+                        <div class="col">
+                            <div class="stat-card p-2">
+                                <h5>{{ stats[boite.id].nb_ips }}</h5>
+                                <small class="text-muted">IPs sources</small>
+                            </div>
+                        </div>
                     </div>
                     <div class="d-grid gap-2">
                         <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-outline-primary btn-sm">

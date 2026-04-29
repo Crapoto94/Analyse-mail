@@ -139,6 +139,7 @@ def index():
         stats[bid] = {
             'nb_messages': conn.execute('SELECT COUNT(*) as c FROM messages WHERE boite_id=?', (bid,)).fetchone()['c'],
             'nb_recipients': conn.execute('SELECT COUNT(DISTINCT recipient_address) as c FROM messages WHERE boite_id=?', (bid,)).fetchone()['c'],
+            'nb_ips': conn.execute('SELECT COUNT(DISTINCT from_ip) as c FROM messages WHERE boite_id=? AND from_ip!=""', (bid,)).fetchone()['c'],
             'statuts': dict(conn.execute('SELECT status, COUNT(*) as c FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall())
         }
     conn.close()
@@ -347,7 +348,21 @@ def test_api_ville():
             headers={'X-API-KEY': token, 'Accept': 'application/json'}
         )
         with urllib.request.urlopen(req, timeout=10) as response:
-            return jsonify({'success': True, 'message': f'API accessible (HTTP {response.status})'})
+            response_body = response.read().decode('utf-8')
+            return jsonify({
+                'success': True, 
+                'message': f'API accessible (HTTP {response.status})',
+                'response': response_body,
+                'url': api_url.rstrip('/') + '/ping'
+            })
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8')
+        return jsonify({
+            'success': False, 
+            'message': f'Erreur HTTP {e.code}',
+            'response': error_body,
+            'url': api_url.rstrip('/') + '/ping'
+        })
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
 
@@ -410,17 +425,21 @@ def test_send_custom():
     if not token or not api_url:
         return jsonify({'success': False, 'message': 'Configuration API manquante'})
     
-    emetteur_nom = get_config('custom_message_emetteur_nom', '')
-    emetteur_email = get_config('custom_message_emetteur_email', '')
-    titre = get_config('custom_message_titre', '')
-    header1 = get_config('custom_message_header1', '')
-    header2 = get_config('custom_message_header2', '')
-    header3 = get_config('custom_message_header3', '')
-    message_body = get_config('custom_message', '')
+    data = request.get_json() or {}
+    emetteur_nom = data.get('emetteur_nom', '')
+    emetteur_email = data.get('emetteur_email', '')
+    titre = data.get('titre', '')
+    header1 = data.get('header1', '')
+    header2 = data.get('header2', '')
+    header3 = data.get('header3', '')
+    cc_raw = data.get('cc', '')
+    cc_list = [addr.strip() for addr in cc_raw.split(',') if addr.strip()] if cc_raw else []
+    message_body = data.get('message', '')
     
     try:
         email_data = {
             'to': 'test@example.com',
+            'cc': cc_list,
             'from_name': emetteur_nom,
             'from_email': emetteur_email,
             'subject': titre,
