@@ -235,8 +235,40 @@ def view_boite(bid):
         else:
             print(f"DEBUG: Pas d'info pour {ip}")
     
+    # Analyse temporelle
+    timeline = conn.execute('''SELECT 
+        strftime('%Y-%m-%d %H', received) as hour,
+        COUNT(*) as cnt 
+        FROM messages WHERE boite_id=? 
+        GROUP BY strftime('%Y-%m-%d %H', received) 
+        ORDER BY hour''', (bid,)).fetchall()
+    
+    # Analyse par domaine de destinataire
+    domain_analysis = {}
+    for row in domain_rows:
+        email = row['recipient_address']
+        if '@' in email:
+            domain = email.split('@')[1].lower()
+            if domain not in domain_analysis:
+                domain_analysis[domain] = {'count': 0, 'recipients': set()}
+            domain_analysis[domain]['count'] += 1
+            domain_analysis[domain]['recipients'].add(email)
+    
+    domain_stats = [{'domain': k, 'count': v['count'], 'recipients': len(v['recipients'])} 
+                   for k, v in domain_analysis.items()]
+    domain_stats.sort(key=lambda x: x['count'], reverse=True)
+    
+    # Calculer la fenetre d'attaque
+    first_msg = conn.execute('SELECT MIN(received) as first FROM messages WHERE boite_id=?', (bid,)).fetchone()['first']
+    last_msg = conn.execute('SELECT MAX(received) as last FROM messages WHERE boite_id=?', (bid,)).fetchone()['last']
+    
     conn.close()
-    return render_template('view_boite.html', boite=boite, messages=messages, ips=ips, recipients=recipients, statuts=statuts, top_domains=top_domains, ip_info_list=ip_info_list)
+    return render_template('view_boite.html', 
+                         boite=boite, messages=messages, ips=ips, 
+                         recipients=recipients, statuts=statuts, 
+                         top_domains=top_domains, ip_info_list=ip_info_list,
+                         timeline=timeline, domain_stats=domain_stats,
+                         first_msg=first_msg, last_msg=last_msg)
 
 @app.route('/boite/<int:bid>/upload', methods=['GET', 'POST'])
 def upload_csv(bid):
