@@ -210,6 +210,7 @@ def view_boite(bid):
     messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
     ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
     recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
+    all_recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
     statuts = conn.execute('SELECT status, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall()
     
     # Extraire les domaines (top 50)
@@ -221,6 +222,7 @@ def view_boite(bid):
             domain = email.split('@')[1].lower()
             domains[domain] = domains.get(domain, 0) + 1
     top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:50]
+    all_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)
     
     # Géolocalisation des IPs
     ip_info_list = []

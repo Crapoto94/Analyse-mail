@@ -151,7 +151,12 @@
 
 {% if recipients %}
 <div class="card mb-4">
-    <div class="card-header">Top 50 Destinataires</div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Top 50 Destinataires</span>
+        <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#all-recipients" onclick="this.style.display='none'">
+            Voir tout
+        </button>
+    </div>
     <div class="card-body">
         <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
             <table class="table table-sm">
@@ -168,13 +173,36 @@
                 </tbody>
             </table>
         </div>
+        
+        <div class="collapse" id="all-recipients">
+            <div class="table-responsive mt-3" style="max-height: 600px; overflow-y: auto;">
+                <table class="table table-sm">
+                    <thead>
+                        <tr><th>Destinataire</th><th>Nb Messages</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for r in all_recipients %}
+                        <tr>
+                            <td>{{ r.recipient_address }}</td>
+                            <td><span class="badge bg-info">{{ r.cnt }}</span></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 </div>
 {% endif %}
 
 {% if top_domains %}
 <div class="card mb-4">
-    <div class="card-header">Top 50 Domaines</div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Top 50 Domaines</span>
+        <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#all-domains" onclick="this.style.display='none'">
+            Voir tout
+        </button>
+    </div>
     <div class="card-body">
         <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
             <table class="table table-sm">
@@ -191,6 +219,24 @@
                 </tbody>
             </table>
         </div>
+    
+        <div class="collapse" id="all-domains">
+            <div class="table-responsive mt-3" style="max-height: 600px; overflow-y: auto;">
+                <table class="table table-sm">
+                    <thead>
+                        <tr><th>Domaine</th><th>Nb Messages</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for domain, cnt in all_domains %}
+                        <tr>
+                            <td>{{ domain }}</td>
+                            <td><span class="badge bg-success">{{ cnt }}</span></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 </div>
 {% endif %}
@@ -198,7 +244,10 @@
 <div class="card">
     <div class="card-header d-flex justify-content-between align-items-center">
         Messages envoyés ({{ messages|length }})
-        <input type="text" id="filter-address" class="form-control form-control-sm w-25" placeholder="Filtrer par adresse..." onkeyup="filterMessages()">
+        <div class="input-group input-group-sm w-50">
+            <input type="text" id="filter-address" class="form-control" placeholder="Filtrer par adresse..." onkeyup="filterMessages()">
+            <span class="input-group-text" id="match-count">0</span>
+        </div>
     </div>
     <div class="card-body">
         {% if messages %}
@@ -247,18 +296,22 @@ function filterMessages() {
     var table = document.getElementById('messages-table');
     if (!table) return;
     var rows = table.getElementsByTagName('tbody')[0].getElementsByTagName('tr');
+    var matchCount = 0;
     
     for (var i = 0; i < rows.length; i++) {
         var cells = rows[i].getElementsByTagName('td');
         if (cells.length > 1) {
             var address = cells[1].textContent || cells[1].innerText;
-            if (address.toLowerCase().indexOf(filter) > -1) {
+            if (filter === '' || address.toLowerCase().indexOf(filter) > -1) {
                 rows[i].style.display = '';
+                matchCount++;
             } else {
                 rows[i].style.display = 'none';
             }
         }
     }
+    
+    document.getElementById('match-count').textContent = matchCount + ' / ' + rows.length;
 }
 
 
