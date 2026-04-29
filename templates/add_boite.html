@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Ajouter une boîte{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h1 class="mb-4"><i class="bi bi-envelope-plus"></i> Définir une boîte compromise</h1>
+        <div class="card">
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Adresse email de l'utilisateur *</label>
+                        <input type="email" class="form-control" name="user_email" required 
+                               placeholder="ex: utilisateur@domaine.fr">
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Date de compromission</label>
+                            <input type="date" class="form-control" name="date_compromission">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Heure de compromission</label>
+                            <input type="time" class="form-control" name="heure_compromission">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Date de découverte</label>
+                        <input type="date" class="form-control" name="date_decouverte">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Notes</label>
+                        <textarea class="form-control" name="notes" rows="3" 
+                                  placeholder="Contexte, observations..."></textarea>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-circle"></i> Enregistrer
+                        </button>
+                        <a href="{{ url_for('index') }}" class="btn btn-secondary">
+                            <i class="bi bi-x-circle"></i> Annuler
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

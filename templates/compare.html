@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Comparaison des boîtes{% endblock %}
+{% block content %}
+<h1 class="mb-4"><i class="bi bi-arrow-left-right"></i> Comparaison des boîtes compromises</h1>
+
+<a href="{{ url_for('index') }}" class="btn btn-secondary mb-3">
+    <i class="bi bi-arrow-left"></i> Retour
+</a>
+
+{% if comparisons %}
+    {% for comp in comparisons %}
+    <div class="card mb-4">
+        <div class="card-header">
+            <strong>{{ comp.boite1 }}</strong> vs <strong>{{ comp.boite2 }}</strong>
+        </div>
+        <div class="card-body">
+            <div class="alert alert-info">
+                <i class="bi bi-envelope"></i> 
+                <strong>{{ comp.common_count }}</strong> destinataire(s) en commun
+            </div>
+            {% if comp.common %}
+            <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                <table class="table table-sm">
+                    <thead>
+                        <tr><th>Destinataires communs</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for email in comp.common %}
+                        <tr><td><code>{{ email }}</code></td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% if comp.common_count > 100 %}
+            <small class="text-muted">Affichage limité aux 100 premiers...</small>
+            {% endif %}
+            {% else %}
+            <p class="text-muted">Aucun destinataire commun trouvé.</p>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+{% else %}
+    <div class="alert alert-warning">
+        <i class="bi bi-info-circle"></i> Il faut au moins 2 boîtes compromises pour faire une comparaison.
+    </div>
+{% endif %}
+{% endblock %}

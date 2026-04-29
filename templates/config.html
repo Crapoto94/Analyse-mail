@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Configuration{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card mb-4">
+            <div class="card-header bg-primary text-white">
+                <h4 class="mb-0"><i class="bi bi-chat-text"></i> Message personnalisé</h4>
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="custom_message_emetteur_nom" class="form-label">Émetteur (nom)</label>
+                            <input type="text" class="form-control" id="custom_message_emetteur_nom" name="custom_message_emetteur_nom" value="{{ custom_message_emetteur_nom }}">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="custom_message_emetteur_email" class="form-label">Émetteur (adresse mail)</label>
+                            <input type="email" class="form-control" id="custom_message_emetteur_email" name="custom_message_emetteur_email" value="{{ custom_message_emetteur_email }}">
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="custom_message_titre" class="form-label">Titre</label>
+                        <input type="text" class="form-control" id="custom_message_titre" name="custom_message_titre" value="{{ custom_message_titre }}">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="custom_message_header1" class="form-label">Header 1</label>
+                        <input type="text" class="form-control" id="custom_message_header1" name="custom_message_header1" value="{{ custom_message_header1 }}">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="custom_message_header2" class="form-label">Header 2</label>
+                        <input type="text" class="form-control" id="custom_message_header2" name="custom_message_header2" value="{{ custom_message_header2 }}">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="custom_message_header3" class="form-label">Header 3</label>
+                        <input type="text" class="form-control" id="custom_message_header3" name="custom_message_header3" value="{{ custom_message_header3 }}">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="custom_message" class="form-label">Message</label>
+                        <div id="editor-container" style="height: 200px;">{{ custom_message|safe }}</div>
+                        <input type="hidden" name="custom_message" id="custom_message">
+                        <div class="form-text">Message configurable (éditeur WYSIWYG)</div>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check-lg"></i> Enregistrer le message
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header bg-secondary text-white">
+                <h4 class="mb-0"><i class="bi bi-cloud"></i> Configuration API Ville</h4>
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="api_ville_url" class="form-label">URL de l'API Ville</label>
+                        <input type="url" class="form-control" id="api_ville_url" name="api_ville_url" value="{{ api_ville_url }}" placeholder="https://api-ville.toulouse.fr/api">
+                        <div class="form-text">URL de base de l'API Ville</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="api_ville_doc_url" class="form-label">Lien vers la documentation</label>
+                        <input type="url" class="form-control" id="api_ville_doc_url" name="api_ville_doc_url" value="{{ api_ville_doc_url }}" placeholder="https://api-ville.toulouse.fr/docs">
+                        <div class="form-text">URL de la documentation de l'API Ville</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="api_ville_token" class="form-label">Token API</label>
+                        <input type="password" class="form-control" id="api_ville_token" name="api_ville_token" value="{{ api_ville_token }}" placeholder="Saisir le token...">
+                        <div class="form-text">Token d'authentification pour l'API Ville</div>
+                    </div>
+                    
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-lg"></i> Enregistrer l'API
+                        </button>
+                        <button type="button" class="btn btn-outline-success" onclick="testApi()">
+                            <i class="bi bi-play-circle"></i> Tester l'API
+                        </button>
+                    </div>
+                </form>
+                
+                <div id="test-result" class="mt-3" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<link href="https://cdn.quilljs.com/1.3.7/quill.snow.css" rel="stylesheet">
+<script src="https://cdn.quilljs.com/1.3.7/quill.min.js"></script>
+<script>
+var quill = new Quill('#editor-container', {
+    theme: 'snow',
+    modules: {
+        toolbar: [
+            [{ 'header': [1, 2, 3, false] }],
+            ['bold', 'italic', 'underline'],
+            [{ 'list': 'ordered'}, { 'list': 'bullet' }],
+            ['link'],
+            ['clean']
+        ]
+    }
+});
+
+document.querySelector('form:first-of-type').addEventListener('submit', function(e) {
+    document.getElementById('custom_message').value = quill.root.innerHTML;
+});
+
+function testApi() {
+    const resultDiv = document.getElementById('test-result');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
+    
+    fetch('{{ url_for("test_api_ville") }}')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            } else {
+                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            }
+        })
+        .catch(error => {
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion</div>';
+        });
+}
+</script>
+{% endblock %}

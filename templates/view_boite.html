@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}Détails - {{ boite.user_email }}{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-envelope-exclamation"></i> {{ boite.user_email }}</h1>
+    <div>
+        <a href="{{ url_for('upload_csv', bid=boite.id) }}" class="btn btn-success">
+            <i class="bi bi-cloud-upload"></i> Importer CSV
+        </a>
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Retour
+        </a>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ messages|length }}</h3>
+                <small class="text-muted">Messages totaux</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ recipients|length }}</h3>
+                <small class="text-muted">Destinataires uniques</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ ips|length }}</h3>
+                <small class="text-muted">IPs sources</small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">Informations sur la compromission</div>
+    <div class="card-body">
+        <div class="row">
+            <div class="col-md-6">
+                <p><strong>Date de compromission:</strong> {{ boite.date_compromission or 'Non définie' }}</p>
+                <p><strong>Heure de compromission:</strong> {{ boite.heure_compromission or 'Non définie' }}</p>
+            </div>
+            <div class="col-md-6">
+                <p><strong>Date de découverte:</strong> {{ boite.date_decouverte or 'Non définie' }}</p>
+                <p><strong>Notes:</strong> {{ boite.notes or 'Aucune' }}</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if statuts %}
+<div class="card mb-4">
+    <div class="card-header">Statuts des messages</div>
+    <div class="card-body">
+        <div class="d-flex gap-2 flex-wrap">
+            {% for s in statuts %}
+                <span class="badge bg-{% if s.status == 'Delivered' %}success{% elif s.status == 'Failed' %}danger{% elif s.status == 'Resolved' %}secondary{% elif s.status == 'Quarantined' %}warning{% else %}primary{% endif %} p-2">
+                    {{ s.status }}: {{ s.cnt }}
+                </span>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if ips %}
+<div class="card mb-4">
+    <div class="card-header">IPs sources (attaquants)</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm">
+                <thead>
+                    <tr><th>IP Source</th><th>Nb Messages</th></tr>
+                </thead>
+                <tbody>
+                    {% for ip in ips %}
+                    <tr>
+                        <td><code>{{ ip.from_ip }}</code></td>
+                        <td><span class="badge bg-primary">{{ ip.cnt }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if recipients %}
+<div class="card mb-4">
+    <div class="card-header">Top 50 Destinataires</div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+            <table class="table table-sm">
+                <thead>
+                    <tr><th>Destinataire</th><th>Nb Messages</th></tr>
+                </thead>
+                <tbody>
+                    {% for r in recipients %}
+                    <tr>
+                        <td>{{ r.recipient_address }}</td>
+                        <td><span class="badge bg-info">{{ r.cnt }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if top_domains %}
+<div class="card mb-4">
+    <div class="card-header">Top 50 Domaines</div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+            <table class="table table-sm">
+                <thead>
+                    <tr><th>Domaine</th><th>Nb Messages</th></tr>
+                </thead>
+                <tbody>
+                    {% for domain, cnt in top_domains %}
+                    <tr>
+                        <td>{{ domain }}</td>
+                        <td><span class="badge bg-success">{{ cnt }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header">Messages envoyés ({{ messages|length }})</div>
+    <div class="card-body">
+        {% if messages %}
+        <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+            <table class="table table-hover table-sm">
+                <thead>
+                    <tr>
+                        <th>Date/Heure</th>
+                        <th>Destinataire</th>
+                        <th>Sujet</th>
+                        <th>Statut</th>
+                        <th>IP Source</th>
+                        <th>Taille</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for msg in messages %}
+                    <tr>
+                        <td><small>{{ msg.received }}</small></td>
+                        <td><small>{{ msg.recipient_address }}</small></td>
+                        <td><small>{{ msg.subject }}</small></td>
+                        <td>
+                            <span class="badge bg-{% if msg.status == 'Delivered' %}success{% elif msg.status == 'Failed' %}danger{% elif msg.status == 'Resolved' %}secondary{% elif msg.status == 'Quarantined' %}warning{% else %}primary{% endif %}">
+                                {{ msg.status }}
+                            </span>
+                        </td>
+                        <td><code><small>{{ msg.from_ip }}</small></code></td>
+                        <td><small>{{ (msg.size / 1024)|round(1) }} KB</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="alert alert-info">
+            Aucun message importé. <a href="{{ url_for('upload_csv', bid=boite.id) }}">Importer un fichier CSV</a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

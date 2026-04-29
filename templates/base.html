@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analyse de Compromission - {% block title %}{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .stat-card { border-left: 4px solid #0d6efd; }
+        .status-delivered { color: #198754; }
+        status-resolved { color: #6c757d; }
+        .status-failed { color: #dc3545; }
+        .status-quarantined { color: #fd7e14; }
+    </style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">
+    <div class="container">
+        <a class="navbar-brand" href="{{ url_for('index') }}">
+            <i class="bi bi-shield-exclamation"></i> Analyse Compromission
+        </a>
+        <div class="navbar-nav ms-auto">
+            <a class="nav-link text-white" href="{{ url_for('compare_boites') }}">
+                <i class="bi bi-arrow-left-right"></i> Comparaison
+            </a>
+            <a class="nav-link text-white" href="{{ url_for('config') }}">
+                <i class="bi bi-gear"></i> Configuration
+            </a>
+        </div>
+    </div>
+</nav>
+    <div class="container">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                {% for message in messages %}
+                    <div class="alert alert-info alert-dismissible fade show" role="alert">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

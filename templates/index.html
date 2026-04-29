@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Accueil{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-envelope-exclamation"></i> Boîtes Compromises</h1>
+    <a href="{{ url_for('add_boite') }}" class="btn btn-primary">
+        <i class="bi bi-plus-circle"></i> Ajouter une boîte
+    </a>
+</div>
+
+{% if boites %}
+    <div class="row">
+    {% for boite in boites %}
+        <div class="col-md-6 col-lg-4 mb-3">
+            <div class="card h-100">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <strong>{{ boite.user_email }}</strong>
+                    <form method="POST" action="{{ url_for('delete_boite', bid=boite.id) }}" 
+                          onsubmit="return confirm('Confirmer la suppression ?')" class="d-inline">
+                        <button class="btn btn-sm btn-outline-danger" type="submit">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </form>
+                </div>
+                <div class="card-body">
+                    <p class="card-text">
+                        <small class="text-muted">
+                            <i class="bi bi-calendar-event"></i> 
+                            Compromission: {{ boite.date_compromission or 'Non définie' }}
+                            {% if boite.heure_compromission %} à {{ boite.heure_compromission }}{% endif %}
+                        </small>
+                    </p>
+                    <div class="row text-center mb-3">
+                        <div class="col">
+                            <div class="stat-card p-2">
+                                <h5>{{ stats[boite.id].nb_messages }}</h5>
+                                <small class="text-muted">Messages</small>
+                            </div>
+                        </div>
+                        <div class="col">
+                            <div class="stat-card p-2">
+                                <h5>{{ stats[boite.id].nb_recipients }}</h5>
+                                <small class="text-muted">Destinataires</small>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="d-grid gap-2">
+                        <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-outline-primary btn-sm">
+                            <i class="bi bi-eye"></i> Voir les détails
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    {% endfor %}
+    </div>
+{% else %}
+    <div class="alert alert-warning text-center">
+        <i class="bi bi-info-circle"></i> Aucune boîte compromise enregistrée.
+        <a href="{{ url_for('add_boite') }}" class="alert-link">Ajouter une boîte</a>
+    </div>
+{% endif %}
+{% endblock %}
