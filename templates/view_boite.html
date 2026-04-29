@@ -196,11 +196,14 @@
 {% endif %}
 
 <div class="card">
-    <div class="card-header">Messages envoyés ({{ messages|length }})</div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+        Messages envoyés ({{ messages|length }})
+        <input type="text" id="filter-address" class="form-control form-control-sm w-25" placeholder="Filtrer par adresse..." onkeyup="filterMessages()">
+    </div>
     <div class="card-body">
         {% if messages %}
         <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
-            <table class="table table-hover table-sm">
+            <table class="table table-hover table-sm" id="messages-table">
                 <thead>
                     <tr>
                         <th>Date/Heure</th>
@@ -226,6 +229,15 @@
                         <td><small>{{ (msg.size / 1024)|round(1) }} KB</small></td>
                     </tr>
                     {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="alert alert-info">
+            Aucun message importé. <a href="{{ url_for('upload_csv', bid=boite.id) }}">Importer un fichier CSV</a>
+        </div>
+        {% endif %}
+    </div>
                 </tbody>
             </table>
         </div>
@@ -280,7 +292,15 @@ function sendEmails() {
             
             const resultDiv = document.getElementById('send-result');
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = '<div class="alert alert-info"><i class="bi bi-hourglass-split"></i> Envoi en cours...</div>';
+            resultDiv.innerHTML = `
+                <div class="alert alert-info">
+                    <i class="bi bi-hourglass-split"></i> Envoi en cours...
+                    <div class="progress mt-2" style="height: 20px;">
+                        <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" 
+                             role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+                    </div>
+                    <small id="progress-text" class="mt-1 d-block">Initialisation...</small>
+                </div>`;
             
             fetch('{{ url_for("send_emails_to_recipients", bid=boite.id) }}', {
                 method: 'POST',
@@ -288,7 +308,16 @@ function sendEmails() {
             })
             .then(response => response.json())
             .then(data => {
+                const progressBar = document.getElementById('progress-bar');
+                const progressText = document.getElementById('progress-text');
+                
                 if (data.success) {
+                    progressBar.style.width = '100%';
+                    progressBar.classList.remove('progress-bar-animated');
+                    progressBar.classList.add('bg-success');
+                    progressBar.textContent = '100%';
+                    progressText.textContent = 'Terminé !';
+                    
                     resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
                 } else {
                     let errorDetails = '';

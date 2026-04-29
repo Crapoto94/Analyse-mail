@@ -150,7 +150,19 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+from functools import wraps
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not (auth.username == 'admin' and auth.password == 'Admin94200!!!2025'):
+            return 'Unauthorized', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'}
+        return f(*args, **kwargs)
+    return decorated_function
+
 @app.route('/')
+@login_required
 def index():
     conn = get_db()
     boites = conn.execute('SELECT * FROM boites_compromises ORDER BY created_at DESC').fetchall()
