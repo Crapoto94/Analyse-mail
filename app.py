@@ -81,6 +81,18 @@ def init_db():
         hostname TEXT,
         query_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        level TEXT NOT NULL,
+        category TEXT NOT NULL,
+        message TEXT NOT NULL,
+        details TEXT,
+        boite_id INTEGER,
+        recipient TEXT,
+        FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
+    )''')
     
     # Migration: ajouter colonne hostname si elle n'existe pas
     try:
@@ -230,22 +242,20 @@ def set_config(key, value):
 
 init_db()
 
-# Charger la config depuis les variables d'environnement (Docker)
-def load_config_from_env():
-    import os
-    api_url = os.environ.get('API_VILLE_URL', '')
-    api_token = os.environ.get('API_VILLE_TOKEN', '')
-    if api_url:
-        set_config('api_ville_url', api_url)
-    if api_token:
-        set_config('api_ville_token', api_token)
-
-load_config_from_env()
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+def add_log(level, category, message, details=None, boite_id=None, recipient=None):
+    try:
+        conn = get_db()
+        conn.execute('INSERT INTO logs (level, category, message, details, boite_id, recipient) VALUES (?, ?, ?, ?, ?, ?)',
+                     (level, category, message, details, boite_id, recipient))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Erreur logging: {e}")
 
 from functools import wraps
 
@@ -471,6 +481,69 @@ def delete_boite(bid):
     flash('Boîte supprimée')
     return redirect(url_for('index'))
 
+@app.route('/logs')
+@login_required
+def view_logs():
+    conn = get_db()
+    page = request.args.get('page', 1, type=int)
+    per_page = 50
+    offset = (page - 1) * per_page
+
+    level_filter = request.args.get('level', '')
+    category_filter = request.args.get('category', '')
+    search = request.args.get('search', '')
+
+    query = 'SELECT * FROM logs WHERE 1=1'
+    params = []
+
+    if level_filter:
+        query += ' AND level=?'
+        params.append(level_filter)
+    if category_filter:
+        query += ' AND category=?'
+        params.append(category_filter)
+    if search:
+        query += ' AND (message LIKE ? OR details LIKE ? OR recipient LIKE ?)'
+        params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
+
+    query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+    params.extend([per_page, offset])
+
+    logs = conn.execute(query, params).fetchall()
+
+    count_query = 'SELECT COUNT(*) as cnt FROM logs WHERE 1=1'
+    count_params = []
+    if level_filter:
+        count_query += ' AND level=?'
+        count_params.append(level_filter)
+    if category_filter:
+        count_query += ' AND category=?'
+        count_params.append(category_filter)
+    if search:
+        count_query += ' AND (message LIKE ? OR details LIKE ? OR recipient LIKE ?)'
+        count_params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
+
+    total = conn.execute(count_query, count_params).fetchone()['cnt']
+    total_pages = (total + per_page - 1) // per_page
+
+    levels = conn.execute('SELECT DISTINCT level FROM logs ORDER BY level').fetchall()
+    categories = conn.execute('SELECT DISTINCT category FROM logs ORDER BY category').fetchall()
+
+    conn.close()
+    return render_template('logs.html', logs=logs, page=page, total_pages=total_pages,
+                           levels=levels, categories=categories,
+                           level_filter=level_filter, category_filter=category_filter, search=search)
+
+@app.route('/logs/clear', methods=['POST'])
+@login_required
+def clear_logs():
+    conn = get_db()
+    conn.execute('DELETE FROM logs')
+    conn.commit()
+    conn.close()
+    flash('Logs supprimés')
+    return redirect(url_for('view_logs'))
+
 @app.route('/compare')
 def compare_boites():
     conn = get_db()
@@ -686,25 +759,28 @@ def get_recipients_count(bid):
 def send_emails_to_recipients(bid):
     import urllib.request
     import traceback
-    
+
     conn = get_db()
     boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
     if not boite:
         conn.close()
+        add_log('ERROR', 'EMAIL', f'Boîte {bid} non trouvée lors de l\'envoi d\'emails')
         return jsonify({'success': False, 'message': 'Boîte non trouvée'})
-    
+
     recipients = conn.execute('SELECT DISTINCT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
     conn.close()
-    
+
     if not recipients:
+        add_log('WARNING', 'EMAIL', f'Aucun destinataire trouvé pour la boîte {bid}')
         return jsonify({'success': False, 'message': 'Aucun destinataire trouvé'})
-    
+
     api_url = get_config('api_ville_url', '')
     token = get_config('api_ville_token', '')
-    
+
     if not api_url or not token:
+        add_log('ERROR', 'EMAIL', f'Configuration API Ville incomplète pour la boîte {bid}', f'api_url: {api_url}, token présent: {bool(token)}', bid)
         return jsonify({'success': False, 'message': 'Configuration API Ville incomplète'})
-    
+
     emetteur_nom = get_config('custom_message_emetteur_nom', '')
     emetteur_email = get_config('custom_message_emetteur_email', '')
     titre = get_config('custom_message_titre', '')
@@ -714,9 +790,11 @@ def send_emails_to_recipients(bid):
     cc_raw = get_config('custom_message_cc', '')
     cc_list = [addr.strip() for addr in cc_raw.split(',') if addr.strip()] if cc_raw else []
     message_body = get_config('custom_message', '')
-    
+
+    add_log('INFO', 'EMAIL', f'Début envoi emails pour boîte {bid}', f'{len(recipients)} destinataires, sujet: {titre}', bid)
+
     results = {'success': 0, 'failed': 0, 'errors': [], 'debug': []}
-    
+
     for r in recipients:
         recipient = r['recipient_address']
         try:
@@ -732,11 +810,11 @@ def send_emails_to_recipients(bid):
                 'footer2': header2,
                 'footer3': header3
             }
-            
+
             data = json.dumps(email_data).encode('utf-8')
             full_url = api_url.rstrip('/') + '/api/v1/mail/send'
             results['debug'].append(f'Tentative envoi vers {full_url} pour {recipient}')
-            
+
             req = urllib.request.Request(
                 full_url,
                 data=data,
@@ -751,17 +829,21 @@ def send_emails_to_recipients(bid):
                 response_text = response.read().decode('utf-8')
                 results['debug'].append(f'Success: {response.status} - {response_text}')
                 results['success'] += 1
+                add_log('INFO', 'EMAIL', f'Email envoyé avec succès', f'HTTP {response.status} - {response_text}', bid, recipient)
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8') if e.fp else str(e)
             results['failed'] += 1
             results['errors'].append(f'{recipient}: HTTP {e.code} - {error_body}')
             results['debug'].append(f'HTTP Error: {e.code} - {error_body}')
+            add_log('ERROR', 'EMAIL', f'Échec envoi email vers {recipient}', f'HTTP {e.code} - {error_body}', bid, recipient)
         except Exception as e:
             results['failed'] += 1
             results['errors'].append(f'{recipient}: {str(e)}')
             results['debug'].append(f'Error: {traceback.format_exc()}')
-    
+            add_log('ERROR', 'EMAIL', f'Échec envoi email vers {recipient}', f'{str(e)}\n{traceback.format_exc()}', bid, recipient)
+
     error_details = ' | '.join(results['errors'][:3]) if results['errors'] else ''
+    add_log('INFO', 'EMAIL', f'Fin envoi emails pour boîte {bid}', f'{results["success"]} succès, {results["failed"]} échecs', bid)
     return jsonify({
         'success': results['failed'] == 0,
         'message': f'{results["success"]} emails envoyés, {results["failed"]} échecs. Détails: {error_details}',
@@ -802,8 +884,20 @@ def export_messages(bid):
     response.headers['Content-Disposition'] = f'attachment; filename=messages_{boite["user_email"].replace("@", "_")}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     return response
 
+def load_config_from_env():
+    import os
+    api_url = os.environ.get('API_VILLE_URL', '')
+    api_token = os.environ.get('API_VILLE_TOKEN', '')
+    if api_url:
+        set_config('api_ville_url', api_url)
+    if api_token:
+        set_config('api_ville_token', api_token)
+
+load_config_from_env()
+
 if __name__ == '__main__':
     import sys
+    load_config_from_env()
     if len(sys.argv) > 1 and sys.argv[1] == '--dev':
         app.run(host='0.0.0.0', debug=True, port=5050)
     else:

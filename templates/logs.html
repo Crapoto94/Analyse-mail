@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block content %}
+<h2><i class="bi bi-journal-text"></i> Logs</h2>
+
+<form class="row g-3 mb-3" method="get">
+    <div class="col-md-3">
+        <label class="form-label">Niveau</label>
+        <select name="level" class="form-select">
+            <option value="">Tous</option>
+            {% for l in levels %}
+            <option value="{{ l.level }}" {% if level_filter==l.level %}selected{% endif %}>{{ l.level }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div class="col-md-3">
+        <label class="form-label">Catégorie</label>
+        <select name="category" class="form-select">
+            <option value="">Toutes</option>
+            {% for c in categories %}
+            <option value="{{ c.category }}" {% if category_filter==c.category %}selected{% endif %}>{{ c.category }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div class="col-md-4">
+        <label class="form-label">Recherche</label>
+        <input type="text" name="search" class="form-control" value="{{ search }}" placeholder="Message, détails, destinataire...">
+    </div>
+    <div class="col-md-2 d-flex align-items-end">
+        <button type="submit" class="btn btn-primary w-100"><i class="bi bi-search"></i> Filtrer</button>
+    </div>
+</form>
+
+<form method="post" action="{{ url_for('clear_logs') }}" class="mb-3" onsubmit="return confirm('Supprimer tous les logs ?');">
+    <button type="submit" class="btn btn-danger"><i class="bi bi-trash"></i> Vider les logs</button>
+</form>
+
+<div class="table-responsive">
+    <table class="table table-sm table-hover">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Niveau</th>
+                <th>Catégorie</th>
+                <th>Message</th>
+                <th>Détails</th>
+                <th>Destinataire</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for log in logs %}
+            <tr class="{% if log.level=='ERROR' %}table-danger{% elif log.level=='WARNING' %}table-warning{% endif %}">
+                <td><small>{{ log.timestamp }}</small></td>
+                <td><span class="badge {% if log.level=='ERROR' %}bg-danger{% elif log.level=='WARNING' %}bg-warning{% else %}bg-info{% endif %}">{{ log.level }}</span></td>
+                <td>{{ log.category }}</td>
+                <td>{{ log.message }}</td>
+                <td><small class="text-muted">{{ log.details[:100] if log.details else '' }}</small></td>
+                <td><small>{{ log.recipient or '' }}</small></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-center text-muted">Aucun log</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<nav>
+    <ul class="pagination">
+        {% if page > 1 %}
+        <li class="page-item"><a class="page-link" href="?page={{ page-1 }}&level={{ level_filter }}&category={{ category_filter }}&search={{ search }}">Précédent</a></li>
+        {% endif %}
+        <li class="page-item disabled"><a class="page-link" href="#">Page {{ page }} / {{ total_pages }}</a></li>
+        {% if page < total_pages %}
+        <li class="page-item"><a class="page-link" href="?page={{ page+1 }}&level={{ level_filter }}&category={{ category_filter }}&search={{ search }}">Suivant</a></li>
+        {% endif %}
+    </ul>
+</nav>
+{% endblock %}
