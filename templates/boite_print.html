@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Analyse - {{ boite.user_email }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; font-size: 12px; }
+        h1 { color: #0d6efd; border-bottom: 2px solid #0d6efd; padding-bottom: 10px; }
+        h2 { color: #333; margin-top: 20px; font-size: 16px; }
+        table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f8f9fa; font-weight: bold; }
+        .stat-card { border: 1px solid #ddd; padding: 10px; margin: 10px 0; background: #f8f9fa; }
+        .badge { padding: 3px 8px; border-radius: 3px; font-size: 11px; }
+        .bg-success { background: #198754; color: white; }
+        .bg-warning { background: #ffc107; color: black; }
+        .bg-danger { background: #dc3545; color: white; }
+        @media print {
+            body { margin: 0; }
+            .no-print { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Analyse de compromission - {{ boite.user_email }}</h1>
+    
+    <div class="stat-card">
+        <strong>Date compromission :</strong> {{ boite.date_compromission }} {{ boite.heure_compromission }}<br>
+        <strong>Date découverte :</strong> {{ boite.date_decouverte }}<br>
+        <strong>Fenêtre d'attaque :</strong> {{ first_msg }} à {{ last_msg }}
+    </div>
+
+    <h2>Statistiques</h2>
+    <table>
+        <tr>
+            <th>Messages totaux</th>
+            <td>{{ messages|length }}</td>
+            <th>Destinataires uniques</th>
+            <td>{{ recipients|length }}</td>
+            <th>IPs sources</th>
+            <td>{{ ips|length }}</td>
+        </tr>
+    </table>
+
+    {% if spf_dkim_dmarc %}
+    <h2>SPF / DKIM / DMARC</h2>
+    <table>
+        <tr><th>SPF</th><td>{{ spf_dkim_dmarc.spf }}</td></tr>
+        <tr><th>DKIM</th><td>{{ spf_dkim_dmarc.dkim }}</td></tr>
+        <tr><th>DMARC</th><td>{{ spf_dkim_dmarc.dmarc }}</td></tr>
+    </table>
+    {% endif %}
+
+    <h2>Top 10 Domaines destinataires</h2>
+    <table>
+        <tr><th>Domaine</th><th>Nombre de messages</th></tr>
+        {% for domain, count in top_domains %}
+        <tr><td>{{ domain }}</td><td>{{ count }}</td></tr>
+        {% endfor %}
+    </table>
+
+    {% if ip_info_list %}
+    <h2>Géolocalisation des IPs</h2>
+    <table>
+        <tr><th>IP</th><th>Pays</th><th>Ville</th><th>ISP</th><th>VPN</th></tr>
+        {% for info in ip_info_list %}
+        <tr>
+            <td>{{ info.ip }}</td>
+            <td>{{ info.country }}</td>
+            <td>{{ info.city }}</td>
+            <td>{{ info.isp }}</td>
+            <td>{% if info.is_vpn %}Oui{% else %}Non{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
+    <h2>Messages ({{ messages|length }})</h2>
+    <table>
+        <tr><th>Date/Heure</th><th>Destinataire</th><th>Sujet</th><th>Statut</th><th>IP Source</th></tr>
+        {% for msg in messages[:100] %}
+        <tr>
+            <td>{{ msg.received }}</td>
+            <td>{{ msg.recipient_address }}</td>
+            <td>{{ msg.subject }}</td>
+            <td><span class="badge {% if msg.status == 'Delivered' %}bg-success{% elif msg.status == 'Failed' %}bg-danger{% else %}bg-warning{% endif %}">{{ msg.status }}</span></td>
+            <td>{{ msg.from_ip }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% if messages|length > 100 %}
+    <p><em>... et {{ messages|length - 100 }} autres messages</em></p>
+    {% endif %}
+
+    <div class="no-print" style="margin-top: 30px;">
+        <button onclick="window.print()">Imprimer / Exporter PDF</button>
+        <button onclick="window.close()">Fermer</button>
+    </div>
+</body>
+</html>

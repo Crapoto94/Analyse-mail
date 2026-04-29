@@ -3,3 +3,4 @@ Werkzeug==3.0.1
 waitress==3.0.0
 flask-httpauth==4.0.0
 dnspython==2.6.1
+weasyprint==61.2

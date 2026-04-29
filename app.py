@@ -597,6 +597,7 @@ def config():
             set_config('api_ville_url', request.form.get('api_ville_url', ''))
             set_config('api_ville_doc_url', request.form.get('api_ville_doc_url', ''))
             set_config('api_ville_token', request.form.get('api_ville_token', ''))
+            set_config('api_verify_ssl', request.form.get('api_verify_ssl', 'True'))
             flash('Configuration API enregistrée avec succès')
         return redirect(url_for('config'))
     
@@ -772,7 +773,26 @@ def get_recipients_count(bid):
 @app.route('/boite/<int:bid>/send-emails', methods=['POST'])
 def send_emails_to_recipients(bid):
     import urllib.request
+    import urllib.error
     import traceback
+    import ssl
+
+    def make_ssl_context():
+        """Crée un contexte SSL qui ignore la vérification si api_verify_ssl=False"""
+        verify_ssl = get_config('api_verify_ssl', 'True') == 'True'
+        if verify_ssl:
+            return ssl.create_default_context()
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+
+    def make_opener():
+        """Crée un opener avec le contexte SSL approprié"""
+        ctx = make_ssl_context()
+        https_handler = urllib.request.HTTPSHandler(context=ctx)
+        return urllib.request.build_opener(https_handler)
 
     conn = get_db()
     boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
@@ -825,10 +845,11 @@ def send_emails_to_recipients(bid):
                 'footer2': header2,
                 'footer3': header3
             }
-
+            
             data = json.dumps(email_data).encode('utf-8')
+            full_url = api_url.rstrip('/') + '/api/v1/mail/send'
             results['debug'].append(f'Tentative envoi vers {full_url} pour {recipient}')
-
+            
             req = urllib.request.Request(
                 full_url,
                 data=data,
@@ -839,7 +860,17 @@ def send_emails_to_recipients(bid):
                 },
                 method='POST'
             )
-            with urllib.request.urlopen(req, timeout=30) as response:
+            
+            # Contexte SSL selon config
+            ctx = ssl.create_default_context()
+            if not verify_ssl:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            
+            https_handler = urllib.request.HTTPSHandler(context=ctx)
+            opener = urllib.request.build_opener(https_handler)
+            
+            with opener.open(req, timeout=30) as response:
                 response_text = response.read().decode('utf-8')
                 results['debug'].append(f'Success: {response.status} - {response_text}')
                 results['success'] += 1
@@ -863,6 +894,78 @@ def send_emails_to_recipients(bid):
         'message': f'{results["success"]} emails envoyés, {results["failed"]} échecs. Détails: {error_details}',
         'details': results
     })
+
+@app.route('/boite/<int:bid>/export-pdf')
+def export_boite_pdf(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    
+    messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
+    ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
+    recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
+    
+    # Extraire les domaines
+    domain_rows = conn.execute('SELECT recipient_address FROM messages WHERE boite_id=?', (bid,)).fetchall()
+    domains = {}
+    for row in domain_rows:
+        email = row['recipient_address']
+        if '@' in email:
+            domain = email.split('@')[1].lower()
+            domains[domain] = domains.get(domain, 0) + 1
+    top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    # Géolocalisation des IPs
+    ip_info_list = []
+    for ip_row in ips:
+        ip = ip_row['from_ip']
+        info = get_ip_info(ip)
+        if info:
+            ip_info_list.append(info)
+    
+    # Vérification SPF/DKIM/DMARC
+    sender_domain = ''
+    spf_dkim_dmarc = None
+    if messages:
+        sender_email = messages[0]['sender_address'] if messages else ''
+        if '@' in sender_email:
+            sender_domain = sender_email.split('@')[1].lower()
+            spf_dkim_dmarc = check_spf_dkim_dmarc(sender_domain)
+    
+    # Analyse temporelle
+    timeline_rows = conn.execute('''SELECT 
+        CASE 
+            WHEN strftime('%M', received) < '15' THEN strftime('%Y-%m-%d %H:00', received)
+            WHEN strftime('%M', received) < '30' THEN strftime('%Y-%m-%d %H:15', received)
+            WHEN strftime('%M', received) < '45' THEN strftime('%Y-%m-%d %H:30', received)
+            ELSE strftime('%Y-%m-%d %H:45', received)
+        END as time_slot,
+        COUNT(*) as cnt 
+        FROM messages WHERE boite_id=? 
+        GROUP BY time_slot
+        ORDER BY time_slot''', (bid,)).fetchall()
+    timeline = [{'hour': row['time_slot'], 'cnt': row['cnt']} for row in timeline_rows]
+    
+    first_msg = conn.execute('SELECT MIN(received) as first FROM messages WHERE boite_id=?', (bid,)).fetchone()['first']
+    last_msg = conn.execute('SELECT MAX(received) as last FROM messages WHERE boite_id=?', (bid,)).fetchone()['last']
+    
+    conn.close()
+    
+    # Rendre le template HTML pour impression/PDF
+    html_content = render_template('boite_print.html',
+                                  boite=boite, messages=messages, ips=ips,
+                                  recipients=recipients, top_domains=top_domains,
+                                  ip_info_list=ip_info_list,
+                                  spf_dkim_dmarc=spf_dkim_dmarc,
+                                  timeline=timeline, first_msg=first_msg, last_msg=last_msg)
+    
+    response = make_response(html_content)
+    response.headers['Content-Type'] = 'text/html'
+    return response
+
 
 @app.route('/boite/<int:bid>/export')
 def export_messages(bid):
