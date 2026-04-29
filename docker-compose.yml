@@ -11,4 +11,6 @@ services:
     environment:
       - FLASK_ENV=production
       - PYTHONUNBUFFERED=1
+      - API_VILLE_URL=${API_VILLE_URL:-}
+      - API_VILLE_TOKEN=${API_VILLE_TOKEN:-}
     restart: unless-stopped

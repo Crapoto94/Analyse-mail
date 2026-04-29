@@ -2,7 +2,7 @@ import os
 import csv
 import sqlite3
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response
 from werkzeug.utils import secure_filename
 import json
 
@@ -42,8 +42,20 @@ def init_db():
         size INTEGER,
         message_trace_id TEXT,
         csv_source TEXT,
+        attachments TEXT,
+        urls TEXT,
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
+    
+    # Migrations pour ajouter les nouvelles colonnes si elles n'existent pas
+    try:
+        c.execute('ALTER TABLE messages ADD COLUMN attachments TEXT')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE messages ADD COLUMN urls TEXT')
+    except:
+        pass
     c.execute('''CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -131,6 +143,79 @@ def get_ip_info(ip):
     conn.close()
     return None
 
+def check_spf_dkim_dmarc(domain):
+    import dns.resolver
+    result = {'spf': 'Non vérifié', 'dkim': 'Non vérifié', 'dmarc': 'Non vérifié'}
+    
+    try:
+        # Vérifier SPF
+        try:
+            answers = dns.resolver.resolve(domain, 'TXT')
+            for rdata in answers:
+                for s in rdata.strings:
+                    if isinstance(s, bytes):
+                        txt = s.decode('utf-8')
+                    else:
+                        txt = str(s)
+                    if 'v=spf1' in txt.lower():
+                        result['spf'] = txt
+                        break
+                if result['spf'] != 'Non vérifié':
+                    break
+        except dns.resolver.NXDOMAIN:
+            result['spf'] = 'Domaine inexistant'
+        except dns.resolver.NoAnswer:
+            result['spf'] = 'Aucun enregistrement TXT'
+        except Exception as e:
+            result['spf'] = f'Erreur: {str(e)}'
+        
+        # Vérifier DMARC
+        try:
+            dmarc_domain = '_dmarc.' + domain
+            answers = dns.resolver.resolve(dmarc_domain, 'TXT')
+            for rdata in answers:
+                for s in rdata.strings:
+                    if isinstance(s, bytes):
+                        txt = s.decode('utf-8')
+                    else:
+                        txt = str(s)
+                    if 'v=dmarc1' in txt.lower():
+                        result['dmarc'] = txt
+                        break
+                if result['dmarc'] != 'Non vérifié':
+                    break
+        except dns.resolver.NXDOMAIN:
+            result['dmarc'] = 'Aucun enregistrement DMARC'
+        except dns.resolver.NoAnswer:
+            result['dmarc'] = 'Aucun enregistrement DMARC'
+        except Exception as e:
+            result['dmarc'] = f'Erreur: {str(e)}'
+        
+        # DKIM (vérifie quelques sélecteurs courants)
+        dkim_selectors = ['default', 'selector1', 'selector2', 'k1', 'google', 's1', 's2']
+        for selector in dkim_selectors:
+            try:
+                dkim_domain = selector + '._domainkey.' + domain
+                answers = dns.resolver.resolve(dkim_domain, 'TXT')
+                for rdata in answers:
+                    for s in rdata.strings:
+                        if isinstance(s, bytes):
+                            txt = s.decode('utf-8')
+                        else:
+                            txt = str(s)
+                        if 'v=dkim1' in txt.lower():
+                            result['dkim'] = 'Présent (sélecteur: ' + selector + ')'
+                            break
+                    if 'Présent' in result['dkim']:
+                        break
+            except:
+                continue
+        if 'Présent' not in result['dkim']:
+            result['dkim'] = 'Aucun enregistrement DKIM détecté'
+    except Exception as e:
+        print("Erreur DNS pour " + domain + ": " + str(e))
+    return result
+
 def get_config(key, default=''):
     conn = get_db()
     row = conn.execute('SELECT value FROM config WHERE key=?', (key,)).fetchone()
@@ -144,6 +229,18 @@ def set_config(key, value):
     conn.close()
 
 init_db()
+
+# Charger la config depuis les variables d'environnement (Docker)
+def load_config_from_env():
+    import os
+    api_url = os.environ.get('API_VILLE_URL', '')
+    api_token = os.environ.get('API_VILLE_TOKEN', '')
+    if api_url:
+        set_config('api_ville_url', api_url)
+    if api_token:
+        set_config('api_ville_token', api_token)
+
+load_config_from_env()
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -233,17 +330,36 @@ def view_boite(bid):
         info = get_ip_info(ip)
         if info:
             print(f"DEBUG: Info reçue pour {ip}: {info.get('city')}, {info.get('country')}")
-            ip_info_list.append(info)
+            # S'assurer que c'est un dictionnaire sérialisable
+            if isinstance(info, dict):
+                ip_info_list.append(info)
+            else:
+                ip_info_list.append(dict(info))
         else:
             print(f"DEBUG: Pas d'info pour {ip}")
     
-    # Analyse temporelle
-    timeline = conn.execute('''SELECT 
-        strftime('%Y-%m-%d %H', received) as hour,
+    # Vérification SPF/DKIM/DMARC pour le domaine expéditeur
+    sender_domain = ''
+    spf_dkim_dmarc = None
+    if messages:
+        sender_email = messages[0]['sender_address'] if messages else ''
+        if '@' in sender_email:
+            sender_domain = sender_email.split('@')[1].lower()
+            spf_dkim_dmarc = check_spf_dkim_dmarc(sender_domain)
+    
+    # Analyse temporelle (par tranches de 15 min)
+    timeline_rows = conn.execute('''SELECT 
+        CASE 
+            WHEN strftime('%M', received) < '15' THEN strftime('%Y-%m-%d %H:00', received)
+            WHEN strftime('%M', received) < '30' THEN strftime('%Y-%m-%d %H:15', received)
+            WHEN strftime('%M', received) < '45' THEN strftime('%Y-%m-%d %H:30', received)
+            ELSE strftime('%Y-%m-%d %H:45', received)
+        END as time_slot,
         COUNT(*) as cnt 
         FROM messages WHERE boite_id=? 
-        GROUP BY strftime('%Y-%m-%d %H', received) 
-        ORDER BY hour''', (bid,)).fetchall()
+        GROUP BY time_slot
+        ORDER BY time_slot''', (bid,)).fetchall()
+    timeline = [{'hour': row['time_slot'], 'cnt': row['cnt']} for row in timeline_rows]
     
     # Analyse par domaine de destinataire
     domain_analysis = {}
@@ -270,7 +386,8 @@ def view_boite(bid):
                          recipients=recipients, statuts=statuts, 
                          top_domains=top_domains, ip_info_list=ip_info_list,
                          timeline=timeline, domain_stats=domain_stats,
-                         first_msg=first_msg, last_msg=last_msg)
+                         first_msg=first_msg, last_msg=last_msg,
+                         sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc)
 
 @app.route('/boite/<int:bid>/upload', methods=['GET', 'POST'])
 def upload_csv(bid):
@@ -319,16 +436,23 @@ def import_csv(boite_id, filepath, source):
                 if not size_raw.isdigit():
                     size_raw = row.get('FromIP', '').split(';')[-1].strip('"') if ';' in row.get('FromIP', '') else '0'
                 size = int(size_raw) if str(size_raw).isdigit() else 0
+                
+                # Gestion des nouveaux champs (peuvent ne pas exister dans l'ancien CSV)
+                attachments = row.get('Attachments', '').strip('"') or None
+                urls = row.get('Urls', '').strip('"') or None
+                
                 conn.execute('''INSERT INTO messages 
                     (boite_id, message_id, received, sender_address, recipient_address,
-                     subject, status, to_ip, from_ip, size, message_trace_id, csv_source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                     subject, status, to_ip, from_ip, size, message_trace_id, csv_source,
+                     attachments, urls)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                     (boite_id, row.get('MessageId','').strip('"'), row.get('Received','').strip('"'),
                      row.get('SenderAddress','').strip('"'), row.get('RecipientAddress','').strip('"'),
                      row.get('Subject','').strip('"'), row.get('Status','').strip('"'),
                      row.get('ToIP','').strip('"'), from_ip,
                      size,
-                     row.get('MessageTraceId','').strip('"'), source))
+                     row.get('MessageTraceId','').strip('"'), source,
+                     attachments, urls))
                 count += 1
             except Exception as e:
                 print(f"Erreur ligne: {e}")
@@ -643,6 +767,40 @@ def send_emails_to_recipients(bid):
         'message': f'{results["success"]} emails envoyés, {results["failed"]} échecs. Détails: {error_details}',
         'details': results
     })
+
+@app.route('/boite/<int:bid>/export')
+def export_messages(bid):
+    import io
+    conn = get_db()
+    boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    
+    messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
+    conn.close()
+    
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(['Date/Heure', 'Destinataire', 'Sujet', 'Statut', 'IP Source', 'Taille (KB)', 'Pièces jointes', 'URLs'])
+    
+    for msg in messages:
+        writer.writerow([
+            msg['received'],
+            msg['recipient_address'],
+            msg['subject'],
+            msg['status'],
+            msg['from_ip'],
+            round(msg['size'] / 1024, 1) if msg['size'] else 0,
+            msg['attachments'] or '',
+            msg['urls'] or ''
+        ])
+    
+    response = make_response(output.getvalue())
+    response.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    response.headers['Content-Disposition'] = f'attachment; filename=messages_{boite["user_email"].replace("@", "_")}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    return response
 
 if __name__ == '__main__':
     import sys

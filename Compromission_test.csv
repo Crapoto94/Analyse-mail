@@ -1,0 +1,3 @@
+﻿MessageId;Received;SenderAddress;RecipientAddress;Subject;Status;ToIP;FromIP;Size;MessageTraceId
+"<PA4PR01MB72940FD1957718DF99E432F3B2362@PA4PR01MB7294.eurprd01.prod.exchangelabs.com>";"2026-04-27T08:59:59.199Z";"test@ivry94.fr";"marc1@fbc.fr";"Avis de paiement";"Delivered";"34.248.23.176";"198.154.180.131;463102";
+"<A4PR01MB72940FD1957718DF99E432F3B2362@PA4PR01MB7294.eurprd01.prod.exchangelabs.com>";"2026-04-27T08:59:59.101Z";"test@ivry94.fr";"marc2@fbc.fr";"Avis de paiement";"Delivered";"34.248.23.176";"2a01:111:f403:c20f::7;431512";

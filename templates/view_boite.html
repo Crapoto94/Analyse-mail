@@ -3,6 +3,8 @@
 {% block content %}
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h1><i class="bi bi-envelope-exclamation"></i> {{ boite.user_email }}</h1>
     <div class="d-flex gap-2">
@@ -241,113 +243,95 @@
 </div>
 {% endif %}
 
-<div class="card">
-    <div class="card-header d-flex justify-content-between align-items-center">
-        Messages envoyés ({{ messages|length }})
-        <div class="input-group input-group-sm w-50">
-            <input type="text" id="filter-address" class="form-control" placeholder="Filtrer par adresse..." onkeyup="filterMessages()">
-            <span class="input-group-text" id="match-count">0</span>
-        </div>
+{% if spf_dkim_dmarc %}
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-shield-check"></i> Sécurité Email - {{ sender_domain }}
     </div>
     <div class="card-body">
-        {% if messages %}
-        <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
-            <table class="table table-hover table-sm" id="messages-table">
-                <thead>
-                    <tr>
-                        <th>Date/Heure</th>
-                        <th>Destinataire</th>
-                        <th>Sujet</th>
-                        <th>Statut</th>
-                        <th>IP Source</th>
-                        <th>Taille</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for msg in messages %}
-                    <tr>
-                        <td><small>{{ msg.received }}</small></td>
-                        <td><small>{{ msg.recipient_address }}</small></td>
-                        <td><small>{{ msg.subject }}</small></td>
-                        <td>
-                            <span class="badge bg-{% if msg.status == 'Delivered' %}success{% elif msg.status == 'Failed' %}danger{% elif msg.status == 'Resolved' %}secondary{% elif msg.status == 'Quarantined' %}warning{% else %}primary{% endif %}">
-                                {{ msg.status }}
-                            </span>
-                        </td>
-                        <td><code><small>{{ msg.from_ip }}</small></code></td>
-                        <td><small>{{ (msg.size / 1024)|round(1) }} KB</small></td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+        <div class="row">
+            <div class="col-md-4">
+                <h6><i class="bi bi-envelope-check"></i> SPF (Sender Policy Framework)</h6>
+                <p class="small">{{ spf_dkim_dmarc.spf }}</p>
+            </div>
+            <div class="col-md-4">
+                <h6><i class="bi bi-key"></i> DKIM (DomainKeys Identified Mail)</h6>
+                <p class="small">{{ spf_dkim_dmarc.dkim }}</p>
+            </div>
+            <div class="col-md-4">
+                <h6><i class="bi bi-shield"></i> DMARC (Domain-based Message Authentication)</h6>
+                <p class="small">{{ spf_dkim_dmarc.dmarc }}</p>
+            </div>
         </div>
-        {% else %}
+        <div class="mt-2">
+            <small class="text-muted">
+                <i class="bi bi-info-circle"></i> 
+                Ces enregistrements DNS indiquent si le domaine expéditeur a configuré les protections anti-spoofing.
+                SPF définit les serveurs autorisés, DKIM signe les messages, DMARC politique de gestion.
+            </small>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if messages and (messages[0].attachments or messages[0].urls) %}
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-paperclip"></i> Pièces jointes et URLs détectées
+    </div>
+    <div class="card-body">
+        {% set has_attachments = messages|selectattr('attachments')|list|length > 0 %}
+        {% set has_urls = messages|selectattr('urls')|list|length > 0 %}
+        
+        {% if has_attachments %}
+        <div class="mb-3">
+            <h6><i class="bi bi-paperclip"></i> Pièces jointes</h6>
+            <div class="table-responsive" style="max-height: 200px; overflow-y: auto;">
+                <table class="table table-sm">
+                    <thead>
+                        <tr><th>Message</th><th>Pièces jointes</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for msg in messages if msg.attachments %}
+                        <tr>
+                            <td><small>{{ msg.subject or '(Sans sujet)' }}</small></td>
+                            <td><small>{{ msg.attachments }}</small></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if has_urls %}
+        <div class="mb-3">
+            <h6><i class="bi bi-link-45deg"></i> URLs détectées</h6>
+            <div class="table-responsive" style="max-height: 200px; overflow-y: auto;">
+                <table class="table table-sm">
+                    <thead>
+                        <tr><th>Message</th><th>URLs</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for msg in messages if msg.urls %}
+                        <tr>
+                            <td><small>{{ msg.subject or '(Sans sujet)' }}</small></td>
+                            <td><small><a href="{{ msg.urls }}" target="_blank">{{ msg.urls }}</a></small></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if not has_attachments and not has_urls %}
         <div class="alert alert-info">
-            Aucun message importé. <a href="{{ url_for('upload_csv', bid=boite.id) }}">Importer un fichier CSV</a>
+            <i class="bi bi-info-circle"></i> Aucune pièce jointe ou URL détectée dans les messages importés.
         </div>
         {% endif %}
     </div>
 </div>
-
-<script>
-function filterMessages() {
-    var input = document.getElementById('filter-address');
-    var filter = input.value.toLowerCase();
-    var table = document.getElementById('messages-table');
-    if (!table) return;
-    var tbody = table.getElementsByTagName('tbody')[0];
-    if (!tbody) return;
-    var rows = tbody.getElementsByTagName('tr');
-    var matchCount = 0;
-    
-    for (var i = 0; i < rows.length; i++) {
-        var cells = rows[i].getElementsByTagName('td');
-        if (cells.length > 1) {
-            var address = (cells[1].textContent || cells[1].innerText).toLowerCase();
-            if (filter === '' || address.indexOf(filter) > -1) {
-                rows[i].style.display = '';
-                matchCount++;
-            } else {
-                rows[i].style.display = 'none';
-            }
-        }
-    }
-    
-    var matchCountElem = document.getElementById('match-count');
-    if (matchCountElem) {
-        matchCountElem.textContent = matchCount + ' / ' + rows.length;
-    }
-    
-    return false;
-}
-
-
-<script>
-{% if ip_info_list %}
-var map = L.map('map').setView([48.8566, 2.3522], 2);
-
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap contributors'
-}).addTo(map);
-
-var ips = {{ ip_info_list|tojson }};
-ips.forEach(function(ip) {
-    if (ip.lat && ip.lon) {
-        var vpnBadge = ip.is_vpn ? ' <span class="badge bg-warning">VPN/Proxy</span>' : '';
-        var popupContent = '<div style="min-width:200px">' +
-            '<strong>' + ip.ip + '</strong>' + vpnBadge + '<br>' +
-            '<i class="bi bi-geo-alt"></i> ' + ip.city + ' (' + ip.zip + '), ' + ip.country + '<br>' +
-            '<i class="bi bi-hdd-network"></i> ' + ip.isp + '<br>' +
-            '<small><i class="bi bi-clock"></i> ' + ip.timezone + '</small>';
-        if (ip.hostname) {
-            popupContent += '<br><small><i class="bi bi-pc-display"></i> ' + ip.hostname + '</small>';
-        }
-        popupContent += '</div>';
-        
-        var marker = L.marker([ip.lat, ip.lon]).addTo(map)
-            .bindPopup(popupContent);
-    }
-});
 {% endif %}
 
 <div class="card mb-4">
@@ -385,6 +369,9 @@ ips.forEach(function(ip) {
     {% if timeline %}
     <div class="mt-3">
         <h6><i class="bi bi-graph-up"></i> Timeline des attaques (par heure)</h6>
+        <div class="mb-3">
+            <canvas id="timelineChart" style="max-height: 300px;"></canvas>
+        </div>
         <div style="height: 200px; overflow-y: auto;">
             <table class="table table-sm">
                 <thead>
@@ -422,7 +409,155 @@ ips.forEach(function(ip) {
             </li>
         </ul>
     </div>
+    </div>
 </div>
+
+<!-- Bouton Export CSV -->
+<div class="mb-3">
+    <a href="{{ url_for('export_messages', bid=boite.id) }}" class="btn btn-outline-success">
+        <i class="bi bi-download"></i> Exporter les messages filtrés en CSV
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        Messages envoyés ({{ messages|length }})
+        <div class="input-group input-group-sm w-50">
+            <input type="text" id="filter-address" class="form-control" placeholder="Filtrer par adresse..." onkeyup="filterMessages()">
+            <span class="input-group-text" id="match-count">0</span>
+        </div>
+    </div>
+    <div class="card-body">
+        {% if messages %}
+        <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+            <table class="table table-hover table-sm" id="messages-table">
+                <thead>
+                    <tr>
+                        <th>Date/Heure</th>
+                        <th>Destinataire</th>
+                        <th>Sujet</th>
+                        <th>Statut</th>
+                        <th>IP Source</th>
+                        <th>Taille</th>
+                        <th>Pièces jointes</th>
+                        <th>URLs</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for msg in messages %}
+                    <tr>
+                        <td><small>{{ msg.received }}</small></td>
+                        <td><small>{{ msg.recipient_address }}</small></td>
+                        <td><small>{{ msg.subject }}</small></td>
+                        <td>
+                            <span class="badge bg-{% if msg.status == 'Delivered' %}success{% elif msg.status == 'Failed' %}danger{% elif msg.status == 'Resolved' %}secondary{% elif msg.status == 'Quarantined' %}warning{% else %}primary{% endif %}">
+                                {{ msg.status }}
+                            </span>
+                        </td>
+                        <td><code><small>{{ msg.from_ip }}</small></code></td>
+                        <td><small>{{ (msg.size / 1024)|round(1) }} KB</small></td>
+                        <td><small>{% if msg.attachments %}{{ msg.attachments }}{% else %}-{% endif %}</small></td>
+                        <td><small>{% if msg.urls %}<a href="{{ msg.urls }}" target="_blank">{{ msg.urls[:50] }}{% if msg.urls|length > 50 %}...{% endif %}</a>{% else %}-{% endif %}</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="alert alert-info">
+            Aucun message importé. <a href="{{ url_for('upload_csv', bid=boite.id) }}">Importer un fichier CSV</a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+function filterMessages() {
+    var input = document.getElementById('filter-address');
+    var filter = input.value.toLowerCase().trim();
+    var table = document.getElementById('messages-table');
+    if (!table) return;
+    var tbody = table.getElementsByTagName('tbody')[0];
+    if (!tbody) return;
+    var rows = tbody.getElementsByTagName('tr');
+    var matchCount = 0;
+    
+    for (var i = 0; i < rows.length; i++) {
+        var cells = rows[i].getElementsByTagName('td');
+        if (cells.length > 1) {
+            var address = (cells[1].textContent || cells[1].innerText).toLowerCase();
+            if (filter === '' || address.indexOf(filter) > -1) {
+                rows[i].style.display = '';
+                matchCount++;
+            } else {
+                rows[i].style.display = 'none';
+            }
+        }
+    }
+    
+    var matchCountElem = document.getElementById('match-count');
+    if (matchCountElem) {
+        matchCountElem.textContent = matchCount + ' / ' + rows.length;
+    }
+}
+
+{% if ip_info_list %}
+var map = L.map('map').setView([48.8566, 2.3522], 2);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors'
+}).addTo(map);
+
+var ips = {{ ip_info_list|tojson }};
+ips.forEach(function(ip) {
+    if (ip.lat && ip.lon) {
+        var vpnBadge = ip.is_vpn ? ' <span class="badge bg-warning">VPN/Proxy</span>' : '';
+        var popupContent = '<div style="min-width:200px">' +
+            '<strong>' + ip.ip + '</strong>' + vpnBadge + '<br>' +
+            '<i class="bi bi-geo-alt"></i> ' + ip.city + ' (' + ip.zip + '), ' + ip.country + '<br>' +
+            '<i class="bi bi-hdd-network"></i> ' + ip.isp + '<br>' +
+            '<small><i class="bi bi-clock"></i> ' + ip.timezone + '</small>';
+        if (ip.hostname) {
+            popupContent += '<br><small><i class="bi bi-pc-display"></i> ' + ip.hostname + '</small>';
+        }
+        popupContent += '</div>';
+        
+        var marker = L.marker([ip.lat, ip.lon]).addTo(map)
+            .bindPopup(popupContent);
+    }
+});
+{% endif %}
+
+{% if timeline %}
+var timelineData = {{ timeline|tojson }};
+var ctx = document.getElementById('timelineChart').getContext('2d');
+var timelineChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: timelineData.map(t => t.hour),
+        datasets: [{
+            label: 'Nombre de messages',
+            data: timelineData.map(t => t.cnt),
+            borderColor: 'rgb(75, 192, 192)',
+            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+            tension: 0.1,
+            fill: true
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: { display: true },
+            title: { display: true, text: 'Évolution temporelle des attaques' }
+        },
+        scales: {
+            y: { beginAtZero: true, title: { display: true, text: 'Nb messages' } },
+            x: { title: { display: true, text: 'Heure' }, ticks: { maxRotation: 45, autoSkip: true, maxTicksLimit: 20 } }
+        }
+    }
+});
+{% endif %}
 
 function sendEmails() {
     fetch('{{ url_for("get_recipients_count", bid=boite.id) }}')
