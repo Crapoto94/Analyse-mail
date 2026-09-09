@@ -188,34 +188,51 @@ app.jinja_env.filters['mfa_status'] = format_mfa_status
 
 def friendly_graph_error(message):
     """Resume une erreur technique Microsoft Graph (souvent une longue URL + un corps
-    JSON) en une phrase courte et comprehensible, pour affichage direct dans l'UI
-    (le message brut integral reste disponible en infobulle). Conserve un eventuel
-    prefixe de source court (ex: 'Règles de messagerie : ') devant le resume."""
+    JSON) en une phrase courte et comprehensible, pour affichage direct dans l'UI (le
+    message brut integral reste disponible en infobulle). Un message peut regrouper
+    plusieurs sources d'echec separees par ' / ' (voir run_monitoring_scan) : chaque
+    segment est traite independamment, et les segments correspondant a un etat normal
+    (ex: boite sans licence Exchange) sont retires plutot que juste reformules — on ne
+    veut pas les afficher DU TOUT, meme sous une forme adoucie. Si tous les segments
+    sont ainsi retires (y compris pour une donnee deja enregistree avant ce filtrage),
+    la fonction retourne une chaine vide et l'appelant doit alors n'afficher aucune
+    alerte : c'est reevalue a chaque affichage, pas seulement a l'ecriture."""
     if not message:
         return ''
 
-    prefix = ''
-    rest = message
-    if ': ' in message:
-        candidate_prefix, candidate_rest = message.split(': ', 1)
-        if len(candidate_prefix) <= 40 and 'http' not in candidate_prefix.lower():
-            prefix, rest = candidate_prefix + ' : ', candidate_rest
+    outer_prefix = ''
+    body = message
+    if message.startswith('Scan partiel : '):
+        outer_prefix, body = 'Scan partiel : ', message[len('Scan partiel : '):]
 
-    text = rest.lower()
-    if 'mailboxnotenabledforrestapi' in text or ('404' in text and 'mailfolders' in text):
-        summary = "boîte Exchange indisponible (normal pour un compte d'administration dédié sans licence Exchange)"
-    elif 'read operation timed out' in text or "n'a pas répondu à temps" in text or 'timed out' in text:
-        summary = "Microsoft Graph n'a pas répondu à temps (temporaire, devrait se résoudre au prochain scan)"
-    elif 'http 403' in text or 'authorization_requestdenied' in text:
-        summary = "permission Microsoft Graph manquante ou consentement admin non accordé (voir Configuration)"
-    elif 'http 401' in text or 'invalidauthenticationtoken' in text:
-        summary = 'authentification Microsoft Graph refusée (secret expiré ou configuration incorrecte)'
-    elif 'configuration microsoft graph incomplète' in text:
-        summary = 'configuration Microsoft Graph incomplète (voir Configuration)'
-    else:
-        summary = rest if len(rest) <= 140 else rest[:140] + '…'
+    summaries = []
+    for seg in (s.strip() for s in body.split(' / ')):
+        if not seg:
+            continue
+        prefix, rest = '', seg
+        if ': ' in seg:
+            candidate_prefix, candidate_rest = seg.split(': ', 1)
+            if len(candidate_prefix) <= 40 and 'http' not in candidate_prefix.lower():
+                prefix, rest = candidate_prefix + ' : ', candidate_rest
 
-    return prefix + summary
+        text = rest.lower()
+        if 'mailboxnotenabledforrestapi' in text or ('404' in text and 'mailfolders' in text):
+            continue  # etat normal (compte sans boite Exchange) : ne pas afficher du tout
+        elif 'read operation timed out' in text or "n'a pas répondu à temps" in text or 'timed out' in text:
+            summary = "Microsoft Graph n'a pas répondu à temps (temporaire, devrait se résoudre au prochain scan)"
+        elif 'http 403' in text or 'authorization_requestdenied' in text:
+            summary = "permission Microsoft Graph manquante ou consentement admin non accordé (voir Configuration)"
+        elif 'http 401' in text or 'invalidauthenticationtoken' in text:
+            summary = 'authentification Microsoft Graph refusée (secret expiré ou configuration incorrecte)'
+        elif 'configuration microsoft graph incomplète' in text:
+            summary = 'configuration Microsoft Graph incomplète (voir Configuration)'
+        else:
+            summary = rest if len(rest) <= 140 else rest[:140] + '…'
+        summaries.append(prefix + summary)
+
+    if not summaries:
+        return ''
+    return outer_prefix + ' / '.join(summaries)
 
 
 app.jinja_env.filters['friendly_graph_error'] = friendly_graph_error

@@ -80,7 +80,8 @@
                         <td><code>{{ p.prefix }}*</code></td>
                         <td>{% if p.is_active %}<span class="badge bg-success">Actif</span>{% else %}<span class="badge bg-secondary">En pause</span>{% endif %}</td>
                         <td><small class="text-muted">{{ p.last_sync_at|paris if p.last_sync_at else 'Jamais synchronisé' }}</small>
-                            {% if p.last_error %}<div class="small text-danger" title="{{ p.last_error }}"><i class="bi bi-exclamation-circle"></i> {{ p.last_error|friendly_graph_error }}</div>{% endif %}
+                            {% set p_err = p.last_error|friendly_graph_error %}
+                            {% if p_err %}<div class="small text-danger" title="{{ p.last_error }}"><i class="bi bi-exclamation-circle"></i> {{ p_err }}</div>{% endif %}
                         </td>
                         <td>{{ mailboxes|selectattr('source_pattern_id', 'equalto', p.id)|list|length }}</td>
                         <td class="text-end text-nowrap">
@@ -152,7 +153,8 @@
                             {% elif m.last_scan_verdict == 'signals_to_check' %}<span class="text-warning small"><i class="bi bi-exclamation-triangle-fill"></i> À vérifier</span>
                             {% elif m.last_scan_verdict == 'no_strong_signal' %}<span class="text-success small"><i class="bi bi-check-circle-fill"></i> RAS</span>
                             {% else %}<span class="text-muted small">-</span>{% endif %}
-                            {% if m.last_error %}<div class="small text-danger" title="{{ m.last_error }}"><i class="bi bi-exclamation-circle"></i> {{ m.last_error|friendly_graph_error }}</div>{% endif %}
+                            {% set m_err = m.last_error|friendly_graph_error %}
+                            {% if m_err %}<div class="small text-danger" title="{{ m.last_error }}"><i class="bi bi-exclamation-circle"></i> {{ m_err }}</div>{% endif %}
                         </td>
                         <td class="text-end text-nowrap">
                             <form method="POST" action="{{ url_for('scan_now_monitored_mailbox', mailbox_id=m.id) }}" class="d-inline">
