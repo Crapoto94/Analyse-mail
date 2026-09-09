@@ -7,6 +7,16 @@ services:
       - "5050:5050"
     volumes:
       - ./uploads:/app/uploads
+      # IMPORTANT : monte le fichier de base de donnees de l'hote directement dans le
+      # conteneur. Sans ce montage, compromis.db est copie dans l'image au moment du
+      # build (COPY . . dans le Dockerfile) : tout rebuild (ex: pour recuperer une mise
+      # a jour du code) ecrase alors les donnees ecrites depuis le dernier build
+      # (configuration, comptes, boites surveillees...) avec l'ancien contenu du depot
+      # git. Avec ce montage, le conteneur lit/ecrit directement le fichier de l'hote,
+      # qui survit donc a n'importe quel rebuild. Le fichier ./compromis.db DOIT deja
+      # exister sur l'hote avant le premier "docker-compose up" avec cette ligne, sinon
+      # Docker cree un DOSSIER a la place (piege classique des bind mounts de fichier).
+      - ./compromis.db:/app/compromis.db
     environment:
       - FLASK_ENV=production
       - PYTHONUNBUFFERED=1
