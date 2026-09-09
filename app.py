@@ -3377,8 +3377,22 @@ _monitoring_lock = threading.Lock()
 MONITORING_SCAN_WINDOW_DAYS = 7
 
 # Seuil de score (sur 10, voir compute_risk_score) au-dela duquel un scan de surveillance
-# declenche une alerte Teams : "score > 5", strictement, comme demande.
-TEAMS_ALERT_SCORE_THRESHOLD = 5
+# declenche une alerte Teams — 5 par defaut, mais reglable par un administrateur depuis
+# Configuration (voir get_teams_alert_threshold ci-dessous et le POST /config).
+TEAMS_ALERT_SCORE_THRESHOLD_DEFAULT = 5
+
+
+def get_teams_alert_threshold():
+    """Seuil configure par un administrateur (config 'teams_alert_score_threshold'), avec
+    repli sur TEAMS_ALERT_SCORE_THRESHOLD_DEFAULT si absent ou invalide."""
+    raw = get_config('teams_alert_score_threshold', '').strip()
+    try:
+        value = int(raw)
+        if 0 <= value <= 10:
+            return value
+    except ValueError:
+        pass
+    return TEAMS_ALERT_SCORE_THRESHOLD_DEFAULT
 
 VERDICT_LABELS = {
     'compromise_likely': 'Compromission probable',
@@ -3390,7 +3404,7 @@ VERDICT_LABELS = {
 def send_teams_alert(email, score, verdict, findings_summary, mailbox_id=None, boite_id=None):
     """Poste une carte d'alerte dans le canal Microsoft Teams configure (webhook entrant,
     cle 'teams_webhook_url') quand une boite surveillee bascule en compromission probable
-    (score > TEAMS_ALERT_SCORE_THRESHOLD). Ne fait rien si aucune URL n'est configuree.
+    (score > seuil configurable, voir get_teams_alert_threshold). Ne fait rien si aucune URL n'est configuree.
     Utilise le format "MessageCard" classique des webhooks entrants Teams (Office 365
     Connector) — pas de dependance externe (urllib.request, comme le reste de l'appli).
     Si `boite_id` est fourni (fiche d'incident deja creee/instruite par
@@ -3449,7 +3463,7 @@ def send_teams_alert(email, score, verdict, findings_summary, mailbox_id=None, b
 
 def escalate_to_incident(email, score, verdict, findings_summary):
     """Quand une boite surveillee bascule en compromission probable (score >
-    TEAMS_ALERT_SCORE_THRESHOLD), transforme automatiquement l'alerte en debut
+    get_teams_alert_threshold()), transforme automatiquement l'alerte en debut
     d'investigation complete : cree (ou reutilise) la fiche d'incident correspondante,
     importe via Microsoft Graph tout ce qu'importe manuellement un analyste (connexions,
     journal d'audit, regles de messagerie ET messages envoyes), lance l'analyse IA si un
@@ -3564,9 +3578,10 @@ def run_monitoring_scan(mailbox_row):
         # nouvelle fiche/import/analyse IA serait relancee et un message Teams renvoye a
         # chaque passage. Cree la fiche d'incident, importe tout via Graph (avec messages),
         # lance l'analyse IA, puis alerte Teams avec le lien direct vers la fiche.
+        threshold = get_teams_alert_threshold()
         previous_score = mailbox_row['last_scan_score']
-        was_already_over_threshold = previous_score is not None and previous_score > TEAMS_ALERT_SCORE_THRESHOLD
-        if result['score'] > TEAMS_ALERT_SCORE_THRESHOLD and not was_already_over_threshold:
+        was_already_over_threshold = previous_score is not None and previous_score > threshold
+        if result['score'] > threshold and not was_already_over_threshold:
             escalate_to_incident(email, result['score'], result['verdict'], findings_summary)
 
         level = 'WARNING' if (result['score'] >= 6 or partial_note) else 'INFO'
@@ -4653,6 +4668,14 @@ def config():
             flash('Configuration IA enregistrée avec succès')
         elif 'teams_webhook_url' in request.form:
             set_config('teams_webhook_url', request.form.get('teams_webhook_url', '').strip())
+            threshold_raw = request.form.get('teams_alert_score_threshold', '').strip()
+            try:
+                threshold_value = int(threshold_raw)
+                if not (0 <= threshold_value <= 10):
+                    raise ValueError
+                set_config('teams_alert_score_threshold', str(threshold_value))
+            except ValueError:
+                flash('Seuil invalide (nombre entier entre 0 et 10 attendu) — non modifié')
             flash('Configuration Teams enregistrée avec succès')
         elif 'abuseipdb_api_key' in request.form:
             new_key = request.form.get('abuseipdb_api_key', '')
@@ -4687,7 +4710,7 @@ def config():
         nvidia_default_model=NVIDIA_DEFAULT_MODEL,
         groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE,
         teams_webhook_url=get_config('teams_webhook_url', ''),
-        teams_alert_score_threshold=TEAMS_ALERT_SCORE_THRESHOLD,
+        teams_alert_score_threshold=get_teams_alert_threshold(),
         abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')))
 
 @app.route('/api/diag/proxy-headers')

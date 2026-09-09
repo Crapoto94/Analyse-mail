@@ -286,6 +286,12 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                                value="{{ teams_webhook_url }}" placeholder="https://xxxxx.webhook.office.com/webhookb2/...">
                         <div class="form-text">Laisser vide pour désactiver les alertes Teams.</div>
                     </div>
+                    <div class="mb-3">
+                        <label for="teams_alert_score_threshold" class="form-label">Seuil de score déclenchant l'escalade</label>
+                        <input type="number" class="form-control" id="teams_alert_score_threshold" name="teams_alert_score_threshold"
+                               value="{{ teams_alert_score_threshold }}" min="0" max="10" step="1" style="max-width:120px;">
+                        <div class="form-text">Sur 10 — l'alerte se déclenche pour un score strictement supérieur à cette valeur.</div>
+                    </div>
                     <button type="button" class="btn btn-sm btn-outline-secondary mb-3" onclick="testTeamsWebhook()">
                         <i class="bi bi-plug"></i> Envoyer un message de test
                     </button>
