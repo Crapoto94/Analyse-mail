@@ -2098,6 +2098,72 @@ def global_search():
     return render_template('search_results.html', q=q, results=results, total=total, too_short=False)
 
 
+# Nombre maximum de boites sur lesquelles le tableau de bord recalcule le score de risque
+# actuel (voir analyze_compromise) : plafonne pour rester rapide meme sur une base avec
+# beaucoup d'incidents deja cloture — les plus recents sont les plus pertinents a afficher.
+DASHBOARD_MAX_SCORED_BOITES = 100
+
+
+@app.route('/dashboard')
+def dashboard():
+    """Tableau de bord agrege : tendance des incidents dans le temps, repartition des
+    verdicts actuels, IPs qui reviennent sur plusieurs boites (signal de compromission
+    croisee), et etat de la surveillance/du monitoring connexions — pour avoir une vue
+    d'ensemble sans ouvrir boite par boite."""
+    conn = get_db()
+
+    incidents_by_month = conn.execute('''
+        SELECT strftime('%Y-%m', created_at) as month, COUNT(*) as c
+        FROM boites_compromises GROUP BY month ORDER BY month''').fetchall()
+
+    boite_ids = [r['id'] for r in conn.execute(
+        'SELECT id FROM boites_compromises ORDER BY created_at DESC LIMIT ?',
+        (DASHBOARD_MAX_SCORED_BOITES,)).fetchall()]
+    conn.close()
+
+    verdict_counts = {'compromise_likely': 0, 'signals_to_check': 0, 'no_strong_signal': 0}
+    for bid in boite_ids:
+        try:
+            analysis = analyze_compromise(bid)
+            verdict_counts[analysis['verdict']] = verdict_counts.get(analysis['verdict'], 0) + 1
+        except Exception:
+            continue
+
+    conn = get_db()
+    # IPs qui reviennent sur plusieurs boites differentes (messages + connexions + audit
+    # confondus) : signal fort de compromission croisee (meme attaquant, plusieurs comptes).
+    shared_ips = conn.execute('''
+        SELECT ip, COUNT(DISTINCT boite_id) as nb_boites FROM (
+            SELECT from_ip as ip, boite_id FROM messages WHERE from_ip != ''
+            UNION ALL
+            SELECT ip_address as ip, boite_id FROM signin_logs WHERE ip_address != ''
+            UNION ALL
+            SELECT ip_address as ip, boite_id FROM audit_logs WHERE ip_address != ''
+        ) GROUP BY ip HAVING nb_boites >= 2 ORDER BY nb_boites DESC LIMIT 20''').fetchall()
+
+    nb_boites_total = conn.execute('SELECT COUNT(*) as c FROM boites_compromises').fetchone()['c']
+    nb_monitored_active = conn.execute('SELECT COUNT(*) as c FROM monitored_mailboxes WHERE is_active=1').fetchone()['c']
+    nb_monitored_alert = conn.execute(
+        "SELECT COUNT(*) as c FROM monitored_mailboxes WHERE is_active=1 AND last_scan_verdict='compromise_likely'"
+    ).fetchone()['c']
+    nb_signins_24h = conn.execute(
+        "SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= datetime('now','-1 day')").fetchone()['c']
+    nb_signins_failed_24h = conn.execute(
+        "SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= datetime('now','-1 day') AND status != 'Success'"
+    ).fetchone()['c']
+    top_recipients = conn.execute('''
+        SELECT recipient_address, COUNT(*) as c FROM messages
+        WHERE recipient_address != '' GROUP BY recipient_address ORDER BY c DESC LIMIT 10''').fetchall()
+    conn.close()
+
+    return render_template('dashboard.html',
+        incidents_by_month=incidents_by_month, verdict_counts=verdict_counts,
+        shared_ips=shared_ips, nb_boites_total=nb_boites_total,
+        nb_monitored_active=nb_monitored_active, nb_monitored_alert=nb_monitored_alert,
+        nb_signins_24h=nb_signins_24h, nb_signins_failed_24h=nb_signins_failed_24h,
+        top_recipients=top_recipients, scored_boites_count=len(boite_ids))
+
+
 @app.route('/boite/add', methods=['GET', 'POST'])
 def add_boite():
     if request.method == 'POST':

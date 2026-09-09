@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Tableau de bord{% endblock %}
+{% block content %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-bar-chart-line"></i> Tableau de bord</h1>
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Accueil
+    </a>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ nb_boites_total }}</h3><small class="text-muted">Incidents au total</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card" style="border-left-color:#198754;"><div class="card-body text-center">
+            <h3>{{ nb_monitored_active }}</h3><small class="text-muted">Boîtes surveillées actives</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card" style="border-left-color:#dc3545;"><div class="card-body text-center">
+            <h3>{{ nb_monitored_alert }}</h3><small class="text-muted">En compromission probable</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card" style="border-left-color:#fd7e14;"><div class="card-body text-center">
+            <h3>{{ nb_signins_failed_24h }} / {{ nb_signins_24h }}</h3><small class="text-muted">Échecs de connexion (24h, tenant)</small>
+        </div></div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-8">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-graph-up"></i> Incidents créés par mois</div>
+            <div class="card-body">
+                {% if incidents_by_month %}
+                <canvas id="incidentsChart" style="max-height:280px;"></canvas>
+                {% else %}
+                <p class="text-muted mb-0">Aucun incident enregistré pour le moment.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">
+                <i class="bi bi-pie-chart"></i> Verdicts actuels
+                <small class="text-muted">(sur les {{ scored_boites_count }} incidents les plus récents)</small>
+            </div>
+            <div class="card-body">
+                <canvas id="verdictChart" style="max-height:280px;"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header">
+                <i class="bi bi-exclamation-diamond"></i> IPs présentes sur plusieurs boîtes
+                <span class="text-muted small">(signal de compromission croisée)</span>
+            </div>
+            <div class="card-body">
+                {% if shared_ips %}
+                <div class="table-responsive">
+                    <table class="table table-hover table-sm">
+                        <thead><tr><th>IP</th><th>Nb boîtes</th></tr></thead>
+                        <tbody>
+                            {% for row in shared_ips %}
+                            <tr>
+                                <td>{{ ip_badge(row.ip) }}</td>
+                                <td><span class="badge bg-danger">{{ row.nb_boites }}</span></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">Aucune IP commune détectée entre plusieurs boîtes.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-envelope-at"></i> Destinataires les plus ciblés</div>
+            <div class="card-body">
+                {% if top_recipients %}
+                <div class="table-responsive">
+                    <table class="table table-hover table-sm">
+                        <thead><tr><th>Destinataire</th><th>Messages</th></tr></thead>
+                        <tbody>
+                            {% for r in top_recipients %}
+                            <tr><td><small>{{ r.recipient_address }}</small></td><td><span class="badge bg-primary">{{ r.c }}</span></td></tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">Aucun message importé pour le moment.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+{% if incidents_by_month %}
+new Chart(document.getElementById('incidentsChart').getContext('2d'), {
+    type: 'bar',
+    data: {
+        labels: {{ incidents_by_month|map(attribute='month')|list|tojson }},
+        datasets: [{
+            label: 'Incidents créés',
+            data: {{ incidents_by_month|map(attribute='c')|list|tojson }},
+            backgroundColor: '#0d6efd'
+        }]
+    },
+    options: { scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }, plugins: { legend: { display: false } } }
+});
+{% endif %}
+
+new Chart(document.getElementById('verdictChart').getContext('2d'), {
+    type: 'doughnut',
+    data: {
+        labels: ['Compromission probable', 'Signaux à vérifier', 'RAS'],
+        datasets: [{
+            data: [{{ verdict_counts.compromise_likely }}, {{ verdict_counts.signals_to_check }}, {{ verdict_counts.no_strong_signal }}],
+            backgroundColor: ['#dc3545', '#fd7e14', '#198754']
+        }]
+    },
+    options: { plugins: { legend: { position: 'bottom' } } }
+});
+</script>
+{% endblock %}
