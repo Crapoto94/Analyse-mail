@@ -53,6 +53,9 @@
                         <td>{% if u.is_active %}<span class="badge bg-success">Actif</span>{% else %}<span class="badge bg-secondary">Désactivé</span>{% endif %}</td>
                         <td><small class="text-muted">{{ u.created_at|paris }}</small></td>
                         <td class="text-end">
+                            <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#pwd-{{ u.id }}">
+                                <i class="bi bi-key"></i> Mot de passe
+                            </button>
                             {% if u.id != session.get('user_id') %}
                             <form method="POST" action="{{ url_for('toggle_user', user_id=u.id) }}" class="d-inline">
                                 <button class="btn btn-sm btn-outline-secondary" type="submit">
@@ -66,6 +69,21 @@
                                 </button>
                             </form>
                             {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="collapse" id="pwd-{{ u.id }}">
+                        <td colspan="5" class="bg-light">
+                            <form method="POST" action="{{ url_for('reset_user_password', user_id=u.id) }}" class="row g-2 align-items-end py-2">
+                                <div class="col-md-4">
+                                    <label class="form-label small mb-1">Nouveau mot de passe pour {{ u.username }}</label>
+                                    <input type="password" class="form-control form-control-sm" name="new_password" minlength="8" required>
+                                </div>
+                                <div class="col-md-3">
+                                    <button type="submit" class="btn btn-sm btn-primary">
+                                        <i class="bi bi-check-lg"></i> Enregistrer
+                                    </button>
+                                </div>
+                            </form>
                         </td>
                     </tr>
                     {% endfor %}

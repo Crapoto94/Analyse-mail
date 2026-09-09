@@ -1141,6 +1141,29 @@ def toggle_user(user_id):
     return redirect(url_for('list_users'))
 
 
+@app.route('/users/<int:user_id>/reset-password', methods=['POST'])
+@admin_required
+def reset_user_password(user_id):
+    new_password = request.form.get('new_password', '')
+    if len(new_password) < 8:
+        flash('Le mot de passe doit contenir au moins 8 caractères')
+        return redirect(url_for('list_users'))
+
+    conn = get_db()
+    target = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        flash('Utilisateur non trouvé')
+        return redirect(url_for('list_users'))
+
+    conn.execute('UPDATE users SET password_hash=? WHERE id=?', (generate_password_hash(new_password), user_id))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'AUTH', f"Mot de passe modifié pour {target['username']} par {session.get('username')}")
+    flash(f"Mot de passe de {target['username']} modifié avec succès")
+    return redirect(url_for('list_users'))
+
+
 @app.route('/')
 def index():
     conn = get_db()
