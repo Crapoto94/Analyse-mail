@@ -527,12 +527,23 @@ def init_db():
         role TEXT NOT NULL DEFAULT 'user',
         is_active INTEGER NOT NULL DEFAULT 1,
         auth_source TEXT NOT NULL DEFAULT 'local',
+        must_change_password INTEGER NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
     # Migration: ajouter la colonne auth_source si elle n'existe pas (bases existantes)
     try:
         c.execute("ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'")
+    except Exception:
+        pass
+
+    # Migration : force le changement de mot de passe a la prochaine connexion — utilise
+    # pour le compte admin par defaut (voir plus bas) et chaque fois qu'un administrateur
+    # cree un compte ou reinitialise un mot de passe pour quelqu'un d'autre (voir add_user
+    # et reset_user_password) : la personne choisit alors elle-meme son mot de passe des
+    # sa premiere connexion, plutot que de garder indefiniment celui fixe par un tiers.
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0')
     except Exception:
         pass
 
@@ -611,11 +622,13 @@ def init_db():
     )''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_api_key_usage_key_id ON api_key_usage(api_key_id)')
 
-    # Migration : creer un compte admin par defaut si la table users est vide, en reprenant
-    # l'ancien mot de passe HTTP Basic pour ne pas verrouiller l'acces existant.
+    # Migration : creer un compte admin par defaut si la table users est vide. Identifiants
+    # volontairement simples (admin/admin) puisque must_change_password=1 force de toute
+    # facon un changement de mot de passe des la premiere connexion — pas de mot de passe
+    # "definitif" fixe dans le code source a retenir/proteger.
     if c.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
-        c.execute('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
-                   ('admin', generate_password_hash('Admin94200!!!2025'), 'admin'))
+        c.execute('INSERT INTO users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 1)',
+                   ('admin', generate_password_hash('admin'), 'admin'))
 
     # Migration: ajouter colonne hostname si elle n'existe pas
     try:
@@ -1620,15 +1633,25 @@ from functools import wraps
 # Routes accessibles sans etre connecte (endpoints Flask, pas les URLs).
 PUBLIC_ENDPOINTS = {'login', 'static', 'microsoft_login', 'microsoft_callback'}
 
+# Endpoints encore accessibles a un compte dont le mot de passe doit etre change (en plus
+# des routes publiques ci-dessus) : la page de changement elle-meme et la deconnexion,
+# sans quoi un compte fraichement cree se retrouverait bloque sans issue.
+PASSWORD_CHANGE_ALLOWED_ENDPOINTS = {'change_password', 'logout'}
+
 
 @app.before_request
 def require_login():
     """Impose une connexion pour toute l'application, sauf la page de connexion elle-meme
-    et les fichiers statiques. Remplace l'ancienne authentification HTTP Basic globale."""
+    et les fichiers statiques. Remplace l'ancienne authentification HTTP Basic globale.
+    Impose egalement le changement de mot de passe (compte fraichement cree/reinitialise
+    par un administrateur, ou compte admin par defaut jamais personnalise) avant tout
+    acces au reste de l'application."""
     if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
         return
     if not session.get('user_id'):
         return redirect(url_for('login', next=request.path))
+    if session.get('must_change_password') and request.endpoint not in PASSWORD_CHANGE_ALLOWED_ENDPOINTS:
+        return redirect(url_for('change_password'))
 
 
 def login_required(f):
@@ -1669,11 +1692,60 @@ def login():
             session['user_id'] = user['id']
             session['username'] = user['username']
             session['role'] = user['role']
+            session['must_change_password'] = bool(user['must_change_password'])
             next_url = request.form.get('next') or url_for('index')
             return redirect(next_url)
         flash('Identifiants incorrects')
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     return render_template('login.html', next=request.args.get('next', ''), graph_configured=graph_configured)
+
+
+@app.route('/change-password', methods=['GET', 'POST'])
+def change_password():
+    """Changement de mot de passe force (compte fraichement cree/reinitialise par un
+    administrateur, ou compte admin par defaut jamais personnalise — voir must_change_password
+    et require_login). Accessible aussi volontairement par n'importe quel utilisateur connecte
+    pour changer son propre mot de passe a tout moment (pas seulement quand c'est impose)."""
+    if not session.get('user_id'):
+        return redirect(url_for('login'))
+    conn = get_db()
+    user = conn.execute('SELECT * FROM users WHERE id=?', (session['user_id'],)).fetchone()
+    if not user:
+        conn.close()
+        session.clear()
+        return redirect(url_for('login'))
+    if user['auth_source'] == 'microsoft':
+        conn.close()
+        flash("Ce compte s'authentifie via Microsoft — aucun mot de passe local à changer ici")
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        current_password = request.form.get('current_password', '')
+        new_password = request.form.get('new_password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        if not check_password_hash(user['password_hash'], current_password):
+            conn.close()
+            flash('Mot de passe actuel incorrect')
+            return render_template('change_password.html', forced=bool(session.get('must_change_password')))
+        if len(new_password) < 8:
+            conn.close()
+            flash('Le nouveau mot de passe doit contenir au moins 8 caractères')
+            return render_template('change_password.html', forced=bool(session.get('must_change_password')))
+        if new_password != confirm_password:
+            conn.close()
+            flash('La confirmation ne correspond pas au nouveau mot de passe')
+            return render_template('change_password.html', forced=bool(session.get('must_change_password')))
+        conn.execute('UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?',
+                     (generate_password_hash(new_password), user['id']))
+        conn.commit()
+        conn.close()
+        session['must_change_password'] = False
+        add_log('INFO', 'AUTH', f"Mot de passe changé par {user['username']}")
+        flash('Mot de passe modifié avec succès')
+        return redirect(url_for('index'))
+
+    conn.close()
+    return render_template('change_password.html', forced=bool(session.get('must_change_password')))
 
 
 @app.route('/logout', methods=['POST'])
@@ -1859,7 +1931,9 @@ def add_user():
 
     conn = get_db()
     try:
-        conn.execute('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
+        # must_change_password=1 : c'est l'administrateur qui choisit ce mot de passe
+        # initial, pas la personne elle-meme — elle devra le changer a sa premiere connexion.
+        conn.execute('INSERT INTO users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 1)',
                      (username, generate_password_hash(password), role))
         conn.commit()
         flash(f"Utilisateur {username} créé avec succès")
@@ -1938,7 +2012,8 @@ def reset_user_password(user_id):
         flash('Utilisateur non trouvé')
         return redirect(url_for('list_users'))
 
-    conn.execute('UPDATE users SET password_hash=? WHERE id=?', (generate_password_hash(new_password), user_id))
+    conn.execute('UPDATE users SET password_hash=?, must_change_password=1 WHERE id=?',
+                 (generate_password_hash(new_password), user_id))
     conn.commit()
     conn.close()
     add_log('INFO', 'AUTH', f"Mot de passe modifié pour {target['username']} par {session.get('username')}")

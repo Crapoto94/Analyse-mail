@@ -166,6 +166,7 @@ function showGlobalLoadingFatalError(err) {
                     <li><a class="dropdown-item" href="{{ url_for('list_trusted_ips') }}"><i class="bi bi-patch-check"></i> IPs de confiance</a></li>
                     <li><hr class="dropdown-divider"></li>
                     {% endif %}
+                    <li><a class="dropdown-item" href="{{ url_for('change_password') }}"><i class="bi bi-shield-lock"></i> Changer mon mot de passe</a></li>
                     <li>
                         <form method="POST" action="{{ url_for('logout') }}">
                             <button type="submit" class="dropdown-item">
