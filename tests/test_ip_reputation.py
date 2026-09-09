@@ -82,3 +82,39 @@ def test_trusted_ip_city_override_corrects_imprecise_geolocation(app_module, cli
 
 def test_display_location_unchanged_for_ip_without_override(app_module):
     assert app_module.get_display_location('198.51.100.1', 'Berlin, Berlin, DE') == 'Berlin, Berlin, DE'
+
+
+def test_is_datacenter_flag_matches_abuseipdb_usage_type():
+    """AbuseIPDB renvoie exactement 'Data Center/Web Hosting/Transit' (avec espace)."""
+    payload = {'usage_type': 'Data Center/Web Hosting/Transit', 'is_trusted': False}
+    assert (not payload['is_trusted']) and any(
+        kw in payload['usage_type'].lower() for kw in ('data center', 'datacenter'))
+
+
+def test_datacenter_badge_shown_via_heuristic_hosting_keyword(app_module, monkeypatch):
+    """Sans clé AbuseIPDB configurée, l'app retombe sur un heuristique par mot-clé
+    ISP/organisation (ex: Amazon) qui doit aussi déclencher le badge DC."""
+    monkeypatch.setattr(app_module, 'get_ip_info',
+                         lambda ip: {'ip': ip, 'isp': 'Amazon.com, Inc.', 'org': 'EC2', 'country': 'Netherlands'})
+    payload = app_module.ip_reputation_payload('198.51.100.50')
+    assert 'atacenter' in payload['usage_type']  # 'Hébergeur/Datacenter (estimation heuristique)'
+    assert payload['is_datacenter'] is True
+
+
+def test_datacenter_badge_hidden_for_trusted_ip_even_if_datacenter(app_module, client, monkeypatch):
+    """Sauf pour les IPs de confiance : meme si la reputation la classe hebergeur/datacenter,
+    le badge DC ne doit pas s'afficher pour une IP deja declaree de confiance."""
+    login_as_default_admin(client)
+    client.post('/admin/trusted-ips/add', data={'ip': '198.51.100.60', 'label': 'Ville', 'note': ''})
+    monkeypatch.setattr(app_module, 'get_ip_info',
+                         lambda ip: {'ip': ip, 'isp': 'Amazon.com, Inc.', 'org': 'EC2', 'country': 'France'})
+    payload = app_module.ip_reputation_payload('198.51.100.60')
+    assert payload['is_trusted'] is True
+    assert payload['is_datacenter'] is False
+
+
+def test_no_datacenter_badge_for_residential_isp(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, 'get_ip_info',
+                         lambda ip: {'ip': ip, 'isp': 'Orange SA', 'org': '', 'country': 'France'})
+    payload = app_module.ip_reputation_payload('198.51.100.70')
+    assert payload['is_datacenter'] is False

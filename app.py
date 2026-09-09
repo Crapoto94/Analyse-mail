@@ -991,6 +991,10 @@ def ip_reputation_payload(ip):
         'is_vpn': bool(info.get('is_vpn')),
         'is_trusted': bool(info.get('is_trusted')),
         'trusted_label': info.get('trusted_label') or '',
+        # Badge "DC" (hebergeur/datacenter) : jamais pour une IP de confiance deja
+        # identifiee et validee par un administrateur, meme si AbuseIPDB la classe ainsi.
+        'is_datacenter': (not info.get('is_trusted')) and any(
+            kw in (info.get('usage_type') or '').lower() for kw in ('data center', 'datacenter')),
     }
 
 
@@ -1006,6 +1010,8 @@ def _ip_badge_html(payload):
         extra_badges += f' <span class="badge bg-primary" style="font-size:0.65em;">{escape(payload.get("trusted_label") or "Ville")}</span>'
     if payload.get('is_vpn'):
         extra_badges += ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>'
+    if payload.get('is_datacenter'):
+        extra_badges += ' <span class="badge bg-secondary" style="font-size:0.65em;">DC</span>'
     data_attr = escape(json.dumps(payload, ensure_ascii=False))
     return Markup(
         f'<span class="ip-badge text-nowrap"><code>{escape(ip)}</code> '
@@ -6070,6 +6076,10 @@ def api_v1_openapi():
             'is_whitelisted': {'type': 'boolean'},
             'last_reported_at': {'type': 'string', 'nullable': True},
             'is_vpn': {'type': 'boolean'},
+            'is_trusted': {'type': 'boolean', 'description': "IP déclarée de confiance par un administrateur (page IPs de confiance)."},
+            'trusted_label': {'type': 'string'},
+            'is_datacenter': {'type': 'boolean', 'description': (
+                "Type d'usage \"Data Center/Web Hosting/Transit\" — jamais vrai pour une IP de confiance.")},
         }
     }
 

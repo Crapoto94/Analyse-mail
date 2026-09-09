@@ -255,7 +255,8 @@ function showGlobalLoadingFatalError(err) {
                 '<span class="ip-rep-dot" style="background-color:' + dotColor + ';"></span> ' +
                 '<strong>' + (info.level_label || '') + '</strong>' +
                 (info.is_trusted ? ' <span class="badge bg-primary">' + (info.trusted_label || 'Ville') + '</span>' : '') +
-                (info.is_vpn ? ' <span class="badge bg-warning text-dark">VPN/Proxy</span>' : '');
+                (info.is_vpn ? ' <span class="badge bg-warning text-dark">VPN/Proxy</span>' : '') +
+                (info.is_datacenter ? ' <span class="badge bg-secondary">DC</span>' : '');
 
             var location = [info.city, info.country].filter(Boolean).join(', ');
             setText('ipInfoLocation', location);
@@ -373,11 +374,17 @@ function showGlobalLoadingFatalError(err) {
                           var dot = a.querySelector('.ip-rep-dot');
                           if (dot) dot.style.backgroundColor = color;
                           if (!a.parentElement.querySelector('.badge')) {
+                              var badgesHtml = '';
                               if (info.is_trusted) {
-                                  a.insertAdjacentHTML('afterend', ' <span class="badge bg-primary" style="font-size:0.65em;">' + (info.trusted_label || 'Ville') + '</span>');
-                              } else if (info.is_vpn) {
-                                  a.insertAdjacentHTML('afterend', ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>');
+                                  badgesHtml += ' <span class="badge bg-primary" style="font-size:0.65em;">' + (info.trusted_label || 'Ville') + '</span>';
                               }
+                              if (info.is_vpn) {
+                                  badgesHtml += ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>';
+                              }
+                              if (info.is_datacenter) {
+                                  badgesHtml += ' <span class="badge bg-secondary" style="font-size:0.65em;">DC</span>';
+                              }
+                              if (badgesHtml) a.insertAdjacentHTML('afterend', badgesHtml);
                           }
                       });
                   });
