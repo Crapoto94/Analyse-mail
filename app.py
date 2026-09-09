@@ -151,6 +151,22 @@ def init_db():
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
 
+    c.execute('''CREATE TABLE IF NOT EXISTS mailbox_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        boite_id INTEGER,
+        rule_id TEXT,
+        display_name TEXT,
+        is_enabled TEXT,
+        sequence INTEGER,
+        conditions_summary TEXT,
+        actions_summary TEXT,
+        forwards_to TEXT,
+        is_suspicious TEXT,
+        source TEXT,
+        raw_json TEXT,
+        FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
+    )''')
+
     # Migration: ajouter colonne hostname si elle n'existe pas
     try:
         c.execute('ALTER TABLE ip_info ADD COLUMN hostname TEXT')
@@ -314,6 +330,274 @@ def add_log(level, category, message, details=None, boite_id=None, recipient=Non
     except Exception as e:
         print(f"Erreur logging: {e}")
 
+# ============================================================================
+# Microsoft Graph API : recuperation directe des connexions, du journal
+# d'audit et des regles de messagerie d'une boite via l'API, en alternative
+# a l'import manuel de CSV. Authentification "app-only" (flux client
+# credentials) : necessite un App Registration Entra ID avec les permissions
+# d'application suivantes, consentement admin donne :
+#   - AuditLog.Read.All      -> connexions (signIns) et journal d'audit (directoryAudits)
+#   - MailboxSettings.Read   -> regles de messagerie (transfert, suppression...)
+#   - Directory.Read.All     -> resolution des informations utilisateur (optionnel)
+# Voir la page /config pour la configuration (tenant ID, client ID, client secret).
+# ============================================================================
+
+_graph_token_cache = {'token': None, 'expires_at': 0}
+
+
+def get_graph_token(force_refresh=False):
+    """Recupere (et met en cache) un jeton d'acces app-only pour Microsoft Graph
+    via le flux OAuth2 client_credentials."""
+    import time
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    tenant_id = get_config('graph_tenant_id', '').strip()
+    client_id = get_config('graph_client_id', '').strip()
+    client_secret = get_config('graph_client_secret', '').strip()
+    if not (tenant_id and client_id and client_secret):
+        raise RuntimeError("Configuration Microsoft Graph incomplète (tenant ID / client ID / client secret manquant) — voir /config")
+
+    now = time.time()
+    if not force_refresh and _graph_token_cache['token'] and _graph_token_cache['expires_at'] > now + 60:
+        return _graph_token_cache['token']
+
+    url = f'https://login.microsoftonline.com/{urllib.parse.quote(tenant_id)}/oauth2/v2.0/token'
+    data = urllib.parse.urlencode({
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'scope': 'https://graph.microsoft.com/.default',
+        'grant_type': 'client_credentials',
+    }).encode('utf-8')
+    req = urllib.request.Request(url, data=data, method='POST',
+                                  headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        raise RuntimeError(f"Authentification Microsoft Graph refusée (HTTP {e.code}) : {error_body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Impossible de joindre Microsoft Graph : {e}")
+
+    token = payload.get('access_token')
+    if not token:
+        raise RuntimeError(f"Réponse d'authentification Microsoft Graph inattendue : {payload}")
+    _graph_token_cache['token'] = token
+    _graph_token_cache['expires_at'] = now + int(payload.get('expires_in', 3600))
+    return token
+
+
+def graph_get_all(path, params=None):
+    """Effectue un GET sur Microsoft Graph avec pagination automatique (@odata.nextLink).
+    `path` est soit un chemin relatif ('/organization'), soit une URL absolue."""
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    token = get_graph_token()
+    url = path if path.startswith('http') else 'https://graph.microsoft.com/v1.0' + path
+    if params:
+        sep = '&' if '?' in url else '?'
+        url += sep + urllib.parse.urlencode(params)
+
+    results = []
+    while url:
+        req = urllib.request.Request(url, headers={
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json',
+            'ConsistencyLevel': 'eventual',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else str(e)
+            raise RuntimeError(f"Erreur Microsoft Graph (HTTP {e.code}) sur {url} : {error_body}")
+        if isinstance(payload, dict) and 'value' in payload:
+            results.extend(payload['value'])
+            url = payload.get('@odata.nextLink')
+        else:
+            results.append(payload)
+            url = None
+    return results
+
+
+def _graph_status_text(status_obj):
+    error_code = (status_obj or {}).get('errorCode')
+    return 'Success' if error_code in (0, None) else 'Failure'
+
+
+def fetch_signins_from_graph(boite_id, user_upn, days=30):
+    """Recupere les connexions interactives (auditLogs/signIns) d'un utilisateur
+    sur les N derniers jours et les insere dans signin_logs (avec deduplication)."""
+    from datetime import datetime, timedelta
+
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    upn_escaped = (user_upn or '').replace("'", "''")
+    filter_q = f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}"
+    items = graph_get_all('/auditLogs/signIns', params={'$filter': filter_q, '$top': '999'})
+
+    conn = get_db()
+    existing = set(
+        (r['request_id'], r['date_utc'], r['user_upn'], r['ip_address'])
+        for r in conn.execute('SELECT request_id, date_utc, user_upn, ip_address FROM signin_logs WHERE boite_id=?', (boite_id,)).fetchall()
+    )
+    count = 0
+    duplicates = 0
+    for item in items:
+        status = item.get('status') or {}
+        device = item.get('deviceDetail') or {}
+        location = item.get('location') or {}
+        mfa = item.get('mfaDetail') or {}
+
+        request_id = item.get('id', '')
+        date_utc = item.get('createdDateTime', '')
+        user_upn_val = item.get('userPrincipalName', '')
+        ip_address = item.get('ipAddress', '')
+        key = (request_id, date_utc, user_upn_val, ip_address)
+        if key in existing:
+            duplicates += 1
+            continue
+
+        country = location.get('countryOrRegion', '') or ''
+        location_str = ', '.join(p for p in [location.get('city', ''), location.get('state', ''), country] if p)
+        risky = item.get('riskLevelAggregated') in ('medium', 'high') or item.get('riskState') == 'atRisk'
+
+        conn.execute('''INSERT INTO signin_logs
+            (boite_id, date_utc, request_id, correlation_id, user_display_name, user_upn,
+             ip_address, location, country, status, error_code, failure_reason, application,
+             client_app, device_id, browser, os, is_compliant, is_managed, conditional_access,
+             mfa_result, mfa_method, asn, flagged, user_agent, csv_source, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (boite_id, date_utc, request_id, item.get('correlationId', ''), item.get('userDisplayName', ''),
+             user_upn_val, ip_address, location_str, country, _graph_status_text(status),
+             str(status.get('errorCode', '') if status.get('errorCode') is not None else ''),
+             status.get('failureReason', ''), item.get('appDisplayName', ''),
+             item.get('clientAppUsed', ''), device.get('deviceId', ''), device.get('browser', ''),
+             device.get('operatingSystem', ''), str(device.get('isCompliant', '')).lower(),
+             str(device.get('isManaged', '')).lower(), item.get('conditionalAccessStatus', ''),
+             item.get('authenticationRequirement', ''), mfa.get('authMethod', ''),
+             str(item.get('autonomousSystemNumber', '') or ''), 'true' if risky else 'false',
+             '', 'Microsoft Graph API', json.dumps(item, ensure_ascii=False)))
+        existing.add(key)
+        count += 1
+    conn.commit()
+    conn.close()
+    return count, duplicates
+
+
+def fetch_audit_from_graph(boite_id, user_upn, days=30):
+    """Recupere les evenements du journal d'audit (auditLogs/directoryAudits) concernant
+    un utilisateur (cible ou initiateur) sur les N derniers jours, et les insere dans
+    audit_logs (avec deduplication). Le filtre serveur ne portant que sur la date, le
+    tri par utilisateur est fait cote client sur les cibles/initiateurs de chaque evenement."""
+    from datetime import datetime, timedelta
+
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    items = graph_get_all('/auditLogs/directoryAudits', params={'$filter': f'activityDateTime ge {since}', '$top': '999'})
+
+    upn_lower = (user_upn or '').lower()
+    relevant = []
+    for item in items:
+        targets = item.get('targetResources') or []
+        initiator = (item.get('initiatedBy') or {}).get('user') or {}
+        if any((t.get('userPrincipalName') or '').lower() == upn_lower for t in targets) or \
+           (initiator.get('userPrincipalName') or '').lower() == upn_lower:
+            relevant.append(item)
+
+    conn = get_db()
+    existing = set(
+        (r['date_utc'], r['correlation_id'], r['activite'], r['target_upn'])
+        for r in conn.execute('SELECT date_utc, correlation_id, activite, target_upn FROM audit_logs WHERE boite_id=?', (boite_id,)).fetchall()
+    )
+    count = 0
+    duplicates = 0
+    for item in relevant:
+        targets = item.get('targetResources') or []
+        target = targets[0] if targets else {}
+        initiated_by = item.get('initiatedBy') or {}
+        actor_user = initiated_by.get('user') or {}
+        actor_app = initiated_by.get('app') or {}
+
+        date_utc = item.get('activityDateTime', '')
+        correlation_id = item.get('correlationId', '')
+        activite = item.get('activityDisplayName', '')
+        target_upn = target.get('userPrincipalName', '')
+        key = (date_utc, correlation_id, activite, target_upn)
+        if key in existing:
+            duplicates += 1
+            continue
+
+        mods = target.get('modifiedProperties') or []
+        mods_summary = ' | '.join(
+            f"{m.get('displayName','')}: {m.get('oldValue','')} -> {m.get('newValue','')}"
+            for m in mods if m.get('displayName')
+        )
+        conn.execute('''INSERT INTO audit_logs
+            (boite_id, date_utc, correlation_id, service, categorie, activite, resultat,
+             result_reason, actor_type, actor_display_name, actor_upn, ip_address,
+             target_type, target_display_name, target_upn, modifications_summary,
+             csv_source, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (boite_id, date_utc, correlation_id, item.get('loggedByService', ''), item.get('category', ''),
+             activite, 'Success' if item.get('result') == 'success' else 'Failure', item.get('resultReason', ''),
+             'User' if actor_user else ('Application' if actor_app else ''),
+             actor_user.get('displayName') or actor_app.get('displayName', ''),
+             actor_user.get('userPrincipalName', ''), actor_user.get('ipAddress', ''),
+             target.get('type', ''), target.get('displayName', ''), target_upn, mods_summary,
+             'Microsoft Graph API', json.dumps(item, ensure_ascii=False)))
+        existing.add(key)
+        count += 1
+    conn.commit()
+    conn.close()
+    return count, duplicates
+
+
+def fetch_inbox_rules_from_graph(boite_id, user_upn):
+    """Recupere les regles de la boite de reception (transfert, suppression...) via
+    Microsoft Graph. Contrairement aux connexions/audit (journal d'evenements), les
+    regles representent un etat courant : le precedent instantane issu de Graph est
+    remplace a chaque appel (les regles importees depuis un CSV, s'il y en a, sont conservees)."""
+    import urllib.parse
+
+    encoded_upn = urllib.parse.quote(user_upn or '')
+    items = graph_get_all(f'/users/{encoded_upn}/mailFolders/inbox/messageRules')
+
+    conn = get_db()
+    conn.execute("DELETE FROM mailbox_rules WHERE boite_id=? AND source=?", (boite_id, 'Microsoft Graph API'))
+    count = 0
+    for item in items:
+        actions = item.get('actions') or {}
+        conditions = item.get('conditions') or {}
+
+        forward_targets = []
+        for field in ('forwardTo', 'redirectTo', 'forwardAsAttachmentTo'):
+            for rec in (actions.get(field) or []):
+                addr = (rec.get('emailAddress') or {}).get('address')
+                if addr:
+                    forward_targets.append(addr)
+
+        suspicious = bool(forward_targets) or bool(actions.get('delete')) or bool(actions.get('permanentDelete'))
+
+        actions_parts = [f'{k}: {v}' for k, v in actions.items() if v]
+        conditions_parts = [f'{k}: {v}' for k, v in conditions.items() if v]
+
+        conn.execute('''INSERT INTO mailbox_rules
+            (boite_id, rule_id, display_name, is_enabled, sequence, conditions_summary,
+             actions_summary, forwards_to, is_suspicious, source, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (boite_id, item.get('id', ''), item.get('displayName', ''), str(item.get('isEnabled', '')).lower(),
+             item.get('sequence', 0), ' | '.join(conditions_parts), ' | '.join(actions_parts),
+             ', '.join(forward_targets), 'true' if suspicious else 'false', 'Microsoft Graph API',
+             json.dumps(item, ensure_ascii=False)))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+
 from functools import wraps
 
 def login_required(f):
@@ -378,6 +662,9 @@ def view_boite(bid):
         messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
         nb_signins = conn.execute('SELECT COUNT(*) as c FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['c']
         nb_audit = conn.execute('SELECT COUNT(*) as c FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['c']
+        nb_rules = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
+        nb_suspicious_rules = conn.execute("SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (bid,)).fetchone()['c']
+        graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
         ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
         recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
         all_recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
@@ -462,7 +749,9 @@ def view_boite(bid):
                          timeline=timeline, domain_stats=domain_stats,
                          first_msg=first_msg, last_msg=last_msg,
                          sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc,
-                         nb_signins=nb_signins, nb_audit=nb_audit)
+                         nb_signins=nb_signins, nb_audit=nb_audit,
+                         nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
+                         graph_configured=graph_configured)
 
 def _timeline_query(conn, table, bid):
     rows = conn.execute(f'''SELECT
@@ -634,6 +923,81 @@ def view_audit_detail(event_id):
                          subtitle=row['date_utc'],
                          back_url=url_for('view_audit', bid=row['boite_id']),
                          back_label="Retour au journal d'audit")
+
+
+@app.route('/boite/<int:bid>/graph/fetch', methods=['POST'])
+def graph_fetch(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    conn.close()
+    if not boite:
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+
+    try:
+        days = max(1, min(int(request.form.get('days', '30')), 90))
+    except ValueError:
+        days = 30
+
+    summary = []
+    errors = []
+
+    try:
+        c, d = fetch_signins_from_graph(bid, boite['user_email'], days)
+        summary.append(f'{c} connexion(s) ({d} doublon(s) ignoré(s))')
+    except Exception as e:
+        errors.append(f'Connexions : {e}')
+
+    try:
+        c, d = fetch_audit_from_graph(bid, boite['user_email'], days)
+        summary.append(f"{c} événement(s) d'audit ({d} doublon(s) ignoré(s))")
+    except Exception as e:
+        errors.append(f'Journal d\'audit : {e}')
+
+    try:
+        c = fetch_inbox_rules_from_graph(bid, boite['user_email'])
+        summary.append(f'{c} règle(s) de messagerie')
+    except Exception as e:
+        errors.append(f'Règles de messagerie : {e}')
+
+    if summary:
+        add_log('INFO', 'GRAPH', f"Import Microsoft Graph pour {boite['user_email']}", ', '.join(summary), bid)
+        flash('Import Microsoft Graph (' + str(days) + ' jours) : ' + ', '.join(summary))
+    for err in errors:
+        add_log('ERROR', 'GRAPH', f"Erreur import Microsoft Graph pour {boite['user_email']}", err, bid)
+        flash(f'Erreur Microsoft Graph — {err}')
+
+    return redirect(url_for('view_boite', bid=bid))
+
+
+@app.route('/boite/<int:bid>/rules')
+def view_rules(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    rules = conn.execute('SELECT * FROM mailbox_rules WHERE boite_id=? ORDER BY is_suspicious DESC, sequence ASC', (bid,)).fetchall()
+    conn.close()
+    return render_template('rules.html', boite=boite, rules=rules)
+
+
+@app.route('/boite/<int:bid>/rules/clear', methods=['POST'])
+def clear_rules(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    cnt = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
+    conn.execute('DELETE FROM mailbox_rules WHERE boite_id=?', (bid,))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'IMPORT', f"Règles de messagerie effacées pour la boîte {bid} ({boite['user_email']})", f'{cnt} règle(s) supprimée(s)', bid)
+    flash(f'{cnt} règle(s) de messagerie effacée(s)')
+    return redirect(url_for('view_rules', bid=bid))
 
 
 @app.route('/boite/<int:bid>/upload', methods=['GET', 'POST'])
@@ -1125,8 +1489,18 @@ def config():
             set_config('api_ville_token', request.form.get('api_ville_token', ''))
             set_config('api_verify_ssl', request.form.get('api_verify_ssl', 'True'))
             flash('Configuration API enregistrée avec succès')
+        elif 'graph_tenant_id' in request.form or 'graph_client_id' in request.form or 'graph_client_secret' in request.form:
+            set_config('graph_tenant_id', request.form.get('graph_tenant_id', '').strip())
+            set_config('graph_client_id', request.form.get('graph_client_id', '').strip())
+            # Ne pas ecraser le secret existant si le champ est laisse vide (evite d'effacer
+            # accidentellement un secret deja enregistre lors d'une simple mise a jour du tenant/client ID)
+            new_secret = request.form.get('graph_client_secret', '')
+            if new_secret:
+                set_config('graph_client_secret', new_secret.strip())
+            _graph_token_cache['token'] = None
+            flash('Configuration Microsoft Graph enregistrée avec succès')
         return redirect(url_for('config'))
-    
+
     return render_template('config.html',
         custom_message_emetteur_nom=get_config('custom_message_emetteur_nom', ''),
         custom_message_emetteur_email=get_config('custom_message_emetteur_email', ''),
@@ -1138,7 +1512,20 @@ def config():
         custom_message=get_config('custom_message', ''),
         api_ville_url=get_config('api_ville_url', 'https://api-ville.toulouse.fr/api'),
         api_ville_doc_url=get_config('api_ville_doc_url', 'https://api-ville.toulouse.fr/docs'),
-        api_ville_token=get_config('api_ville_token', ''))
+        api_ville_token=get_config('api_ville_token', ''),
+        graph_tenant_id=get_config('graph_tenant_id', ''),
+        graph_client_id=get_config('graph_client_id', ''),
+        graph_client_secret_set=bool(get_config('graph_client_secret', '')))
+
+@app.route('/api/test-graph')
+def test_api_graph():
+    try:
+        get_graph_token(force_refresh=True)
+        orgs = graph_get_all('/organization')
+        org_name = orgs[0].get('displayName') if orgs else 'N/A'
+        return jsonify({'success': True, 'message': f"Connexion Microsoft Graph réussie (tenant : {org_name})"})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/test-ville')
 def test_api_ville():
