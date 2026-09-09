@@ -434,6 +434,29 @@ def init_db():
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
 
+    # Connexions de TOUT le tenant (pas limitees aux boites deja suivies) : alimentee par
+    # refresh_tenant_signins(), rafraichie automatiquement toutes les TENANT_SIGNINS_REFRESH_MINUTES
+    # minutes par le planificateur de surveillance — voir /connexions.
+    c.execute('''CREATE TABLE IF NOT EXISTS tenant_signins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT UNIQUE,
+        date_utc TEXT,
+        user_upn TEXT,
+        user_display_name TEXT,
+        ip_address TEXT,
+        location TEXT,
+        country TEXT,
+        status TEXT,
+        error_code TEXT,
+        failure_reason TEXT,
+        application TEXT,
+        client_app TEXT,
+        mfa_result TEXT,
+        flagged TEXT,
+        fetched_at TEXT
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tenant_signins_date ON tenant_signins(date_utc)')
+
     c.execute('''CREATE TABLE IF NOT EXISTS audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         boite_id INTEGER,
@@ -3497,15 +3520,86 @@ def _monitoring_scan_due(row, now):
     return elapsed_minutes >= (row['interval_minutes'] or 60)
 
 
+# Intervalle de rafraichissement du monitoring "connexions tenant" (voir /connexions) et
+# duree de conservation des lignes recuperees, au-dela de laquelle elles sont purgees pour
+# eviter une croissance illimitee de la table (ce flux n'est pas rattache a une boite
+# precise, contrairement a signin_logs — c'est un instantane glissant, pas un historique
+# d'investigation).
+TENANT_SIGNINS_REFRESH_MINUTES = 5
+TENANT_SIGNINS_RETENTION_HOURS = 48
+
+
+def refresh_tenant_signins():
+    """Recupere TOUTES les connexions du tenant (reussies et echouees, tous utilisateurs
+    confondus) depuis le dernier passage, en un seul appel Microsoft Graph pagine (pas de
+    filtre par utilisateur) — a la difference du scan par boite qui doit interroger chaque
+    utilisateur individuellement. Deduplique par request_id (identifiant Graph de
+    l'evenement), purge les lignes plus vieilles que TENANT_SIGNINS_RETENTION_HOURS."""
+    from datetime import timedelta
+
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    last_iso = get_config('tenant_signins_last_fetch_at', '')
+    last_dt = _parse_iso(last_iso) if last_iso else None
+    if last_dt:
+        # Petite marge de recouvrement (10 min) pour ne rien manquer entre deux passages —
+        # sans risque de doublon grace a la contrainte UNIQUE sur request_id.
+        since_dt = last_dt - timedelta(minutes=10)
+    else:
+        since_dt = now_dt - timedelta(hours=1)
+    since = since_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    items = graph_get_all('/auditLogs/signIns', params={
+        '$filter': f'createdDateTime ge {since}', '$top': '999'}, timeout=45, max_pages=25)
+    mapped = [_map_graph_signin(it) for it in items]
+
+    fetched_at = now_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn = get_db()
+    before = conn.total_changes
+    for m in mapped:
+        conn.execute('''INSERT OR IGNORE INTO tenant_signins
+            (request_id, date_utc, user_upn, user_display_name, ip_address, location, country,
+             status, error_code, failure_reason, application, client_app, mfa_result, flagged, fetched_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (m['request_id'], m['date_utc'], m['user_upn'], m['user_display_name'], m['ip_address'],
+             m['location'], m['country'], m['status'], m['error_code'], m['failure_reason'],
+             m['application'], m['client_app'], m['mfa_result'], m['flagged'], fetched_at))
+    new_rows = conn.total_changes - before
+
+    cutoff = (now_dt - timedelta(hours=TENANT_SIGNINS_RETENTION_HOURS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute('DELETE FROM tenant_signins WHERE date_utc < ?', (cutoff,))
+    conn.commit()
+    conn.close()
+
+    set_config('tenant_signins_last_fetch_at', fetched_at)
+    add_log('INFO', 'TENANT_SIGNINS',
+            f'{new_rows} nouvelle(s) connexion(s) (tenant complet, {len(mapped)} récupérée(s))',
+            f'depuis {since}')
+    return new_rows
+
+
 def monitoring_scheduler_tick():
     """Un passage du planificateur :
     1. resynchronise les motifs de decouverte automatique actifs dont l'intervalle est
        ecoule (ex: 'adm-*') pour ajouter les nouvelles boites correspondantes ;
-    2. scanne toutes les boites surveillees actives dont l'intervalle est ecoule.
+    2. scanne toutes les boites surveillees actives dont l'intervalle est ecoule ;
+    3. rafraichit le flux de connexions tenant (voir /connexions) toutes les
+       TENANT_SIGNINS_REFRESH_MINUTES minutes.
     Ne fait rien si la configuration Microsoft Graph est incomplete."""
     if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
         return
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    last_signins_refresh = get_config('tenant_signins_last_fetch_at', '')
+    signins_due = True
+    if last_signins_refresh:
+        last = _parse_iso(last_signins_refresh)
+        if last:
+            signins_due = (now - last).total_seconds() / 60 >= TENANT_SIGNINS_REFRESH_MINUTES
+    if signins_due:
+        try:
+            refresh_tenant_signins()
+        except Exception as e:
+            add_log('ERROR', 'TENANT_SIGNINS', 'Échec du rafraîchissement des connexions (tenant)', str(e))
 
     conn = get_db()
     patterns = conn.execute('SELECT * FROM monitoring_patterns WHERE is_active=1').fetchall()
@@ -3558,6 +3652,39 @@ def view_monitoring():
     conn.close()
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     return render_template('monitoring.html', mailboxes=mailboxes, patterns=patterns, graph_configured=graph_configured)
+
+
+@app.route('/connexions')
+@admin_required
+def view_tenant_signins():
+    """Monitoring des connexions de tout le tenant (reussies et echouees), sans se limiter
+    aux boites deja suivies — alimente automatiquement toutes les TENANT_SIGNINS_REFRESH_MINUTES
+    minutes par le planificateur (voir refresh_tenant_signins/monitoring_scheduler_tick)."""
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM tenant_signins ORDER BY date_utc DESC LIMIT 1000').fetchall()
+    nb_total = conn.execute('SELECT COUNT(*) as c FROM tenant_signins').fetchone()['c']
+    nb_failed = conn.execute("SELECT COUNT(*) as c FROM tenant_signins WHERE status != 'Success'").fetchone()['c']
+    conn.close()
+    graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+    last_refresh = get_config('tenant_signins_last_fetch_at', '')
+    return render_template('tenant_signins.html', rows=rows, nb_total=nb_total, nb_failed=nb_failed,
+                            graph_configured=graph_configured, last_refresh=last_refresh,
+                            refresh_minutes=TENANT_SIGNINS_REFRESH_MINUTES,
+                            retention_hours=TENANT_SIGNINS_RETENTION_HOURS)
+
+
+@app.route('/connexions/refresh', methods=['POST'])
+@admin_required
+def refresh_tenant_signins_now():
+    if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
+        flash("Configuration Microsoft Graph incomplète — voir Configuration")
+        return redirect(url_for('view_tenant_signins'))
+    try:
+        new_rows = refresh_tenant_signins()
+        flash(f"Rafraîchi : {new_rows} nouvelle(s) connexion(s)")
+    except Exception as e:
+        flash(f"Échec du rafraîchissement : {e}")
+    return redirect(url_for('view_tenant_signins'))
 
 
 @app.route('/monitoring/patterns/add', methods=['POST'])

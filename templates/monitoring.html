@@ -3,9 +3,14 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h1><i class="bi bi-eye"></i> Surveillance des boîtes</h1>
-    <a href="{{ url_for('index') }}" class="btn btn-secondary">
-        <i class="bi bi-arrow-left"></i> Accueil
-    </a>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('view_tenant_signins') }}" class="btn btn-outline-primary">
+            <i class="bi bi-shield-lock"></i> Monitoring connexions
+        </a>
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Accueil
+        </a>
+    </div>
 </div>
 
 <p class="text-muted">

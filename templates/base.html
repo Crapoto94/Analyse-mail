@@ -158,6 +158,7 @@ function showGlobalLoadingFatalError(err) {
                 <ul class="dropdown-menu dropdown-menu-end">
                     {% if session.get('role') == 'admin' %}
                     <li><a class="dropdown-item" href="{{ url_for('view_monitoring') }}"><i class="bi bi-eye"></i> Surveillance</a></li>
+                    <li><a class="dropdown-item" href="{{ url_for('view_tenant_signins') }}"><i class="bi bi-shield-lock"></i> Monitoring connexions</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('list_users') }}"><i class="bi bi-people"></i> Utilisateurs</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('view_logs') }}"><i class="bi bi-journal-text"></i> Logs</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('config') }}"><i class="bi bi-gear"></i> Configuration</a></li>
