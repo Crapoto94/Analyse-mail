@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Clés d'API{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-key"></i> Clés d'API</h1>
+    <div>
+        <a href="{{ url_for('api_docs') }}" class="btn btn-outline-secondary">
+            <i class="bi bi-file-earmark-code"></i> Documentation (Swagger)
+        </a>
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Accueil
+        </a>
+    </div>
+</div>
+
+<p class="text-muted">
+    Ces clés permettent à des <strong>applications externes</strong> de consulter en lecture seule l'état des
+    boîtes surveillées et des incidents via l'API <code>/api/v1/*</code> (en-tête <code>X-API-Key</code>).
+    Voir la <a href="{{ url_for('api_docs') }}">documentation interactive</a> pour la liste des endpoints.
+</p>
+
+<div class="card mb-4">
+    <div class="card-header">Délivrer une nouvelle clé</div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('add_api_key') }}" class="row g-2 align-items-end">
+            <div class="col-md-5">
+                <label class="form-label small mb-1">Nom / application cliente</label>
+                <input type="text" class="form-control" name="name" placeholder="ex: Dashboard SOC" required>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small mb-1">Durée de validité</label>
+                <select class="form-select" name="duration_days">
+                    <option value="">Illimitée</option>
+                    <option value="30">30 jours</option>
+                    <option value="90" selected>90 jours</option>
+                    <option value="180">180 jours</option>
+                    <option value="365">1 an</option>
+                </select>
+            </div>
+            <div class="col-md-3 d-grid">
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-key"></i> Générer la clé
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Clés existantes ({{ keys|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm align-middle">
+                <thead>
+                    <tr>
+                        <th>Nom</th><th>Clé</th><th>Statut</th><th>Expiration</th>
+                        <th>Créée le</th><th>Dernière utilisation</th><th>Appels</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for k in keys %}
+                    <tr>
+                        <td>{{ k.name }}<br><small class="text-muted">par {{ k.created_by or '—' }}</small></td>
+                        <td><code>{{ k.key_prefix }}</code></td>
+                        <td>
+                            {% if k.is_revoked %}<span class="badge bg-dark">Révoquée</span>
+                            {% elif k.is_paused %}<span class="badge bg-warning text-dark">En pause</span>
+                            {% elif k.expires_at and k.expires_at < now_iso %}<span class="badge bg-secondary">Expirée</span>
+                            {% else %}<span class="badge bg-success">Active</span>{% endif %}
+                        </td>
+                        <td><small class="text-muted">{{ k.expires_at|paris if k.expires_at else 'Jamais' }}</small></td>
+                        <td><small class="text-muted">{{ k.created_at|paris }}</small></td>
+                        <td><small class="text-muted">{{ k.last_used_at|paris if k.last_used_at else 'Jamais' }}</small></td>
+                        <td>
+                            <a href="{{ url_for('api_key_usage_detail', key_id=k.id) }}">{{ usage_counts.get(k.id, 0) }}</a>
+                        </td>
+                        <td class="text-end text-nowrap">
+                            {% if not k.is_revoked %}
+                            <form method="POST" action="{{ url_for('toggle_api_key', key_id=k.id) }}" class="d-inline">
+                                <button class="btn btn-sm btn-outline-secondary" type="submit">
+                                    {% if k.is_paused %}Réactiver{% else %}Mettre en pause{% endif %}
+                                </button>
+                            </form>
+                            <form method="POST" action="{{ url_for('revoke_api_key', key_id=k.id) }}" class="d-inline"
+                                  onsubmit="return confirm('Révoquer définitivement la clé « {{ k.name }} » ?')">
+                                <button class="btn btn-sm btn-outline-danger" type="submit">Révoquer</button>
+                            </form>
+                            {% else %}
+                            <form method="POST" action="{{ url_for('delete_api_key', key_id=k.id) }}" class="d-inline"
+                                  onsubmit="return confirm('Supprimer définitivement la clé « {{ k.name }} » et son historique ?')">
+                                <button class="btn btn-sm btn-outline-danger" type="submit">
+                                    <i class="bi bi-trash"></i> Supprimer
+                                </button>
+                            </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="8" class="text-muted text-center py-3">Aucune clé créée pour le moment.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

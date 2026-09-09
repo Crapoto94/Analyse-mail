@@ -151,11 +151,20 @@
     </div>
     <div class="collapse" id="dsi-action-form">
         <div class="card-body border-bottom bg-light">
-            <form method="POST" action="{{ url_for('add_dsi_action', bid=boite.id) }}" class="d-flex gap-2">
-                <input type="text" name="action_text" class="form-control form-control-sm" placeholder="Ex : mot de passe réinitialisé le 09/09, MFA renforcé..." required maxlength="500">
-                <button type="submit" class="btn btn-sm btn-primary text-nowrap">
-                    <i class="bi bi-check-lg"></i> Ajouter
-                </button>
+            <form method="POST" action="{{ url_for('add_dsi_action', bid=boite.id) }}" class="row g-2 align-items-end">
+                <div class="col-md-7">
+                    <label class="form-label small mb-1">Action réalisée</label>
+                    <input type="text" name="action_text" class="form-control form-control-sm" placeholder="Ex : mot de passe réinitialisé, MFA renforcé..." required maxlength="500">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small mb-1">Date/heure de l'action</label>
+                    <input type="datetime-local" name="action_at" class="form-control form-control-sm" value="{{ now_local_dt }}">
+                </div>
+                <div class="col-md-2 d-grid">
+                    <button type="submit" class="btn btn-sm btn-primary text-nowrap">
+                        <i class="bi bi-check-lg"></i> Ajouter
+                    </button>
+                </div>
             </form>
         </div>
     </div>
@@ -163,14 +172,37 @@
         {% if dsi_actions %}
         <ul class="list-group list-group-flush">
             {% for a in dsi_actions %}
-            <li class="list-group-item d-flex justify-content-between align-items-start gap-2">
-                <div>
-                    {{ a.action_text }}
-                    <br><small class="text-muted">{{ a.created_at|paris if a.created_at else '' }}{% if a.created_by %} — {{ a.created_by }}{% endif %}</small>
+            <li class="list-group-item">
+                <div class="d-flex justify-content-between align-items-start gap-2">
+                    <div>
+                        <strong>{{ a.action_at|action_dt if a.action_at else '' }}</strong> — {{ a.action_text }}
+                        <br><small class="text-muted">
+                            Enregistrée le {{ a.created_at|paris if a.created_at else '' }}{% if a.created_by %} par {{ a.created_by }}{% endif %}
+                            {% if a.updated_at %} · modifiée le {{ a.updated_at|paris }}{% if a.updated_by %} par {{ a.updated_by }}{% endif %}{% endif %}
+                        </small>
+                    </div>
+                    <div class="text-nowrap">
+                        <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#edit-dsi-{{ a.id }}">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <form method="POST" action="{{ url_for('delete_dsi_action', bid=boite.id, action_id=a.id) }}" class="d-inline" onsubmit="return confirm('Supprimer cette action ?')">
+                            <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                        </form>
+                    </div>
                 </div>
-                <form method="POST" action="{{ url_for('delete_dsi_action', bid=boite.id, action_id=a.id) }}" onsubmit="return confirm('Supprimer cette action ?')">
-                    <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
-                </form>
+                <div class="collapse mt-2" id="edit-dsi-{{ a.id }}">
+                    <form method="POST" action="{{ url_for('edit_dsi_action', bid=boite.id, action_id=a.id) }}" class="row g-2 align-items-end">
+                        <div class="col-md-7">
+                            <input type="text" name="action_text" class="form-control form-control-sm" value="{{ a.action_text }}" required maxlength="500">
+                        </div>
+                        <div class="col-md-3">
+                            <input type="datetime-local" name="action_at" class="form-control form-control-sm" value="{{ a.action_at or '' }}">
+                        </div>
+                        <div class="col-md-2 d-grid">
+                            <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-check-lg"></i> Enregistrer</button>
+                        </div>
+                    </form>
+                </div>
             </li>
             {% endfor %}
         </ul>

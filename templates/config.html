@@ -258,6 +258,44 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                 </form>
             </div>
         </div>
+
+        <div class="card mt-4">
+            <div class="card-header" style="background-color:#464775;color:#fff;">
+                <h4 class="mb-0"><i class="bi bi-microsoft-teams"></i> Alertes Microsoft Teams</h4>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Quand une boîte <strong>surveillée</strong> (page <a href="{{ url_for('view_monitoring') }}">Surveillance</a>)
+                    obtient lors d'un scan un score de risque strictement supérieur à
+                    <strong>{{ teams_alert_score_threshold }}/10</strong> : une fiche d'incident est créée automatiquement pour
+                    cette boîte, l'import complet Microsoft Graph est lancé (connexions, journal d'audit, règles de messagerie
+                    <strong>et messages envoyés</strong>), puis l'analyse IA (si un fournisseur est configuré ci-dessous) — et
+                    enfin une alerte est postée dans le canal Teams configuré, avec le nom de la boîte, les éléments de
+                    suspicion de compromission détectés, et le <strong>lien direct vers la fiche</strong> déjà instruite.
+                    L'alerte n'est envoyée qu'une fois par bascule (pas à chaque scan tant que le score reste au-dessus du seuil).
+                </p>
+                <p class="text-muted small">
+                    Dans Teams : ouvrez le canal concerné → <em>⋯</em> → <em>Connecteurs</em> (ou <em>Workflows</em> →
+                    modèle « Quand un webhook envoie une requête à un canal ») → <em>Webhook entrant</em>, donnez-lui un nom
+                    et copiez l'URL générée ci-dessous.
+                </p>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="teams_webhook_url" class="form-label">URL du webhook du canal Teams</label>
+                        <input type="url" class="form-control" id="teams_webhook_url" name="teams_webhook_url"
+                               value="{{ teams_webhook_url }}" placeholder="https://xxxxx.webhook.office.com/webhookb2/...">
+                        <div class="form-text">Laisser vide pour désactiver les alertes Teams.</div>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary mb-3" onclick="testTeamsWebhook()">
+                        <i class="bi bi-plug"></i> Envoyer un message de test
+                    </button>
+                    <div id="test-result-teams" class="mb-3" style="display:none;"></div>
+                    <button type="submit" class="btn" style="background-color:#464775;color:#fff;">
+                        <i class="bi bi-check-lg"></i> Enregistrer
+                    </button>
+                </form>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -352,6 +390,25 @@ function testNvidiaApi() {
     resultDiv.innerHTML = '<div class="alert alert-info">Test en cours... (peut prendre quelques secondes)</div>';
 
     fetch('{{ url_for("test_api_nvidia") }}')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            } else {
+                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            }
+        })
+        .catch(error => {
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
+        });
+}
+
+function testTeamsWebhook() {
+    const resultDiv = document.getElementById('test-result-teams');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-info">Envoi du message de test en cours...</div>';
+
+    fetch('{{ url_for("test_teams_webhook") }}')
         .then(response => response.json())
         .then(data => {
             if (data.success) {

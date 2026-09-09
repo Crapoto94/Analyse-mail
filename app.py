@@ -2,9 +2,11 @@ import os
 import csv
 import sqlite3
 import re
+import secrets
+import hashlib
 import unicodedata
 from datetime import datetime, timezone
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response, session
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response, session, g
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 import json
@@ -60,6 +62,38 @@ def format_paris_datetime(value, fmt='%d/%m/%Y %H:%M:%S'):
 
 
 app.jinja_env.filters['paris'] = format_paris_datetime
+
+
+def format_action_datetime(value, fmt='%d/%m/%Y %H:%M'):
+    """Affiche la date/heure (saisie manuellement par un utilisateur via un champ HTML
+    'datetime-local', donc deja en heure locale, sans fuseau) d'une action DSI. A la
+    difference de format_paris_datetime, aucune conversion de fuseau n'est faite : la
+    valeur est prise telle quelle, au format 'YYYY-MM-DDTHH:MM' (eventuellement avec
+    secondes)."""
+    if not value:
+        return ''
+    s = str(value).strip()
+    for candidate_fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M'):
+        try:
+            return datetime.strptime(s, candidate_fmt).strftime(fmt)
+        except ValueError:
+            continue
+    return value
+
+
+app.jinja_env.filters['action_dt'] = format_action_datetime
+
+
+def _now_local_datetime_input():
+    """Date/heure actuelle au format attendu par un champ HTML <input type="datetime-local">
+    (heure de Paris, sans fuseau), utilisee comme valeur par defaut quand l'utilisateur ne
+    precise pas explicitement la date/heure d'une action DSI."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo('Europe/Paris'))
+    except Exception:
+        now = datetime.now()
+    return now.strftime('%Y-%m-%dT%H:%M')
 
 
 # Codes d'erreur Entra ID connus pour indiquer un echec lie a l'authentification forte
@@ -433,10 +467,21 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         boite_id INTEGER NOT NULL,
         action_text TEXT NOT NULL,
+        action_at TEXT,
         created_by TEXT,
         created_at TEXT,
+        updated_by TEXT,
+        updated_at TEXT,
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
+
+    # Migration : ajouter les colonnes date/heure de l'action et tracabilite des
+    # modifications (bases existantes ne les ont pas encore).
+    for _col in ('action_at TEXT', 'updated_by TEXT', 'updated_at TEXT'):
+        try:
+            c.execute(f'ALTER TABLE dsi_actions ADD COLUMN {_col}')
+        except Exception:
+            pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -493,6 +538,41 @@ def init_db():
         c.execute('ALTER TABLE monitored_mailboxes ADD COLUMN source_pattern_id INTEGER')
     except Exception:
         pass
+
+    # Cles d'API delivrees aux applications externes qui consomment l'API /api/v1/* (voir
+    # section "API externe" plus bas dans ce fichier). La cle en clair n'est jamais stockee :
+    # seul son empreinte SHA-256 (key_hash) l'est, comme un mot de passe. key_prefix (les
+    # premiers caracteres de la cle) sert uniquement a l'identifier dans la liste admin sans
+    # avoir a la reafficher en entier.
+    c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        key_prefix TEXT NOT NULL,
+        key_hash TEXT NOT NULL UNIQUE,
+        is_paused INTEGER NOT NULL DEFAULT 0,
+        is_revoked INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_used_at TEXT
+    )''')
+
+    # Journal des appels effectues avec chaque cle (endpoint, methode, code retour) — permet
+    # a l'admin de voir comment une application externe utilise l'API depuis la page de
+    # gestion des cles. api_key_id est NULL quand l'appel a echoue avant meme d'identifier
+    # une cle valide (en-tete absent ou cle inconnue) : conserve quand meme, pour l'audit
+    # des tentatives d'acces invalides.
+    c.execute('''CREATE TABLE IF NOT EXISTS api_key_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        api_key_id INTEGER,
+        endpoint TEXT,
+        method TEXT,
+        status_code INTEGER,
+        ip_address TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_api_key_usage_key_id ON api_key_usage(api_key_id)')
 
     # Migration : creer un compte admin par defaut si la table users est vide, en reprenant
     # l'ancien mot de passe HTTP Basic pour ne pas verrouiller l'acces existant.
@@ -1660,7 +1740,7 @@ def view_boite(bid):
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
                          graph_configured=graph_configured, ai_configured=ai_configured,
                          groq_ai_configured=groq_ai_configured, nvidia_ai_configured=nvidia_ai_configured,
-                         dsi_actions=dsi_actions,
+                         dsi_actions=dsi_actions, now_local_dt=_now_local_datetime_input(),
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count)
 
 def _timeline_query(conn, table, bid):
@@ -2241,7 +2321,7 @@ def build_ai_analysis_prompt(bid):
     conn = get_db()
     boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
     dsi_action_rows = conn.execute(
-        'SELECT action_text, created_by, created_at FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)
+        'SELECT action_text, action_at, created_by, created_at FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)
     ).fetchall()
     conn.close()
     if not boite:
@@ -2863,6 +2943,159 @@ _monitoring_lock = threading.Lock()
 # portant sur la meme boite.
 MONITORING_SCAN_WINDOW_DAYS = 7
 
+# Seuil de score (sur 10, voir compute_risk_score) au-dela duquel un scan de surveillance
+# declenche une alerte Teams : "score > 5", strictement, comme demande.
+TEAMS_ALERT_SCORE_THRESHOLD = 5
+
+VERDICT_LABELS = {
+    'compromise_likely': 'Compromission probable',
+    'signals_to_check': 'Signaux à vérifier',
+    'no_strong_signal': 'RAS',
+}
+
+
+def send_teams_alert(email, score, verdict, findings_summary, mailbox_id=None, boite_id=None):
+    """Poste une carte d'alerte dans le canal Microsoft Teams configure (webhook entrant,
+    cle 'teams_webhook_url') quand une boite surveillee bascule en compromission probable
+    (score > TEAMS_ALERT_SCORE_THRESHOLD). Ne fait rien si aucune URL n'est configuree.
+    Utilise le format "MessageCard" classique des webhooks entrants Teams (Office 365
+    Connector) — pas de dependance externe (urllib.request, comme le reste de l'appli).
+    Si `boite_id` est fourni (fiche d'incident deja creee/instruite par
+    escalate_to_incident), le lien pointe directement dessus ; sinon, a defaut de fiche,
+    vers la page de surveillance generale (`mailbox_id`, dans monitored_mailboxes, n'est
+    alors utilise que pour le contexte, pas pour construire un lien)."""
+    import urllib.request
+    import urllib.error
+
+    webhook_url = get_config('teams_webhook_url', '').strip()
+    if not webhook_url:
+        return False
+
+    verdict_label = VERDICT_LABELS.get(verdict, verdict or 'Inconnu')
+    lien = None
+    base = get_config('public_base_url', '').strip().rstrip('/')
+    try:
+        path = url_for('view_boite', bid=boite_id) if boite_id is not None else url_for('view_monitoring')
+        lien = (base + path) if base else path
+    except Exception:
+        lien = None
+
+    text_lines = [
+        f"**Boîte concernée : {email}**",
+        f"Score de risque : **{score}/10** — {verdict_label}",
+    ]
+    if findings_summary:
+        text_lines.append(f"Signaux détectés : {findings_summary}")
+    if lien:
+        text_lines.append(f"[{'Voir la fiche de la boîte' if boite_id is not None else 'Voir la page de surveillance'}]({lien})")
+
+    payload = {
+        '@type': 'MessageCard',
+        '@context': 'http://schema.org/extensions',
+        'summary': f"Alerte compromission : {email}",
+        'themeColor': 'D9534F' if verdict == 'compromise_likely' else 'F0AD4E',
+        'title': f"🚨 Alerte compromission — {email}",
+        'text': '\n\n'.join(text_lines),
+    }
+
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response.read()
+        add_log('WARNING', 'TEAMS', f"Alerte Teams envoyée pour {email} (score {score}/10)", findings_summary)
+        return True
+    except Exception as e:
+        add_log('ERROR', 'TEAMS', f"Échec de l'envoi de l'alerte Teams pour {email}", str(e))
+        return False
+
+
+def escalate_to_incident(email, score, verdict, findings_summary):
+    """Quand une boite surveillee bascule en compromission probable (score >
+    TEAMS_ALERT_SCORE_THRESHOLD), transforme automatiquement l'alerte en debut
+    d'investigation complete : cree (ou reutilise) la fiche d'incident correspondante,
+    importe via Microsoft Graph tout ce qu'importe manuellement un analyste (connexions,
+    journal d'audit, regles de messagerie ET messages envoyes), lance l'analyse IA si un
+    fournisseur est configure, puis poste l'alerte Teams avec le lien direct vers cette
+    fiche deja instruite plutot que vers la page de surveillance generale.
+
+    Volontairement synchrone (pas de job en tache de fond) : cette fonction ne s'execute
+    que depuis le planificateur de surveillance, deja lui-meme dans un thread dedie."""
+    conn = get_db()
+    existing = conn.execute(
+        'SELECT id FROM boites_compromises WHERE user_email=? ORDER BY created_at DESC LIMIT 1', (email,)
+    ).fetchone()
+    if existing:
+        bid = existing['id']
+        conn.close()
+    else:
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        notes = (f"Fiche créée automatiquement suite à une alerte de surveillance "
+                 f"(score {score}/10, {VERDICT_LABELS.get(verdict, verdict)}).")
+        conn.execute('''INSERT INTO boites_compromises
+            (user_email, date_compromission, heure_compromission, date_decouverte, notes)
+            VALUES (?, ?, ?, ?, ?)''', (email, '', '', today, notes))
+        conn.commit()
+        bid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.close()
+        add_log('WARNING', 'MONITORING', f"Fiche d'incident créée automatiquement pour {email}", notes, bid)
+
+    # Import complet via Microsoft Graph (mêmes sources que "Récupérer via Microsoft
+    # Graph" sur la fiche de la boîte, messages envoyés inclus).
+    days = MONITORING_SCAN_WINDOW_DAYS
+    summary, errors = [], []
+    try:
+        c, d = fetch_sent_messages_from_graph(bid, email, days)
+        summary.append(f'{c} message(s) envoyé(s) ({d} doublon(s) ignoré(s))')
+    except Exception as e:
+        errors.append(f'Messages envoyés : {e}')
+    try:
+        c, d = fetch_signins_from_graph(bid, email, days)
+        summary.append(f'{c} connexion(s) ({d} doublon(s) ignoré(s))')
+    except Exception as e:
+        errors.append(f'Connexions : {e}')
+    try:
+        c, d = fetch_audit_from_graph(bid, email, days)
+        summary.append(f"{c} événement(s) d'audit ({d} doublon(s) ignoré(s))")
+    except Exception as e:
+        errors.append(f"Journal d'audit : {e}")
+    try:
+        c = fetch_inbox_rules_from_graph(bid, email)
+        summary.append(f'{c} règle(s) de messagerie')
+    except Exception as e:
+        if not _is_no_mailbox_error(e):
+            errors.append(f'Règles de messagerie : {e}')
+    if summary:
+        add_log('INFO', 'GRAPH', f'Import Microsoft Graph (auto) pour {email}', ', '.join(summary), bid)
+    for err in errors:
+        add_log('ERROR', 'GRAPH', f'Erreur import Microsoft Graph (auto) pour {email}', err, bid)
+
+    # Analyse IA, si un fournisseur (Groq ou NVIDIA) est configure.
+    if get_config('groq_api_key', '') or get_config('nvidia_api_key', ''):
+        try:
+            result_text, provider, model = run_ai_analysis(bid)
+            now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            conn = get_db()
+            conn.execute('''UPDATE boites_compromises SET
+                ai_analysis=?, ai_analysis_at=?, ai_analysis_model=?, ai_analysis_provider=? WHERE id=?''',
+                (result_text, now_iso, model, provider, bid))
+            conn.commit()
+            conn.close()
+            add_log('INFO', 'IA', f"Analyse IA (auto) effectuée pour {email}", f'Fournisseur : {provider}, modèle : {model}', bid)
+        except Exception as e:
+            add_log('ERROR', 'IA', f"Échec de l'analyse IA (auto) pour {email}", str(e), bid)
+
+    # Score/verdict recalcules sur les donnees fraichement importees dans la fiche (peuvent
+    # differer legerement du scan rapide ephemere initial, qui ne portait que sur une
+    # fenetre glissante sans les messages envoyes).
+    analysis = analyze_compromise(bid)
+    send_teams_alert(email, analysis['score'], analysis['verdict'], findings_summary, boite_id=bid)
+    return bid
+
 
 def run_monitoring_scan(mailbox_row):
     """Execute un scan rapide pour une boite surveillee et enregistre le resultat
@@ -2892,6 +3125,16 @@ def run_monitoring_scan(mailbox_row):
             WHERE id=?''',
             (now_iso, result['score'], result['verdict'], len(findings), findings_summary, partial_note, mailbox_row['id']))
         conn.commit()
+
+        # Escalade automatique : seulement quand la boite "devient" compromise (transition
+        # vers un score > seuil), pas a chaque scan tant qu'elle le reste deja — sinon une
+        # nouvelle fiche/import/analyse IA serait relancee et un message Teams renvoye a
+        # chaque passage. Cree la fiche d'incident, importe tout via Graph (avec messages),
+        # lance l'analyse IA, puis alerte Teams avec le lien direct vers la fiche.
+        previous_score = mailbox_row['last_scan_score']
+        was_already_over_threshold = previous_score is not None and previous_score > TEAMS_ALERT_SCORE_THRESHOLD
+        if result['score'] > TEAMS_ALERT_SCORE_THRESHOLD and not was_already_over_threshold:
+            escalate_to_incident(email, result['score'], result['verdict'], findings_summary)
 
         level = 'WARNING' if (result['score'] >= 6 or partial_note) else 'INFO'
         details = f"{len(result['findings'])} signal(aux) détecté(s) sur les dernières 24h"
@@ -3632,10 +3875,39 @@ def add_dsi_action(bid):
         flash('Boîte non trouvée')
         return redirect(url_for('index'))
     action_text = request.form.get('action_text', '').strip()
+    # Date/heure de l'action : saisie librement par l'utilisateur (champ datetime-local,
+    # donc deja en heure locale) — a defaut, on prend la date/heure actuelle, pour ne pas
+    # obliger a la renseigner a chaque fois.
+    action_at = request.form.get('action_at', '').strip() or _now_local_datetime_input()
     if action_text:
         now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-        conn.execute('INSERT INTO dsi_actions (boite_id, action_text, created_by, created_at) VALUES (?, ?, ?, ?)',
-                     (bid, action_text, session.get('username', ''), now_iso))
+        conn.execute('''INSERT INTO dsi_actions (boite_id, action_text, action_at, created_by, created_at)
+                         VALUES (?, ?, ?, ?, ?)''',
+                     (bid, action_text, action_at, session.get('username', ''), now_iso))
+        conn.commit()
+    conn.close()
+    return redirect(url_for('view_boite', bid=bid) + '#dsi-actions')
+
+
+@app.route('/boite/<int:bid>/dsi-actions/<int:action_id>/edit', methods=['POST'])
+def edit_dsi_action(bid, action_id):
+    """Permet de corriger le texte et/ou la date/heure d'une action DSI deja enregistree
+    (ex: erreur de saisie, date approximative a preciser apres coup)."""
+    conn = get_db()
+    action = conn.execute('SELECT * FROM dsi_actions WHERE id=? AND boite_id=?', (action_id, bid)).fetchone()
+    if not action:
+        conn.close()
+        flash('Action non trouvée')
+        return redirect(url_for('view_boite', bid=bid) + '#dsi-actions')
+
+    action_text = request.form.get('action_text', '').strip()
+    action_at = request.form.get('action_at', '').strip()
+    if action_text:
+        now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        conn.execute('''UPDATE dsi_actions SET action_text=?, action_at=?, updated_by=?, updated_at=?
+                         WHERE id=? AND boite_id=?''',
+                     (action_text, action_at or action['action_at'], session.get('username', ''), now_iso,
+                      action_id, bid))
         conn.commit()
     conn.close()
     return redirect(url_for('view_boite', bid=bid) + '#dsi-actions')
@@ -3842,6 +4114,9 @@ def config():
             set_config('nvidia_model', request.form.get('nvidia_model', '').strip())
             set_config('groq_prompt_template', request.form.get('groq_prompt_template', '').strip())
             flash('Configuration IA enregistrée avec succès')
+        elif 'teams_webhook_url' in request.form:
+            set_config('teams_webhook_url', request.form.get('teams_webhook_url', '').strip())
+            flash('Configuration Teams enregistrée avec succès')
         return redirect(url_for('config'))
 
     return render_template('config.html',
@@ -3868,7 +4143,9 @@ def config():
         nvidia_api_key_set=bool(get_config('nvidia_api_key', '')),
         nvidia_model=get_config('nvidia_model', ''),
         nvidia_default_model=NVIDIA_DEFAULT_MODEL,
-        groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE)
+        groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE,
+        teams_webhook_url=get_config('teams_webhook_url', ''),
+        teams_alert_score_threshold=TEAMS_ALERT_SCORE_THRESHOLD)
 
 @app.route('/api/diag/proxy-headers')
 @admin_required
@@ -3921,6 +4198,22 @@ def test_api_nvidia():
         return jsonify({'success': True, 'message': f"Connexion à l'API NVIDIA réussie — réponse du modèle : {reply.strip()[:200]}"})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/test-teams')
+@admin_required
+def test_teams_webhook():
+    webhook_url = get_config('teams_webhook_url', '').strip()
+    if not webhook_url:
+        return jsonify({'success': False, 'message': "URL du webhook Teams non configurée"})
+    ok = send_teams_alert(
+        email='test@exemple.fr',
+        score=10,
+        verdict='compromise_likely',
+        findings_summary="[TEST] Ceci est un message de test envoyé depuis la page Configuration",
+    )
+    if ok:
+        return jsonify({'success': True, 'message': 'Message de test envoyé — vérifiez le canal Teams configuré'})
+    return jsonify({'success': False, 'message': "Échec de l'envoi — voir les logs (catégorie TEAMS) pour le détail"})
 
 @app.route('/api/test-ville')
 @admin_required
@@ -4292,6 +4585,431 @@ def export_messages(bid):
     response.headers['Content-Type'] = 'text/csv; charset=utf-8'
     response.headers['Content-Disposition'] = f'attachment; filename=messages_{boite["user_email"].replace("@", "_")}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     return response
+
+
+# ============================================================================
+# API externe (/api/v1/*) : permet a des applications tierces (SOC, dashboard...) de
+# consulter les donnees de compromission via des cles d'API delivrees par un
+# administrateur (page /admin/api-keys), plutot que par les comptes utilisateurs normaux.
+# Chaque cle a une duree de validite optionnelle, peut etre mise en pause sans etre
+# supprimee, et chaque appel est journalise (table api_key_usage) pour audit.
+# Documentation interactive : /api/docs (Swagger UI, spec generee par /api/v1/openapi.json).
+# ============================================================================
+
+API_KEY_PREFIX = 'am_'
+
+
+def _generate_api_key():
+    """Genere une nouvelle cle d'API. Retourne (cle_en_clair, prefixe_affichable, hash).
+    La cle en clair n'est renvoyee qu'une fois a la creation : seul le hash est conserve."""
+    raw = API_KEY_PREFIX + secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+    display_prefix = raw[:len(API_KEY_PREFIX) + 8] + '…'
+    return raw, display_prefix, key_hash
+
+
+def _log_api_usage(api_key_id, endpoint, method, status_code):
+    try:
+        conn = get_db()
+        conn.execute('''INSERT INTO api_key_usage (api_key_id, endpoint, method, status_code, ip_address)
+                         VALUES (?, ?, ?, ?, ?)''',
+                     (api_key_id, endpoint, method, status_code, request.remote_addr))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Erreur log usage API: {e}")
+
+
+def require_api_key(f):
+    """Protege une route /api/v1/* : verifie l'en-tete X-API-Key (cle valide, ni revoquee,
+    ni en pause, ni expiree), journalise l'appel (succes ou echec) dans api_key_usage, et
+    met a jour last_used_at. La cle validee est exposee via g.api_key pendant la requete."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        supplied = request.headers.get('X-API-Key', '').strip()
+        if not supplied:
+            _log_api_usage(None, request.path, request.method, 401)
+            return jsonify({'error': "Clé API manquante (en-tête 'X-API-Key' requis)"}), 401
+
+        key_hash = hashlib.sha256(supplied.encode('utf-8')).hexdigest()
+        conn = get_db()
+        row = conn.execute('SELECT * FROM api_keys WHERE key_hash=?', (key_hash,)).fetchone()
+
+        if not row:
+            conn.close()
+            _log_api_usage(None, request.path, request.method, 401)
+            return jsonify({'error': 'Clé API invalide'}), 401
+        if row['is_revoked']:
+            conn.close()
+            _log_api_usage(row['id'], request.path, request.method, 403)
+            return jsonify({'error': 'Clé API révoquée'}), 403
+        if row['is_paused']:
+            conn.close()
+            _log_api_usage(row['id'], request.path, request.method, 403)
+            return jsonify({'error': 'Clé API en pause'}), 403
+        if row['expires_at']:
+            expiry = _parse_iso(row['expires_at'])
+            if expiry and datetime.now(timezone.utc).replace(tzinfo=None) > expiry:
+                conn.close()
+                _log_api_usage(row['id'], request.path, request.method, 403)
+                return jsonify({'error': 'Clé API expirée'}), 403
+
+        now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        conn.execute('UPDATE api_keys SET last_used_at=? WHERE id=?', (now_iso, row['id']))
+        conn.commit()
+        conn.close()
+
+        g.api_key = row
+        try:
+            response = f(*args, **kwargs)
+        except Exception:
+            _log_api_usage(row['id'], request.path, request.method, 500)
+            raise
+        status_code = response[1] if isinstance(response, tuple) and len(response) > 1 else getattr(response, 'status_code', 200)
+        _log_api_usage(row['id'], request.path, request.method, status_code)
+        return response
+    return decorated_function
+
+
+# --- Gestion des cles (reservee aux administrateurs) ------------------------------------
+
+@app.route('/admin/api-keys')
+@admin_required
+def list_api_keys():
+    conn = get_db()
+    keys = conn.execute('SELECT * FROM api_keys ORDER BY created_at DESC').fetchall()
+    usage_counts = {r['api_key_id']: r['c'] for r in conn.execute(
+        'SELECT api_key_id, COUNT(*) as c FROM api_key_usage GROUP BY api_key_id').fetchall()}
+    conn.close()
+    now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return render_template('api_keys.html', keys=keys, usage_counts=usage_counts, now_iso=now_iso)
+
+
+@app.route('/admin/api-keys/add', methods=['POST'])
+@admin_required
+def add_api_key():
+    name = request.form.get('name', '').strip()
+    if not name:
+        flash("Un nom (usage prévu) est requis pour créer une clé d'API")
+        return redirect(url_for('list_api_keys'))
+
+    duration_days = request.form.get('duration_days', '').strip()
+    expires_at = None
+    if duration_days:
+        try:
+            days = int(duration_days)
+            if days > 0:
+                from datetime import timedelta
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        except ValueError:
+            flash('Durée de validité invalide (nombre de jours attendu)')
+            return redirect(url_for('list_api_keys'))
+
+    raw_key, display_prefix, key_hash = _generate_api_key()
+    conn = get_db()
+    conn.execute('''INSERT INTO api_keys (name, key_prefix, key_hash, expires_at, created_by)
+                     VALUES (?, ?, ?, ?, ?)''',
+                 (name, display_prefix, key_hash, expires_at, session.get('username')))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'API_KEY', f"Clé d'API créée : {name}", f"Expiration : {expires_at or 'jamais'}")
+    # La cle en clair n'est affichee qu'une seule fois, juste apres sa creation.
+    flash(f"Clé créée : {raw_key} — copiez-la maintenant, elle ne sera plus jamais affichée en entier.")
+    return redirect(url_for('list_api_keys'))
+
+
+@app.route('/admin/api-keys/<int:key_id>/toggle', methods=['POST'])
+@admin_required
+def toggle_api_key(key_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM api_keys WHERE id=?', (key_id,)).fetchone()
+    if not row:
+        conn.close()
+        flash('Clé non trouvée')
+        return redirect(url_for('list_api_keys'))
+    new_paused = 0 if row['is_paused'] else 1
+    conn.execute('UPDATE api_keys SET is_paused=? WHERE id=?', (new_paused, key_id))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'API_KEY', f"Clé « {row['name']} » {'mise en pause' if new_paused else 'réactivée'}")
+    return redirect(url_for('list_api_keys'))
+
+
+@app.route('/admin/api-keys/<int:key_id>/revoke', methods=['POST'])
+@admin_required
+def revoke_api_key(key_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM api_keys WHERE id=?', (key_id,)).fetchone()
+    if not row:
+        conn.close()
+        flash('Clé non trouvée')
+        return redirect(url_for('list_api_keys'))
+    conn.execute('UPDATE api_keys SET is_revoked=1, is_paused=0 WHERE id=?', (key_id,))
+    conn.commit()
+    conn.close()
+    add_log('WARNING', 'API_KEY', f"Clé « {row['name']} » révoquée définitivement")
+    flash(f"Clé « {row['name']} » révoquée")
+    return redirect(url_for('list_api_keys'))
+
+
+@app.route('/admin/api-keys/<int:key_id>/delete', methods=['POST'])
+@admin_required
+def delete_api_key(key_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM api_keys WHERE id=?', (key_id,)).fetchone()
+    if row:
+        conn.execute('DELETE FROM api_key_usage WHERE api_key_id=?', (key_id,))
+        conn.execute('DELETE FROM api_keys WHERE id=?', (key_id,))
+        conn.commit()
+        add_log('INFO', 'API_KEY', f"Clé « {row['name']} » supprimée")
+    conn.close()
+    return redirect(url_for('list_api_keys'))
+
+
+@app.route('/admin/api-keys/<int:key_id>/usage')
+@admin_required
+def api_key_usage_detail(key_id):
+    conn = get_db()
+    key = conn.execute('SELECT * FROM api_keys WHERE id=?', (key_id,)).fetchone()
+    if not key:
+        conn.close()
+        flash('Clé non trouvée')
+        return redirect(url_for('list_api_keys'))
+    usage = conn.execute('''SELECT * FROM api_key_usage WHERE api_key_id=?
+                             ORDER BY created_at DESC LIMIT 200''', (key_id,)).fetchall()
+    conn.close()
+    return render_template('api_key_usage.html', key=key, usage=usage)
+
+
+# --- Endpoints exposes aux applications externes (authentification par cle d'API) -------
+
+@app.route('/api/v1/health')
+@require_api_key
+def api_v1_health():
+    return jsonify({'status': 'ok', 'time': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')})
+
+
+@app.route('/api/v1/monitored-mailboxes')
+@require_api_key
+def api_v1_monitored_mailboxes():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM monitored_mailboxes ORDER BY user_email').fetchall()
+    conn.close()
+    return jsonify([{
+        'id': r['id'],
+        'user_email': r['user_email'],
+        'is_active': bool(r['is_active']),
+        'interval_minutes': r['interval_minutes'],
+        'last_scan_at': r['last_scan_at'],
+        'last_scan_score': r['last_scan_score'],
+        'last_scan_verdict': r['last_scan_verdict'],
+        'last_scan_findings_count': r['last_scan_findings_count'],
+        'last_scan_findings_summary': r['last_scan_findings_summary'],
+        'last_error': r['last_error'],
+    } for r in rows])
+
+
+@app.route('/api/v1/monitored-mailboxes/<int:mailbox_id>')
+@require_api_key
+def api_v1_monitored_mailbox_detail(mailbox_id):
+    conn = get_db()
+    r = conn.execute('SELECT * FROM monitored_mailboxes WHERE id=?', (mailbox_id,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({'error': 'Boîte surveillée non trouvée'}), 404
+    return jsonify({
+        'id': r['id'],
+        'user_email': r['user_email'],
+        'is_active': bool(r['is_active']),
+        'interval_minutes': r['interval_minutes'],
+        'last_scan_at': r['last_scan_at'],
+        'last_scan_score': r['last_scan_score'],
+        'last_scan_verdict': r['last_scan_verdict'],
+        'last_scan_findings_count': r['last_scan_findings_count'],
+        'last_scan_findings_summary': r['last_scan_findings_summary'],
+        'last_error': r['last_error'],
+    })
+
+
+@app.route('/api/v1/boites')
+@require_api_key
+def api_v1_boites():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM boites_compromises ORDER BY created_at DESC').fetchall()
+    conn.close()
+    return jsonify([{
+        'id': r['id'],
+        'user_email': r['user_email'],
+        'date_compromission': r['date_compromission'],
+        'heure_compromission': r['heure_compromission'],
+        'date_decouverte': r['date_decouverte'],
+        'created_at': r['created_at'],
+    } for r in rows])
+
+
+@app.route('/api/v1/boites/<int:bid>')
+@require_api_key
+def api_v1_boite_detail(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    conn.close()
+    if not boite:
+        return jsonify({'error': 'Boîte non trouvée'}), 404
+    analysis = analyze_compromise(bid)
+    return jsonify({
+        'id': boite['id'],
+        'user_email': boite['user_email'],
+        'date_compromission': boite['date_compromission'],
+        'heure_compromission': boite['heure_compromission'],
+        'date_decouverte': boite['date_decouverte'],
+        'notes': boite['notes'],
+        'created_at': boite['created_at'],
+        'risk_score': analysis['score'],
+        'risk_verdict': analysis['verdict'],
+        'findings': [{'severity': f['severity'], 'title': f['title'], 'description': f['description']}
+                     for f in analysis['findings']],
+    })
+
+
+@app.route('/api/v1/openapi.json')
+def api_v1_openapi():
+    """Specification OpenAPI 3.0 de l'API externe (/api/v1/*), consommee par la page
+    /api/docs (Swagger UI). Non protegee par cle d'API (c'est une simple documentation)."""
+    base = get_config('public_base_url', '').strip().rstrip('/')
+    servers = [{'url': (base + '/api/v1') if base else '/api/v1'}]
+    verdict_enum = list(VERDICT_LABELS.keys())
+
+    mailbox_schema = {
+        'type': 'object',
+        'properties': {
+            'id': {'type': 'integer'},
+            'user_email': {'type': 'string', 'format': 'email'},
+            'is_active': {'type': 'boolean'},
+            'interval_minutes': {'type': 'integer'},
+            'last_scan_at': {'type': 'string', 'format': 'date-time', 'nullable': True},
+            'last_scan_score': {'type': 'integer', 'nullable': True, 'minimum': 0, 'maximum': 10},
+            'last_scan_verdict': {'type': 'string', 'enum': verdict_enum, 'nullable': True},
+            'last_scan_findings_count': {'type': 'integer', 'nullable': True},
+            'last_scan_findings_summary': {'type': 'string', 'nullable': True},
+            'last_error': {'type': 'string', 'nullable': True},
+        }
+    }
+    boite_schema = {
+        'type': 'object',
+        'properties': {
+            'id': {'type': 'integer'},
+            'user_email': {'type': 'string', 'format': 'email'},
+            'date_compromission': {'type': 'string', 'nullable': True},
+            'heure_compromission': {'type': 'string', 'nullable': True},
+            'date_decouverte': {'type': 'string', 'nullable': True},
+            'created_at': {'type': 'string'},
+        }
+    }
+    boite_detail_schema = {
+        'allOf': [boite_schema, {'type': 'object', 'properties': {
+            'notes': {'type': 'string', 'nullable': True},
+            'risk_score': {'type': 'integer', 'minimum': 0, 'maximum': 10},
+            'risk_verdict': {'type': 'string', 'enum': verdict_enum},
+            'findings': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'severity': {'type': 'string', 'enum': ['low', 'medium', 'high', 'critical']},
+                'title': {'type': 'string'},
+                'description': {'type': 'string'},
+            }}},
+        }}]
+    }
+    error_response = {
+        'description': "Erreur (clé manquante, invalide, en pause, révoquée ou expirée)",
+        'content': {'application/json': {'schema': {'type': 'object', 'properties': {
+            'error': {'type': 'string'}}}}},
+    }
+
+    spec = {
+        'openapi': '3.0.3',
+        'info': {
+            'title': 'Analyse-Mail API',
+            'description': (
+                "API en lecture seule permettant à une application externe de consulter l'état de "
+                "compromission des boîtes surveillées et des incidents déjà investigués. "
+                "Authentification par clé d'API (en-tête `X-API-Key`), délivrée depuis la page "
+                "d'administration **Clés d'API**."
+            ),
+            'version': '1.0.0',
+        },
+        'servers': servers,
+        'security': [{'ApiKeyAuth': []}],
+        'components': {
+            'securitySchemes': {
+                'ApiKeyAuth': {'type': 'apiKey', 'in': 'header', 'name': 'X-API-Key'},
+            },
+            'schemas': {
+                'MonitoredMailbox': mailbox_schema,
+                'Boite': boite_schema,
+                'BoiteDetail': boite_detail_schema,
+            },
+            'responses': {
+                'Unauthorized': error_response,
+            },
+        },
+        'paths': {
+            '/health': {'get': {
+                'summary': "Vérifie que la clé d'API est valide",
+                'operationId': 'getHealth',
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        'type': 'object', 'properties': {'status': {'type': 'string'}, 'time': {'type': 'string'}}}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                },
+            }},
+            '/monitored-mailboxes': {'get': {
+                'summary': 'Liste les boîtes surveillées et leur dernier résultat de scan',
+                'operationId': 'listMonitoredMailboxes',
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        'type': 'array', 'items': {'$ref': '#/components/schemas/MonitoredMailbox'}}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                },
+            }},
+            '/monitored-mailboxes/{id}': {'get': {
+                'summary': 'Détail d\'une boîte surveillée',
+                'operationId': 'getMonitoredMailbox',
+                'parameters': [{'name': 'id', 'in': 'path', 'required': True, 'schema': {'type': 'integer'}}],
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        '$ref': '#/components/schemas/MonitoredMailbox'}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                    '404': {'description': 'Non trouvée'},
+                },
+            }},
+            '/boites': {'get': {
+                'summary': "Liste les incidents de compromission (fiches d'investigation)",
+                'operationId': 'listBoites',
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        'type': 'array', 'items': {'$ref': '#/components/schemas/Boite'}}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                },
+            }},
+            '/boites/{id}': {'get': {
+                'summary': "Détail d'un incident, avec score de risque et signaux détectés",
+                'operationId': 'getBoite',
+                'parameters': [{'name': 'id', 'in': 'path', 'required': True, 'schema': {'type': 'integer'}}],
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        '$ref': '#/components/schemas/BoiteDetail'}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                    '404': {'description': 'Non trouvée'},
+                },
+            }},
+        },
+    }
+    return jsonify(spec)
+
+
+@app.route('/api/docs')
+@admin_required
+def api_docs():
+    return render_template('api_docs.html')
+
 
 def load_config_from_env():
     import os
