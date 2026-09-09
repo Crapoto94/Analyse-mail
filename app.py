@@ -52,6 +52,42 @@ def format_paris_datetime(value, fmt='%d/%m/%Y %H:%M:%S'):
 
 app.jinja_env.filters['paris'] = format_paris_datetime
 
+
+# Codes d'erreur Entra ID connus pour indiquer un echec lie a l'authentification forte
+# (MFA), utilises pour deduire un statut MFA lisible quand le champ dedie de Graph
+# (authenticationRequirement) est vide — ce qui est frequent en pratique.
+MFA_FAILURE_ERROR_CODES = {'50074', '50076', '500121', '50158', '530032'}
+MFA_FAILURE_KEYWORDS = ['strong authentication', 'multi-factor', 'multifactor', 'mfa']
+MFA_REQUIREMENT_LABELS = {
+    'multifactorauthentication': 'MFA requise',
+    'singlefactorauthentication': 'Facteur unique',
+}
+
+
+def format_mfa_status(row):
+    """Deduit un libelle lisible pour le statut MFA d'une connexion (table signin_logs).
+    Le champ Graph dedie (authenticationRequirement) est souvent absent en pratique ; a
+    defaut, on infere un echec MFA a partir du code/motif d'erreur de la connexion."""
+    def _get(key):
+        try:
+            return (row[key] or '').strip()
+        except Exception:
+            return ''
+
+    mfa_result = _get('mfa_result')
+    if mfa_result:
+        return MFA_REQUIREMENT_LABELS.get(mfa_result.lower(), mfa_result)
+
+    error_code = _get('error_code')
+    failure_reason = _get('failure_reason').lower()
+    if error_code in MFA_FAILURE_ERROR_CODES or any(kw in failure_reason for kw in MFA_FAILURE_KEYWORDS):
+        return 'MFA requise (non complétée)'
+
+    return '-'
+
+
+app.jinja_env.filters['mfa_status'] = format_mfa_status
+
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs('templates', exist_ok=True)
 
@@ -226,8 +262,27 @@ def init_db():
         last_scan_findings_count INTEGER,
         last_error TEXT,
         created_by TEXT,
+        source_pattern_id INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS monitoring_patterns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prefix TEXT UNIQUE NOT NULL,
+        interval_minutes INTEGER NOT NULL DEFAULT 60,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        last_sync_at TEXT,
+        last_sync_count INTEGER,
+        last_error TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # Migration: ajouter la colonne source_pattern_id si elle n'existe pas (bases existantes)
+    try:
+        c.execute('ALTER TABLE monitored_mailboxes ADD COLUMN source_pattern_id INTEGER')
+    except Exception:
+        pass
 
     # Migration : creer un compte admin par defaut si la table users est vide, en reprenant
     # l'ancien mot de passe HTTP Basic pour ne pas verrouiller l'acces existant.
@@ -743,6 +798,55 @@ def fetch_inbox_rules_from_graph(boite_id, user_upn):
     conn.commit()
     conn.close()
     return count
+
+
+def graph_list_users_by_prefix(prefix):
+    """Liste les utilisateurs du tenant dont l'UPN commence par `prefix` (utilise pour la
+    decouverte automatique de boites a surveiller, ex: toutes les boites 'adm-*').
+    Necessite la permission d'application User.Read.All (ou Directory.Read.All)."""
+    prefix_escaped = (prefix or '').replace("'", "''")
+    items = graph_get_all('/users', params={
+        '$filter': f"startswith(userPrincipalName,'{prefix_escaped}')",
+        '$select': 'id,userPrincipalName,displayName,accountEnabled',
+        '$top': '999',
+    })
+    return [it for it in items if it.get('userPrincipalName') and it.get('accountEnabled', True)]
+
+
+def sync_monitoring_pattern(pattern_row):
+    """Interroge Microsoft Graph pour la liste actuelle des boites correspondant au motif
+    (prefixe d'UPN), et ajoute a la surveillance celles qui n'y sont pas deja. N'enleve
+    jamais une boite deja surveillee (meme si elle ne correspond plus au motif) : a faire
+    manuellement depuis /monitoring si besoin."""
+    now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn = get_db()
+    try:
+        users = graph_list_users_by_prefix(pattern_row['prefix'])
+        added = 0
+        for u in users:
+            upn = u['userPrincipalName']
+            existing = conn.execute('SELECT id FROM monitored_mailboxes WHERE user_email=?', (upn,)).fetchone()
+            if existing:
+                continue
+            conn.execute('''INSERT INTO monitored_mailboxes
+                (user_email, interval_minutes, created_by, source_pattern_id)
+                VALUES (?, ?, ?, ?)''',
+                (upn, pattern_row['interval_minutes'], f"motif:{pattern_row['prefix']}", pattern_row['id']))
+            added += 1
+        conn.execute('''UPDATE monitoring_patterns SET last_sync_at=?, last_sync_count=?, last_error=NULL
+            WHERE id=?''', (now_iso, len(users), pattern_row['id']))
+        conn.commit()
+        if added:
+            add_log('INFO', 'MONITORING', f"Découverte automatique ({pattern_row['prefix']}*) : {added} nouvelle(s) boîte(s) ajoutée(s) à la surveillance")
+        return added
+    except Exception as e:
+        conn.execute('UPDATE monitoring_patterns SET last_sync_at=?, last_error=? WHERE id=?',
+                     (now_iso, str(e), pattern_row['id']))
+        conn.commit()
+        add_log('ERROR', 'MONITORING', f"Échec de la découverte automatique pour le motif {pattern_row['prefix']}*", str(e))
+        raise
+    finally:
+        conn.close()
 
 
 def _extract_ip_from_headers(headers):
@@ -1276,10 +1380,18 @@ def build_unified_timeline(boite_id):
 
 def compute_risk_score(findings):
     """Convertit la liste de findings (issus de analyze_compromise_events) en un score
-    de risque de compromission sur 10, a partir de la severite de chaque signal."""
-    weights = {'critical': 4, 'high': 2, 'medium': 1, 'low': 0.5}
+    de risque de compromission sur 10, a partir de la severite de chaque signal.
+
+    Les poids 'medium'/'low' sont volontairement faibles : ces signaux isoles (ex:
+    quelques changements de methode MFA, une friction de connexion depuis le pays
+    habituel...) sont frequents et le plus souvent benins pris individuellement.
+    Seule une accumulation consequente, ou un signal 'high'/'critical' — plus rares et
+    bien plus specifiques d'une compromission reelle — doivent faire monter le score
+    significativement. L'arrondi par troncature (int, pas round) evite de sur-noter
+    une situation encore incertaine ("a verifier") au-dela de ce qu'elle justifie."""
+    weights = {'critical': 4, 'high': 2, 'medium': 0.5, 'low': 0.25}
     score = sum(weights.get(f['severity'], 0) for f in findings)
-    return min(10, round(score))
+    return min(10, int(score))
 
 
 def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
@@ -1330,7 +1442,10 @@ def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
                 'events': [e],
             })
 
-    # 3) Rafale d'echecs suivie d'un succes (>=3 echecs en 15 min puis succes dans les 15 min suivantes)
+    # 3) Rafale d'echecs suivie d'un succes (>=3 echecs en 15 min puis succes dans les 15 min suivantes).
+    #    Ce n'est un signal fort que si la connexion reussie provient d'un pays INHABITUEL :
+    #    des echecs suivis d'un succes depuis le pays/l'IP habituel(le) sont tres majoritairement
+    #    de la friction normale (mot de passe mal saisi, prompt MFA relance...), pas une attaque.
     failures_window = []
     for e in signin_events:
         if not e['dt']:
@@ -1340,14 +1455,27 @@ def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
         else:
             recent_failures = [f for f in failures_window if 0 <= (e['dt'] - f['dt']).total_seconds() <= 900]
             if len(recent_failures) >= 3:
-                findings.append({
-                    'severity': 'high',
-                    'title': "Rafale d'échecs de connexion suivie d'un succès",
-                    'description': (f"{len(recent_failures)} échecs de connexion en moins de 15 min pour {e['user']}, "
-                                     f"suivis d'une connexion réussie à {e['timestamp']} depuis {e['ip']} — signature typique "
-                                     f"d'une attaque par force brute/password spray ayant abouti."),
-                    'events': recent_failures + [e],
-                })
+                unusual_country = bool(baseline_country and e['country'] and e['country'] != baseline_country)
+                if unusual_country:
+                    findings.append({
+                        'severity': 'high',
+                        'title': "Rafale d'échecs de connexion suivie d'un succès",
+                        'description': (f"{len(recent_failures)} échecs de connexion en moins de 15 min pour {e['user']}, "
+                                         f"suivis d'une connexion réussie à {e['timestamp']} depuis {e['ip']} ({e['country']}, "
+                                         f"pays inhabituel) — signature typique d'une attaque par force brute/password spray ayant abouti."),
+                        'events': recent_failures + [e],
+                    })
+                else:
+                    findings.append({
+                        'severity': 'low',
+                        'title': "Échecs de connexion suivis d'un succès (pays habituel)",
+                        'description': (f"{len(recent_failures)} échec(s) de connexion en moins de 15 min pour {e['user']}, "
+                                         f"suivis d'une connexion réussie à {e['timestamp']} depuis {e['ip']}"
+                                         + (f" ({e['country']})" if e['country'] else '') +
+                                         " — le pays correspond à l'usage habituel du compte : probablement une simple "
+                                         "erreur de saisie ou une relance MFA, à confirmer si le doute persiste."),
+                        'events': recent_failures + [e],
+                    })
             failures_window = []
 
     # 4) Activites d'audit sensibles (mot de passe, MFA, regles de messagerie, consentement...)
@@ -1842,14 +1970,33 @@ def _monitoring_scan_due(row, now):
 
 
 def monitoring_scheduler_tick():
-    """Un passage du planificateur : scanne toutes les boites actives dont l'intervalle
-    est ecoule. Ne fait rien si la configuration Microsoft Graph est incomplete."""
+    """Un passage du planificateur :
+    1. resynchronise les motifs de decouverte automatique actifs dont l'intervalle est
+       ecoule (ex: 'adm-*') pour ajouter les nouvelles boites correspondantes ;
+    2. scanne toutes les boites surveillees actives dont l'intervalle est ecoule.
+    Ne fait rien si la configuration Microsoft Graph est incomplete."""
     if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
         return
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    conn = get_db()
+    patterns = conn.execute('SELECT * FROM monitoring_patterns WHERE is_active=1').fetchall()
+    conn.close()
+    for pattern in patterns:
+        due = True
+        if pattern['last_sync_at']:
+            last = _parse_iso(pattern['last_sync_at'])
+            if last:
+                due = (now - last).total_seconds() / 60 >= (pattern['interval_minutes'] or 60)
+        if due:
+            try:
+                sync_monitoring_pattern(pattern)
+            except Exception:
+                pass  # deja journalise dans sync_monitoring_pattern
+
     conn = get_db()
     rows = conn.execute('SELECT * FROM monitored_mailboxes WHERE is_active=1').fetchall()
     conn.close()
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
     for row in rows:
         if _monitoring_scan_due(row, now):
             run_monitoring_scan(row)
@@ -1879,9 +2026,82 @@ def start_monitoring_scheduler():
 def view_monitoring():
     conn = get_db()
     mailboxes = conn.execute('SELECT * FROM monitored_mailboxes ORDER BY user_email').fetchall()
+    patterns = conn.execute('SELECT * FROM monitoring_patterns ORDER BY prefix').fetchall()
     conn.close()
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
-    return render_template('monitoring.html', mailboxes=mailboxes, graph_configured=graph_configured)
+    return render_template('monitoring.html', mailboxes=mailboxes, patterns=patterns, graph_configured=graph_configured)
+
+
+@app.route('/monitoring/patterns/add', methods=['POST'])
+@admin_required
+def add_monitoring_pattern():
+    prefix = request.form.get('prefix', '').strip()
+    try:
+        interval = max(5, min(int(request.form.get('interval_minutes', '60')), 10080))
+    except ValueError:
+        interval = 60
+    if not prefix:
+        flash('Préfixe invalide')
+        return redirect(url_for('view_monitoring'))
+
+    conn = get_db()
+    try:
+        conn.execute('''INSERT INTO monitoring_patterns (prefix, interval_minutes, created_by)
+            VALUES (?, ?, ?)''', (prefix, interval, session.get('username', '')))
+        conn.commit()
+        pattern_row = conn.execute('SELECT * FROM monitoring_patterns WHERE prefix=?', (prefix,)).fetchone()
+    except sqlite3.IntegrityError:
+        conn.close()
+        flash(f'Le motif "{prefix}*" existe déjà')
+        return redirect(url_for('view_monitoring'))
+    conn.close()
+
+    try:
+        added = sync_monitoring_pattern(pattern_row)
+        flash(f'Motif "{prefix}*" ajouté — {added} boîte(s) découverte(s) et ajoutée(s) à la surveillance')
+    except Exception as e:
+        flash(f'Motif "{prefix}*" ajouté, mais la découverte initiale a échoué : {e}')
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/patterns/<int:pattern_id>/sync', methods=['POST'])
+@admin_required
+def sync_monitoring_pattern_now(pattern_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM monitoring_patterns WHERE id=?', (pattern_id,)).fetchone()
+    conn.close()
+    if not row:
+        flash('Motif non trouvé')
+        return redirect(url_for('view_monitoring'))
+    try:
+        added = sync_monitoring_pattern(row)
+        flash(f"Synchronisation de \"{row['prefix']}*\" effectuée — {added} nouvelle(s) boîte(s) ajoutée(s)")
+    except Exception as e:
+        flash(f'Erreur lors de la synchronisation : {e}')
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/patterns/<int:pattern_id>/toggle', methods=['POST'])
+@admin_required
+def toggle_monitoring_pattern(pattern_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM monitoring_patterns WHERE id=?', (pattern_id,)).fetchone()
+    if row:
+        conn.execute('UPDATE monitoring_patterns SET is_active=? WHERE id=?', (0 if row['is_active'] else 1, pattern_id))
+        conn.commit()
+    conn.close()
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/patterns/<int:pattern_id>/delete', methods=['POST'])
+@admin_required
+def delete_monitoring_pattern(pattern_id):
+    conn = get_db()
+    conn.execute('DELETE FROM monitoring_patterns WHERE id=?', (pattern_id,))
+    conn.commit()
+    conn.close()
+    flash('Motif supprimé (les boîtes déjà découvertes restent surveillées)')
+    return redirect(url_for('view_monitoring'))
 
 
 @app.route('/monitoring/add', methods=['POST'])
@@ -2209,11 +2429,17 @@ AUDIT_FIELD_CANDIDATES = {
 # Mots-clés (normalisés) d'activités d'audit sensibles à surveiller en priorité
 # lors d'une investigation de compromission de compte.
 SUSPICIOUS_AUDIT_KEYWORDS = [
-    'inboxrule', 'transportrule', 'forward', 'redirect', 'delegate', 'consent',
-    'serviceprincipal', 'approleassignment', 'addowner', 'federation', 'password',
-    'credential', 'authenticationmethod', 'strongauthentication', 'mfa', 'phonenumber',
-    'permission', 'roleassignment', 'admin', 'stsrefreshtokenvalidfrom',
+    'inboxrule', 'transportrule', 'forwardingsmtpaddress', 'forward', 'redirect',
+    'password', 'credential', 'authenticationmethod', 'strongauthentication', 'mfa',
+    'phonenumber', 'securityinfo', 'federation', 'membertorole', 'stsrefreshtokenvalidfrom',
 ]
+# Volontairement EXCLUS malgre leur air alarmant : 'consent', 'serviceprincipal',
+# 'approleassignment', 'addowner', 'permission', 'roleassignment' (hors 'membertorole'),
+# 'admin', 'delegate'. Ces termes correspondent en tres grande majorite a de la gestion
+# d'application/API tout a fait routiniere (creation d'un App Registration, octroi de
+# permissions Graph...) — exactement le type d'action qu'un compte "adm-*" dedie
+# effectue en permanence. Les inclure noyait la detection sous des dizaines de faux
+# positifs a chaque configuration d'outil ou d'integration.
 
 # Mots-clés (substring, non normalises) indiquant qu'une regle de suppression automatique de
 # messages cible specifiquement du courrier lie a la securite (alertes de connexion, mots de

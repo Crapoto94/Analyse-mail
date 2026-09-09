@@ -96,7 +96,7 @@
                 {% for s in foreign_success[:100] %}
                 <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
                     <td><code><small>{{ s.ip_address }}</small></code></td><td><span class="badge bg-warning text-dark">{{ s.country }}</span></td>
-                    <td><small>{{ s.application }}</small></td><td><small>{{ s.mfa_result or '-' }}</small></td></tr>
+                    <td><small>{{ s.application }}</small></td><td><small>{{ s|mfa_status }}</small></td></tr>
                 {% endfor %}
                 </tbody>
             </table>
@@ -240,7 +240,7 @@
                             </span>
                             {% if s.flagged and s.flagged.lower() in ('true','vrai','oui','1') %}<span class="badge bg-warning text-dark">Signalé</span>{% endif %}
                         </td>
-                        <td><small>{{ s.mfa_result or '-' }}</small></td>
+                        <td><small>{{ s|mfa_status }}</small></td>
                         <td><small>{% if s.is_compliant == 'true' %}<i class="bi bi-check-circle text-success" title="Conforme"></i>{% else %}<i class="bi bi-dash-circle text-muted" title="Non conforme"></i>{% endif %} {% if s.is_managed == 'true' %}<i class="bi bi-pc-display text-success" title="Géré"></i>{% endif %}</small></td>
                         <td><a href="{{ url_for('view_signin_detail', signin_id=s.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
                     </tr>

@@ -42,6 +42,74 @@
     </div>
 </div>
 
+<div class="card mb-4 border-dark">
+    <div class="card-header bg-dark text-white">
+        <i class="bi bi-magic"></i> Découverte automatique par motif
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-3">
+            Ajoute automatiquement toutes les boîtes dont l'adresse commence par un préfixe donné (ex: <code>adm-</code>
+            pour toutes les boîtes d'administration). Resynchronisé périodiquement pour détecter les nouvelles boîtes
+            correspondantes — nécessite la permission Graph <code>User.Read.All</code>.
+        </p>
+        <form method="POST" action="{{ url_for('add_monitoring_pattern') }}" class="row g-2 align-items-end mb-3">
+            <div class="col-md-5">
+                <label class="form-label small mb-1">Préfixe (début de l'adresse)</label>
+                <input type="text" class="form-control" name="prefix" placeholder="adm-" required>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small mb-1">Intervalle des boîtes découvertes (minutes)</label>
+                <input type="number" class="form-control" name="interval_minutes" value="60" min="5" max="10080" required>
+            </div>
+            <div class="col-md-3 d-grid">
+                <button type="submit" class="btn btn-dark">
+                    <i class="bi bi-plus-circle"></i> Ajouter le motif
+                </button>
+            </div>
+        </form>
+
+        {% if patterns %}
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead>
+                    <tr><th>Motif</th><th>Statut</th><th>Dernière synchro</th><th>Boîtes découvertes</th><th></th></tr>
+                </thead>
+                <tbody>
+                    {% for p in patterns %}
+                    <tr>
+                        <td><code>{{ p.prefix }}*</code></td>
+                        <td>{% if p.is_active %}<span class="badge bg-success">Actif</span>{% else %}<span class="badge bg-secondary">En pause</span>{% endif %}</td>
+                        <td><small class="text-muted">{{ p.last_sync_at|paris if p.last_sync_at else 'Jamais synchronisé' }}</small>
+                            {% if p.last_error %}<div class="small text-danger" title="{{ p.last_error }}"><i class="bi bi-exclamation-circle"></i> Erreur</div>{% endif %}
+                        </td>
+                        <td>{{ mailboxes|selectattr('source_pattern_id', 'equalto', p.id)|list|length }}</td>
+                        <td class="text-end text-nowrap">
+                            <form method="POST" action="{{ url_for('sync_monitoring_pattern_now', pattern_id=p.id) }}" class="d-inline">
+                                <button type="submit" class="btn btn-sm btn-outline-primary" title="Synchroniser maintenant">
+                                    <i class="bi bi-arrow-repeat"></i>
+                                </button>
+                            </form>
+                            <form method="POST" action="{{ url_for('toggle_monitoring_pattern', pattern_id=p.id) }}" class="d-inline">
+                                <button type="submit" class="btn btn-sm btn-outline-secondary" title="{% if p.is_active %}Mettre en pause{% else %}Réactiver{% endif %}">
+                                    <i class="bi bi-{% if p.is_active %}pause{% else %}play{% endif %}-fill"></i>
+                                </button>
+                            </form>
+                            <form method="POST" action="{{ url_for('delete_monitoring_pattern', pattern_id=p.id) }}" class="d-inline"
+                                  onsubmit="return confirm('Supprimer le motif {{ p.prefix }}* ? Les boîtes déjà découvertes resteront surveillées.')">
+                                <button type="submit" class="btn btn-sm btn-outline-danger" title="Supprimer le motif">
+                                    <i class="bi bi-trash"></i>
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
 <div class="card">
     <div class="card-header">Boîtes surveillées ({{ mailboxes|length }})</div>
     <div class="card-body">
@@ -59,7 +127,9 @@
                 <tbody>
                     {% for m in mailboxes %}
                     <tr>
-                        <td>{{ m.user_email }}</td>
+                        <td>{{ m.user_email }}
+                            {% if m.source_pattern_id %}<span class="badge bg-dark" title="Découverte automatiquement">auto</span>{% endif %}
+                        </td>
                         <td>
                             <form method="POST" action="{{ url_for('update_monitored_mailbox', mailbox_id=m.id) }}" class="d-flex gap-1">
                                 <input type="number" name="interval_minutes" value="{{ m.interval_minutes }}" min="5" max="10080" class="form-control form-control-sm" style="width:80px;">
