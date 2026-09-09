@@ -1641,12 +1641,15 @@ PASSWORD_CHANGE_ALLOWED_ENDPOINTS = {'change_password', 'logout'}
 
 @app.before_request
 def require_login():
-    """Impose une connexion pour toute l'application, sauf la page de connexion elle-meme
-    et les fichiers statiques. Remplace l'ancienne authentification HTTP Basic globale.
-    Impose egalement le changement de mot de passe (compte fraichement cree/reinitialise
-    par un administrateur, ou compte admin par defaut jamais personnalise) avant tout
-    acces au reste de l'application."""
-    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+    """Impose une connexion pour toute l'application, sauf la page de connexion elle-meme,
+    les fichiers statiques, et l'API externe /api/v1/* (qui a sa propre authentification par
+    cle, voir require_api_key — sans cette exception, un appelant externe muni d'une cle
+    valide mais d'aucune session navigateur se faisait rediriger vers /login au lieu
+    d'obtenir la reponse JSON attendue : la cle n'etait alors jamais verifiee). Remplace
+    l'ancienne authentification HTTP Basic globale. Impose egalement le changement de mot de
+    passe (compte fraichement cree/reinitialise par un administrateur, ou compte admin par
+    defaut jamais personnalise) avant tout acces au reste de l'application."""
+    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS or request.path.startswith('/api/v1/'):
         return
     if not session.get('user_id'):
         return redirect(url_for('login', next=request.path))
