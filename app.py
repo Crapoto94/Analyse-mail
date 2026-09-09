@@ -2195,21 +2195,71 @@ def compute_dashboard_kpis():
 
     home_country = get_home_country_code()
     signin_window_rows = conn.execute(
-        f"SELECT ip_address, country FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
+        f"SELECT ip_address, country, status FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
     conn.close()
 
     nb_signins_foreign = 0
     trust_scores = []
+    # Agregation par lieu (ville + pays) pour les cartes du tableau de bord : un cercle par
+    # lieu, dont le rayon depend du nombre de connexions et la couleur/le clignotement du
+    # niveau de suspicion (echecs et/ou score de confiance faible a cet endroit). La
+    # position du cercle est la moyenne des coordonnees des IPs vues a cet endroit
+    # (get_ip_info, deja en cache local — aucun appel reseau supplementaire ici,
+    # ip_reputation_payload ci-dessus l'a deja rempli pour chaque IP de la fenetre).
+    geo_buckets = {}
     for r in signin_window_rows:
-        if (r['country'] or '').strip().upper() != home_country:
+        row_country = (r['country'] or '').strip().upper()
+        if row_country != home_country:
             nb_signins_foreign += 1
         try:
             ip_payload = ip_reputation_payload(r['ip_address'])
         except Exception:
             ip_payload = None
-        trust_scores.append(compute_connection_trust_score(ip_payload, r['country']))
+        row_trust = compute_connection_trust_score(ip_payload, r['country'])
+        trust_scores.append(row_trust)
+
+        try:
+            geo = get_ip_info(r['ip_address'])
+        except Exception:
+            geo = None
+        if geo and geo.get('lat') is not None and geo.get('lon') is not None:
+            key = (geo.get('city') or '', geo.get('country') or '')
+            bucket = geo_buckets.setdefault(key, {
+                'city': geo.get('city') or '', 'country': geo.get('country') or '',
+                'country_code': geo.get('country_code') or '', 'count': 0, 'fail_count': 0,
+                'lats': [], 'lons': [], 'trust_scores': [],
+            })
+            bucket['count'] += 1
+            if (r['status'] or 'Success') != 'Success':
+                bucket['fail_count'] += 1
+            bucket['lats'].append(geo['lat'])
+            bucket['lons'].append(geo['lon'])
+            bucket['trust_scores'].append(row_trust)
+
     avg_trust_score = round(sum(trust_scores) / len(trust_scores)) if trust_scores else None
     nb_low_trust = sum(1 for s in trust_scores if s < 50)
+
+    connections_geo_world = []
+    connections_geo_home = []
+    for bucket in geo_buckets.values():
+        bucket_trust = round(sum(bucket['trust_scores']) / len(bucket['trust_scores']))
+        fail_ratio = bucket['fail_count'] / bucket['count']
+        # Suspect : beaucoup d'echecs a cet endroit, ou une confiance moyenne faible (loin
+        # du pays de reference et/ou IP a mauvaise reputation) — cligote sur la carte pour
+        # attirer l'oeil, plutot qu'un simple point statique parmi d'autres.
+        is_suspicious = fail_ratio >= 0.5 or bucket_trust < 40
+        point = {
+            'city': bucket['city'], 'country': bucket['country'], 'country_code': bucket['country_code'],
+            'count': bucket['count'], 'fail_count': bucket['fail_count'],
+            'trust_score': bucket_trust, 'is_suspicious': is_suspicious,
+            'lat': sum(bucket['lats']) / len(bucket['lats']),
+            'lon': sum(bucket['lons']) / len(bucket['lons']),
+        }
+        connections_geo_world.append(point)
+        if bucket['country_code'].upper() == home_country:
+            connections_geo_home.append(point)
+    connections_geo_world.sort(key=lambda p: -p['count'])
+    connections_geo_home.sort(key=lambda p: -p['count'])
 
     return {
         'incidents_by_month': incidents_by_month, 'verdict_counts': verdict_counts,
@@ -2222,6 +2272,7 @@ def compute_dashboard_kpis():
         'nb_signins_foreign': nb_signins_foreign, 'avg_trust_score': avg_trust_score,
         'nb_low_trust': nb_low_trust, 'signins_window_hours': DASHBOARD_SIGNINS_WINDOW_HOURS,
         'home_country_code': home_country,
+        'connections_geo_world': connections_geo_world, 'connections_geo_home': connections_geo_home,
     }
 
 
@@ -5911,6 +5962,18 @@ def api_v1_openapi():
         }
     }
 
+    geo_point_schema = {
+        'type': 'object',
+        'description': 'Connexions agrégées pour un lieu (ville), destiné à un affichage cartographique.',
+        'properties': {
+            'city': {'type': 'string'}, 'country': {'type': 'string'}, 'country_code': {'type': 'string'},
+            'count': {'type': 'integer'}, 'fail_count': {'type': 'integer'},
+            'trust_score': {'type': 'integer', 'minimum': 0, 'maximum': 100},
+            'is_suspicious': {'type': 'boolean'},
+            'lat': {'type': 'number'}, 'lon': {'type': 'number'},
+        }
+    }
+
     kpis_schema = {
         'type': 'object',
         'description': "Memes chiffres que la page d'accueil de l'application (tableau de bord).",
@@ -5947,6 +6010,10 @@ def api_v1_openapi():
             'home_country_code': {'type': 'string', 'example': 'FR'},
             'avg_trust_score': {'type': 'integer', 'nullable': True, 'minimum': 0, 'maximum': 100},
             'nb_low_trust': {'type': 'integer', 'description': 'Connexions à score de confiance < 50.'},
+            'connections_geo_world': {'type': 'array', 'description': 'Connexions groupées par ville, pour affichage sur une carte.',
+                'items': {'$ref': '#/components/schemas/GeoPoint'}},
+            'connections_geo_home': {'type': 'array', 'description': 'Sous-ensemble de connections_geo_world limité au pays de référence.',
+                'items': {'$ref': '#/components/schemas/GeoPoint'}},
             'generated_at': {'type': 'string', 'format': 'date-time'},
         }
     }
@@ -5975,6 +6042,7 @@ def api_v1_openapi():
                 'BoiteDetail': boite_detail_schema,
                 'IpReputation': ip_reputation_schema,
                 'Kpis': kpis_schema,
+                'GeoPoint': geo_point_schema,
             },
             'responses': {
                 'Unauthorized': error_response,

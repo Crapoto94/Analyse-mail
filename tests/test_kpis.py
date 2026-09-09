@@ -50,3 +50,39 @@ def test_kpis_endpoint_matches_dashboard_numbers(client, app_module):
     dashboard_kpis = app_module.compute_dashboard_kpis()
     assert data['nb_boites_total'] == dashboard_kpis['nb_boites_total']
     assert data['nb_monitored_total'] == dashboard_kpis['nb_monitored_total']
+
+
+def test_connections_geo_groups_by_city_and_flags_suspicious(app_module, monkeypatch):
+    """Regression : les lieux avec beaucoup d'echecs (ou une confiance moyenne faible)
+    doivent ressortir marques 'is_suspicious' pour clignoter sur la carte, les autres non."""
+    conn = app_module.get_db()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    conn.execute("INSERT OR REPLACE INTO ip_info (ip, country, country_code, city, lat, lon) VALUES "
+                 "('1.1.1.1', 'France', 'FR', 'Paris', 48.85, 2.35)")
+    conn.execute("INSERT OR REPLACE INTO ip_info (ip, country, country_code, city, lat, lon) VALUES "
+                 "('2.2.2.2', 'Nowhereland', 'XX', 'Nowhere City', 10.0, 10.0)")
+    for i in range(2):
+        conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, country, status, fetched_at) "
+                     "VALUES (?, ?, '1.1.1.1', 'FR', 'Success', ?)", (f'ok-{i}', now, now))
+    for i in range(3):
+        conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, country, status, fetched_at) "
+                     "VALUES (?, ?, '2.2.2.2', 'XX', 'Failure', ?)", (f'bad-{i}', now, now))
+    conn.commit()
+    conn.close()
+
+    kpis = app_module.compute_dashboard_kpis()
+    by_city = {p['city']: p for p in kpis['connections_geo_world']}
+
+    assert by_city['Paris']['count'] == 2
+    assert by_city['Paris']['is_suspicious'] is False
+
+    assert by_city['Nowhere City']['count'] == 3
+    assert by_city['Nowhere City']['fail_count'] == 3
+    assert by_city['Nowhere City']['is_suspicious'] is True
+
+    # connections_geo_home ne garde que le pays de reference (FR par defaut).
+    home_cities = {p['city'] for p in kpis['connections_geo_home']}
+    assert 'Paris' in home_cities
+    assert 'Nowhere City' not in home_cities
