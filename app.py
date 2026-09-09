@@ -442,13 +442,13 @@ def get_graph_token(force_refresh=False):
     req = urllib.request.Request(url, data=data, method='POST',
                                   headers={'Content-Type': 'application/x-www-form-urlencoded'})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             payload = json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode('utf-8') if e.fp else str(e)
         raise RuntimeError(f"Authentification Microsoft Graph refusée (HTTP {e.code}) : {error_body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Impossible de joindre Microsoft Graph : {e}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(f"Impossible de joindre Microsoft Graph (authentification) : {e}")
 
     token = payload.get('access_token')
     if not token:
@@ -458,9 +458,16 @@ def get_graph_token(force_refresh=False):
     return token
 
 
-def graph_get_all(path, params=None):
+def graph_get_all(path, params=None, timeout=25, max_pages=25):
     """Effectue un GET sur Microsoft Graph avec pagination automatique (@odata.nextLink).
-    `path` est soit un chemin relatif ('/organization'), soit une URL absolue."""
+    `path` est soit un chemin relatif ('/organization'), soit une URL absolue.
+
+    - `timeout` (secondes) s'applique a CHAQUE page recuperee, pas au total : une requete
+      non filtree sur un tenant tres actif peut necessiter plusieurs pages, chacune avec
+      sa propre marge de tempo, plutot qu'un timeout global qui echouerait a coup sur.
+    - `max_pages` protege contre une pagination incontrolee (ex: requete non filtree sur
+      un tenant tres actif) : au-dela, on s'arrete et on retourne ce qui a deja ete recupere
+      plutot que de risquer un blocage tres long ou une consommation memoire excessive."""
     import urllib.request
     import urllib.parse
     import urllib.error
@@ -472,6 +479,7 @@ def graph_get_all(path, params=None):
         url += sep + urllib.parse.urlencode(params)
 
     results = []
+    pages = 0
     while url:
         req = urllib.request.Request(url, headers={
             'Authorization': f'Bearer {token}',
@@ -479,17 +487,23 @@ def graph_get_all(path, params=None):
             'ConsistencyLevel': 'eventual',
         })
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8') if e.fp else str(e)
             raise RuntimeError(f"Erreur Microsoft Graph (HTTP {e.code}) sur {url} : {error_body}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise RuntimeError(f"Microsoft Graph n'a pas répondu à temps sur {url} : {e}")
         if isinstance(payload, dict) and 'value' in payload:
             results.extend(payload['value'])
             url = payload.get('@odata.nextLink')
         else:
             results.append(payload)
             url = None
+        pages += 1
+        if pages >= max_pages and url:
+            print(f"graph_get_all: arrêt après {pages} pages (max_pages atteint) pour {path}")
+            break
     return results
 
 
@@ -584,12 +598,17 @@ def _map_graph_rule(item):
                 forward_targets.append(addr)
     actions_parts = [f'{k}: {v}' for k, v in actions.items() if v]
     conditions_parts = [f'{k}: {v}' for k, v in conditions.items() if v]
+    has_conditions = bool(conditions_parts)
     # Une suppression simple n'est consideree suspecte que si elle cible du courrier lie a la
     # securite (voir SECURITY_RULE_KEYWORDS) : une regle "delete" banale (notifications de
     # supervision, mailer-daemon...) est tres frequente et generalement benigne.
     text_for_keywords = f"{item.get('displayName', '')} {' '.join(conditions_parts)}".lower()
     looks_security_related = any(kw in text_for_keywords for kw in SECURITY_RULE_KEYWORDS)
-    suspicious = bool(forward_targets) or bool(actions.get('permanentDelete')) or \
+    # Un transfert limite par des conditions (expediteur, sujet...) est une redirection ciblee
+    # courante et legitime (correspondant, partenaire, delegation ponctuelle...), meme vers une
+    # adresse externe. Seul un transfert SANS AUCUNE CONDITION - qui s'applique donc a tous les
+    # messages entrants - est le schema classique d'exfiltration utilise apres compromission.
+    suspicious = (bool(forward_targets) and not has_conditions) or bool(actions.get('permanentDelete')) or \
         (bool(actions.get('delete')) and looks_security_related)
     return {
         'rule_id': item.get('id', ''),
@@ -1371,8 +1390,12 @@ def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
                 break
 
     # 6) Regles de messagerie suspectes (transfert/suppression), passees en parametre.
-    #    - Un transfert vers une adresse du meme domaine (ex: collegue en delegation/absence)
-    #      est nettement moins alarmant qu'un transfert vers un domaine externe/inconnu.
+    #    - Un transfert limite par des conditions (expediteur, sujet...) est une redirection
+    #      ciblee courante et legitime (correspondant, partenaire externe, delegation
+    #      ponctuelle...) : suspicious_rules ne contient donc, pour les transferts, que ceux
+    #      SANS AUCUNE CONDITION (s'appliquant a tous les messages entrants) — le veritable
+    #      schema d'exfiltration utilise apres compromission. Un transfert externe sans
+    #      condition reste plus alarmant qu'un transfert interne sans condition.
     #    - Une suppression automatique simple (delete) est tres majoritairement une regle de
     #      confort banale (notifications de supervision, mailer-daemon, newsletters...) : elle
     #      n'est remontee que si elle cible specifiquement des messages lies a la securite
@@ -1390,10 +1413,10 @@ def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
 
         if external_targets:
             severity = 'critical'
-            note = f"vers une adresse EXTERNE : {', '.join(external_targets)}"
+            note = f"vers une adresse EXTERNE, SANS AUCUNE CONDITION (s'applique à tous les messages entrants) : {', '.join(external_targets)}"
         elif internal_targets:
             severity = 'medium'
-            note = f"vers une adresse interne (même domaine) : {', '.join(internal_targets)} — probablement légitime (délégation, absence...), à confirmer auprès de l'utilisateur"
+            note = f"vers une adresse interne (même domaine), sans condition : {', '.join(internal_targets)} — probablement légitime (délégation, absence...), à confirmer auprès de l'utilisateur"
         elif is_permanent_delete:
             severity = 'high' if looks_security_related else 'medium'
             note = 'suppression DÉFINITIVE automatique (sans passer par les éléments supprimés)' + (
@@ -1447,31 +1470,56 @@ def analyze_compromise(boite_id):
 def quick_scan_mailbox(user_upn, days=7):
     """Scan rapide et EPHEMERE d'une boite via Microsoft Graph (rien n'est ecrit en base) :
     recupere connexions + journal d'audit + regles de messagerie sur les N derniers jours,
-    et applique la meme analyse heuristique que pour une boite deja suivie."""
+    et applique la meme analyse heuristique que pour une boite deja suivie.
+
+    Chaque source est recuperee independamment : si l'une d'elles echoue (timeout reseau,
+    permission manquante...), le scan continue avec les autres plutot que d'echouer
+    entierement — le resultat indique alors quelles sources n'ont pas pu etre lues
+    (cle 'errors'), et le score/verdict restent calcules sur les donnees disponibles."""
     from datetime import datetime, timedelta, timezone
     import urllib.parse
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
     upn_escaped = (user_upn or '').replace("'", "''")
+    errors = []
 
-    signin_items = graph_get_all('/auditLogs/signIns', params={
-        '$filter': f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}", '$top': '999'})
-    signin_dicts = [_map_graph_signin(it) for it in signin_items]
+    signin_dicts = []
+    try:
+        signin_items = graph_get_all('/auditLogs/signIns', params={
+            '$filter': f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}", '$top': '500'})
+        signin_dicts = [_map_graph_signin(it) for it in signin_items]
+    except Exception as e:
+        errors.append(f'Connexions : {e}')
 
-    audit_items = graph_get_all('/auditLogs/directoryAudits', params={'$filter': f'activityDateTime ge {since}', '$top': '999'})
-    upn_lower = (user_upn or '').lower()
+    # Filtre serveur sur l'initiateur (rapide et fiable) : capte le scenario le plus frequent
+    # d'une boite compromise, l'attaquant agissant via la session de l'utilisateur lui-meme.
+    # Les actions effectuees SUR l'utilisateur par un tiers (ex: reinitialisation de mot de
+    # passe par un admin) ne sont pas filtrables efficacement cote serveur et ne sont donc
+    # pas incluses ici (elles restent visibles via "Récupérer via Microsoft Graph" sur la
+    # fiche de la boite, une fois celle-ci creee, qui fait une recherche plus large).
     audit_dicts = []
-    for it in audit_items:
-        targets = it.get('targetResources') or []
-        initiator = (it.get('initiatedBy') or {}).get('user') or {}
-        if any((t.get('userPrincipalName') or '').lower() == upn_lower for t in targets) or \
-           (initiator.get('userPrincipalName') or '').lower() == upn_lower:
-            audit_dicts.append(_map_graph_audit(it))
+    try:
+        audit_items = graph_get_all('/auditLogs/directoryAudits', params={
+            '$filter': f"activityDateTime ge {since} and initiatedBy/user/userPrincipalName eq '{upn_escaped}'",
+            '$top': '500'})
+        audit_dicts = [_map_graph_audit(it) for it in audit_items]
+    except Exception as e:
+        errors.append(f"Journal d'audit : {e}")
 
-    encoded_upn = urllib.parse.quote(user_upn or '')
-    rule_items = graph_get_all(f'/users/{encoded_upn}/mailFolders/inbox/messageRules')
-    rule_dicts = [_map_graph_rule(it) for it in rule_items]
-    suspicious_rules = [r for r in rule_dicts if r['is_suspicious'] == 'true']
+    rule_dicts = []
+    suspicious_rules = []
+    try:
+        encoded_upn = urllib.parse.quote(user_upn or '')
+        rule_items = graph_get_all(f'/users/{encoded_upn}/mailFolders/inbox/messageRules')
+        rule_dicts = [_map_graph_rule(it) for it in rule_items]
+        suspicious_rules = [r for r in rule_dicts if r['is_suspicious'] == 'true']
+    except Exception as e:
+        errors.append(f'Règles de messagerie : {e}')
+
+    if len(errors) == 3:
+        # Les 3 sources ont echoue : remonter une vraie erreur plutot qu'un scan "propre" trompeur
+        # (une liste vide peut aussi, legitimement, signifier "aucun evenement sur la periode").
+        raise RuntimeError(' / '.join(errors))
 
     owner_domain = user_upn.split('@')[-1] if user_upn and '@' in user_upn else ''
     events = build_timeline_events(signin_dicts, audit_dicts)
@@ -1481,6 +1529,7 @@ def quick_scan_mailbox(user_upn, days=7):
     analysis['nb_rules'] = len(rule_dicts)
     analysis['user_upn'] = user_upn
     analysis['days'] = days
+    analysis['errors'] = errors
     return analysis
 
 
@@ -1758,17 +1807,21 @@ def run_monitoring_scan(mailbox_row):
         conn.commit()
 
         result = quick_scan_mailbox(email, days=1)
+        partial_note = ('Scan partiel : ' + ' / '.join(result['errors'])) if result.get('errors') else None
 
         conn.execute('''UPDATE monitored_mailboxes SET
-            last_scan_at=?, last_scan_score=?, last_scan_verdict=?, last_scan_findings_count=?, last_error=NULL
+            last_scan_at=?, last_scan_score=?, last_scan_verdict=?, last_scan_findings_count=?, last_error=?
             WHERE id=?''',
-            (now_iso, result['score'], result['verdict'], len(result['findings']), mailbox_row['id']))
+            (now_iso, result['score'], result['verdict'], len(result['findings']), partial_note, mailbox_row['id']))
         conn.commit()
 
-        level = 'WARNING' if result['score'] >= 6 else 'INFO'
+        level = 'WARNING' if (result['score'] >= 6 or partial_note) else 'INFO'
+        details = f"{len(result['findings'])} signal(aux) détecté(s) sur les dernières 24h"
+        if partial_note:
+            details += f' — {partial_note}'
         add_log(level, 'MONITORING',
                 f"Scan de surveillance pour {email} : score {result['score']}/10 ({result['verdict']})",
-                f"{len(result['findings'])} signal(aux) détecté(s) sur les dernières 24h")
+                details)
     except Exception as e:
         conn.execute('UPDATE monitored_mailboxes SET last_scan_at=?, last_error=? WHERE id=?',
                      (now_iso, str(e), mailbox_row['id']))

@@ -59,26 +59,30 @@ function hideGlobalLoading() {
             <a class="nav-link text-white" href="{{ url_for('view_logs') }}">
                 <i class="bi bi-journal-text"></i> Logs
             </a>
-            {% if session.get('role') == 'admin' %}
-            <a class="nav-link text-white" href="{{ url_for('view_monitoring') }}">
-                <i class="bi bi-eye"></i> Surveillance
-            </a>
-            <a class="nav-link text-white" href="{{ url_for('list_users') }}">
-                <i class="bi bi-people"></i> Utilisateurs
-            </a>
-            {% endif %}
             <a class="nav-link text-white" href="{{ url_for('config') }}">
                 <i class="bi bi-gear"></i> Configuration
             </a>
             {% if session.get('user_id') %}
-            <span class="nav-link text-white-50">
-                <i class="bi bi-person-circle"></i> {{ session.get('username') }}
-            </span>
-            <form method="POST" action="{{ url_for('logout') }}" class="d-inline">
-                <button type="submit" class="btn btn-link nav-link text-white p-0 border-0" style="text-decoration:none;">
-                    <i class="bi bi-box-arrow-right"></i> Déconnexion
-                </button>
-            </form>
+            <div class="nav-item dropdown">
+                <a class="nav-link text-white dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                    <i class="bi bi-person-circle"></i> {{ session.get('username') }}
+                    {% if session.get('role') == 'admin' %}<span class="badge bg-light text-primary ms-1">admin</span>{% endif %}
+                </a>
+                <ul class="dropdown-menu dropdown-menu-end">
+                    {% if session.get('role') == 'admin' %}
+                    <li><a class="dropdown-item" href="{{ url_for('view_monitoring') }}"><i class="bi bi-eye"></i> Surveillance</a></li>
+                    <li><a class="dropdown-item" href="{{ url_for('list_users') }}"><i class="bi bi-people"></i> Utilisateurs</a></li>
+                    <li><hr class="dropdown-divider"></li>
+                    {% endif %}
+                    <li>
+                        <form method="POST" action="{{ url_for('logout') }}">
+                            <button type="submit" class="dropdown-item">
+                                <i class="bi bi-box-arrow-right"></i> Déconnexion
+                            </button>
+                        </form>
+                    </li>
+                </ul>
+            </div>
             {% endif %}
         </div>
     </div>
