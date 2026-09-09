@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}IPs de confiance{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-patch-check"></i> IPs de confiance</h1>
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Accueil
+    </a>
+</div>
+
+<p class="text-muted">
+    Les IPs déclarées ici (ex : IPs de la ville elle-même) sont toujours affichées avec une pastille
+    <span class="text-success">verte</span> et un badge dédié — jamais interrogées sur AbuseIPDB, inutile
+    de dépenser du quota sur une IP déjà connue et de confiance.
+</p>
+
+<div class="card mb-4">
+    <div class="card-header">Déclarer une IP de confiance</div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('add_trusted_ip') }}" class="row g-2 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label small mb-1">Adresse IP</label>
+                <input type="text" class="form-control" name="ip" placeholder="ex: 31.14.71.85" required>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small mb-1">Badge affiché</label>
+                <input type="text" class="form-control" name="label" value="Ville" maxlength="30">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small mb-1">Note (optionnel)</label>
+                <input type="text" class="form-control" name="note" placeholder="ex: sortie internet du siège" maxlength="200">
+            </div>
+            <div class="col-md-2 d-grid">
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-plus-lg"></i> Ajouter
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">IPs déclarées ({{ ips|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm">
+                <thead>
+                    <tr><th>IP</th><th>Badge</th><th>Note</th><th>Ajoutée par</th><th>Le</th><th></th></tr>
+                </thead>
+                <tbody>
+                    {% for t in ips %}
+                    <tr>
+                        <td><code>{{ t.ip }}</code></td>
+                        <td><span class="badge bg-primary">{{ t.label }}</span></td>
+                        <td><small class="text-muted">{{ t.note or '—' }}</small></td>
+                        <td><small class="text-muted">{{ t.created_by or '—' }}</small></td>
+                        <td><small class="text-muted">{{ t.created_at|paris }}</small></td>
+                        <td class="text-end">
+                            <form method="POST" action="{{ url_for('delete_trusted_ip', trusted_id=t.id) }}" class="d-inline"
+                                  onsubmit="return confirm('Retirer {{ t.ip }} des IPs de confiance ?')">
+                                <button class="btn btn-sm btn-outline-danger" type="submit">
+                                    <i class="bi bi-trash"></i>
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="6" class="text-muted text-center py-3">Aucune IP de confiance déclarée pour le moment.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

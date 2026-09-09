@@ -162,6 +162,7 @@ function showGlobalLoadingFatalError(err) {
                     <li><a class="dropdown-item" href="{{ url_for('view_logs') }}"><i class="bi bi-journal-text"></i> Logs</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('config') }}"><i class="bi bi-gear"></i> Configuration</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('list_api_keys') }}"><i class="bi bi-key"></i> Clés d'API</a></li>
+                    <li><a class="dropdown-item" href="{{ url_for('list_trusted_ips') }}"><i class="bi bi-patch-check"></i> IPs de confiance</a></li>
                     <li><hr class="dropdown-divider"></li>
                     {% endif %}
                     <li>
@@ -244,6 +245,7 @@ function showGlobalLoadingFatalError(err) {
             document.getElementById('ipInfoLevel').innerHTML =
                 '<span class="ip-rep-dot" style="background-color:' + dotColor + ';"></span> ' +
                 '<strong>' + (info.level_label || '') + '</strong>' +
+                (info.is_trusted ? ' <span class="badge bg-primary">' + (info.trusted_label || 'Ville') + '</span>' : '') +
                 (info.is_vpn ? ' <span class="badge bg-warning text-dark">VPN/Proxy</span>' : '');
 
             var location = [info.city, info.country].filter(Boolean).join(', ');
@@ -361,8 +363,12 @@ function showGlobalLoadingFatalError(err) {
                           a.setAttribute('title', (info.level_label || '') + ' — cliquer pour le détail');
                           var dot = a.querySelector('.ip-rep-dot');
                           if (dot) dot.style.backgroundColor = color;
-                          if (info.is_vpn && a.parentElement && !a.parentElement.querySelector('.badge')) {
-                              a.insertAdjacentHTML('afterend', ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>');
+                          if (!a.parentElement.querySelector('.badge')) {
+                              if (info.is_trusted) {
+                                  a.insertAdjacentHTML('afterend', ' <span class="badge bg-primary" style="font-size:0.65em;">' + (info.trusted_label || 'Ville') + '</span>');
+                              } else if (info.is_vpn) {
+                                  a.insertAdjacentHTML('afterend', ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>');
+                              }
                           }
                       });
                   });

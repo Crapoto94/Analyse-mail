@@ -377,6 +377,19 @@ def init_db():
         query_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
+    # IPs de confiance declarees par un administrateur (ex: IPs de la ville elle-meme) :
+    # toujours affichees en vert avec un badge dedie (label personnalisable, "Ville" par
+    # defaut), sans jamais interroger AbuseIPDB pour elles (inutile de depenser du quota
+    # sur une IP deja connue et de confiance).
+    c.execute('''CREATE TABLE IF NOT EXISTS trusted_ips (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip TEXT UNIQUE NOT NULL,
+        label TEXT NOT NULL DEFAULT 'Ville',
+        note TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -664,15 +677,6 @@ def get_ip_info(ip):
 # locale (table ip_info) pendant 4h avant qu'un nouvel appel a l'API ne soit refait.
 IP_REPUTATION_CACHE_HOURS = 4
 
-# Types d'usage AbuseIPDB consideres comme non residentiels (hebergement/datacenter,
-# infrastructure...), un signal utile en investigation meme quand le score d'abus est bas :
-# un compte compromis se connectant depuis un datacenter/VPN est plus suspect qu'un simple
-# particulier, independamment des signalements d'abus deja recus par cette IP precise.
-IP_NON_RESIDENTIAL_USAGE_TYPES = {
-    'data center/web hosting/transit', 'commercial', 'content delivery network',
-    'hébergeur/datacenter (estimation heuristique)',
-}
-
 
 # Seuils appliques au score d'abus AbuseIPDB (0-100, confiance qu'une IP soit malveillante)
 # pour la pastille verte/orange/rouge. Ce sont les seuils generalement recommandes par
@@ -691,15 +695,14 @@ IP_REPUTATION_ORANGE_THRESHOLD = 25
 def _compute_reputation_level(abuse_score, usage_type, is_vpn_heuristic):
     """Convertit un score d'abus AbuseIPDB (0=aucun signalement, 100=confiance d'abus
     maximale) en niveau vert/orange/rouge. Sans score disponible (pas de cle configuree),
-    retombe sur l'heuristique VPN/proxy/Tor + type d'usage heuristique existante. Une IP
-    d'hebergeur/datacenter ou detectee VPN/proxy est remontee au moins a l'orange meme
-    avec un score d'abus bas : le type d'infrastructure est en soi un signal en contexte
-    d'investigation de compromission, independamment des signalements deja recus."""
-    non_residential = (usage_type or '').strip().lower() in IP_NON_RESIDENTIAL_USAGE_TYPES
-
+    retombe sur l'heuristique VPN/proxy/Tor existante. Seul un VPN/proxy/Tor detecte
+    remonte le niveau au moins a l'orange meme avec un score d'abus bas — le type
+    d'usage (hebergeur/datacenter...) reste affiche dans le detail mais n'influence plus
+    la couleur : beaucoup d'IP legitimes (dont celles de Microsoft 365 lui-meme) sont
+    hebergees en datacenter, ce qui produisait trop de faux positifs oranges."""
     if abuse_score is None:
         # Pas de cle AbuseIPDB : estimation grossiere a partir du seul heuristique existant.
-        return ('orange', 'estimation') if (is_vpn_heuristic or non_residential) else ('green', 'estimation')
+        return ('orange', 'estimation') if is_vpn_heuristic else ('green', 'estimation')
 
     if abuse_score >= IP_REPUTATION_RED_THRESHOLD:
         level = 'red'
@@ -708,7 +711,7 @@ def _compute_reputation_level(abuse_score, usage_type, is_vpn_heuristic):
     else:
         level = 'green'
 
-    if (non_residential or is_vpn_heuristic) and level == 'green':
+    if is_vpn_heuristic and level == 'green':
         level = 'orange'
     return (level, 'abuseipdb')
 
@@ -732,22 +735,45 @@ def _fetch_abuseipdb(ip, api_key):
     return payload['data']
 
 
+def get_trusted_ip(ip):
+    """Renvoie la ligne trusted_ips correspondante (id, ip, label, note...) si l'IP a ete
+    declaree de confiance par un administrateur (page /admin/trusted-ips), sinon None."""
+    ip = (ip or '').strip()
+    if not ip:
+        return None
+    conn = get_db()
+    row = conn.execute('SELECT * FROM trusted_ips WHERE ip=?', (ip,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def get_ip_reputation(ip):
     """Geolocalisation (get_ip_info, cache permanent) + reputation (score d'abus, type
     d'usage — servie depuis la base locale pendant IP_REPUTATION_CACHE_HOURS avant tout
     nouvel appel a l'API) d'une IP. Utilise AbuseIPDB si une cle est configuree (voir
     /config), sinon repli sur l'heuristique VPN/proxy/Tor deja existante (champ is_vpn).
+    Une IP declaree de confiance (trusted_ips) court-circuite tout ceci : toujours verte,
+    jamais interrogee sur AbuseIPDB (inutile de depenser du quota dessus).
     Retourne un dict pret a afficher (geo + reputation + niveau vert/orange/rouge), ou None
     si l'IP est vide/invalide."""
     ip = (ip or '').strip()
     if not ip:
         return None
 
+    trusted = get_trusted_ip(ip)
+
     info = get_ip_info(ip)
     if info is None:
         # Geolocalisation indisponible (IP privee, service en panne...) : reputation seule,
         # sans le reste (pays, ville...).
         info = {'ip': ip}
+
+    if trusted:
+        info['reputation_level'] = 'green'
+        info['reputation_basis'] = 'trusted'
+        info['is_trusted'] = True
+        info['trusted_label'] = trusted.get('label') or 'Ville'
+        return info
 
     needs_refresh = True
     checked_at = info.get('reputation_checked_at')
@@ -819,6 +845,7 @@ REPUTATION_BASIS_LABELS = {
     'abuseipdb': 'AbuseIPDB',
     'abuseipdb_error': "AbuseIPDB (échec de la requête — dernière donnée connue)",
     'estimation': "Estimation heuristique (aucune clé AbuseIPDB configurée)",
+    'trusted': "IP de confiance déclarée par un administrateur",
 }
 
 
@@ -857,25 +884,29 @@ def ip_reputation_payload(ip):
         'is_whitelisted': bool(info.get('is_whitelisted')),
         'last_reported_at': info.get('last_reported_at') or '',
         'is_vpn': bool(info.get('is_vpn')),
+        'is_trusted': bool(info.get('is_trusted')),
+        'trusted_label': info.get('trusted_label') or '',
     }
 
 
 def _ip_badge_html(payload):
-    """Construit le HTML d'un badge IP (pastille couleur + badge VPN eventuel) a partir du
-    payload retourne par ip_reputation_payload — factorise entre render_ip_badge (rendu
-    serveur) et la detection cote client (voir /api/ip-info-batch, meme structure de
+    """Construit le HTML d'un badge IP (pastille couleur + badge de confiance/VPN eventuel)
+    a partir du payload retourne par ip_reputation_payload — factorise entre render_ip_badge
+    (rendu serveur) et la detection cote client (voir /api/ip-info-batch, meme structure de
     donnees, meme rendu construit en JS dans base.html)."""
     ip = payload['ip']
     color = REPUTATION_LEVEL_COLOR.get(payload['level'], '#6c757d')
-    vpn_badge = ''
+    extra_badges = ''
+    if payload.get('is_trusted'):
+        extra_badges += f' <span class="badge bg-primary" style="font-size:0.65em;">{escape(payload.get("trusted_label") or "Ville")}</span>'
     if payload.get('is_vpn'):
-        vpn_badge = ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>'
+        extra_badges += ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>'
     data_attr = escape(json.dumps(payload, ensure_ascii=False))
     return Markup(
         f'<span class="ip-badge text-nowrap"><code>{escape(ip)}</code> '
         f'<a href="#" class="ip-rep-badge" data-bs-toggle="modal" data-bs-target="#ipInfoModal" '
         f'data-ip-info="{data_attr}" title="{escape(payload["level_label"])} — cliquer pour le détail">'
-        f'<span class="ip-rep-dot" style="background-color:{color};"></span></a>{vpn_badge}</span>'
+        f'<span class="ip-rep-dot" style="background-color:{color};"></span></a>{extra_badges}</span>'
     )
 
 
@@ -5104,6 +5135,58 @@ def api_key_usage_detail(key_id):
                              ORDER BY created_at DESC LIMIT 200''', (key_id,)).fetchall()
     conn.close()
     return render_template('api_key_usage.html', key=key, usage=usage)
+
+
+# --- IPs de confiance (ex: IPs de la ville elle-meme) : toujours vertes, badge dedie ------
+
+@app.route('/admin/trusted-ips')
+@admin_required
+def list_trusted_ips():
+    conn = get_db()
+    ips = conn.execute('SELECT * FROM trusted_ips ORDER BY created_at DESC').fetchall()
+    conn.close()
+    return render_template('trusted_ips.html', ips=ips)
+
+
+@app.route('/admin/trusted-ips/add', methods=['POST'])
+@admin_required
+def add_trusted_ip():
+    ip = request.form.get('ip', '').strip()
+    label = request.form.get('label', '').strip() or 'Ville'
+    note = request.form.get('note', '').strip()
+    if not ip:
+        flash('Une adresse IP est requise')
+        return redirect(url_for('list_trusted_ips'))
+    conn = get_db()
+    try:
+        conn.execute('INSERT INTO trusted_ips (ip, label, note, created_by) VALUES (?, ?, ?, ?)',
+                     (ip, label, note, session.get('username')))
+        conn.commit()
+        # Le prochain affichage de cette IP doit refleter immediatement son nouveau statut
+        # de confiance plutot que d'attendre l'expiration du cache de reputation existant.
+        conn.execute('UPDATE ip_info SET reputation_checked_at=NULL WHERE ip=?', (ip,))
+        conn.commit()
+        add_log('INFO', 'TRUSTED_IP', f"IP de confiance ajoutée : {ip} ({label})")
+        flash(f"IP {ip} ajoutée comme IP de confiance")
+    except sqlite3.IntegrityError:
+        flash(f"L'IP {ip} est déjà déclarée comme IP de confiance")
+    finally:
+        conn.close()
+    return redirect(url_for('list_trusted_ips'))
+
+
+@app.route('/admin/trusted-ips/<int:trusted_id>/delete', methods=['POST'])
+@admin_required
+def delete_trusted_ip(trusted_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM trusted_ips WHERE id=?', (trusted_id,)).fetchone()
+    if row:
+        conn.execute('DELETE FROM trusted_ips WHERE id=?', (trusted_id,))
+        conn.execute('UPDATE ip_info SET reputation_checked_at=NULL WHERE ip=?', (row['ip'],))
+        conn.commit()
+        add_log('INFO', 'TRUSTED_IP', f"IP de confiance retirée : {row['ip']}")
+    conn.close()
+    return redirect(url_for('list_trusted_ips'))
 
 
 # --- Endpoints exposes aux applications externes (authentification par cle d'API) -------
