@@ -1,0 +1,312 @@
+{% extends "base.html" %}
+{% block title %}Connexions - {{ boite.user_email }}{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-shield-lock"></i> Connexions interactives - {{ boite.user_email }}</h1>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('upload_csv', bid=boite.id) }}" class="btn btn-success">
+            <i class="bi bi-cloud-upload"></i> Importer CSV
+        </a>
+        {% if signins %}
+        <form method="POST" action="{{ url_for('clear_signins', bid=boite.id) }}"
+              onsubmit="return confirm('Effacer les {{ signins|length }} connexion(s) importée(s) pour cette boîte ? Cette action est irréversible.')">
+            <button type="submit" class="btn btn-outline-danger">
+                <i class="bi bi-trash"></i> Effacer les connexions importées
+            </button>
+        </form>
+        {% endif %}
+        <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Retour à la boîte
+        </a>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-2">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ total }}</h3><small class="text-muted">Connexions totales</small>
+        </div></div>
+    </div>
+    <div class="col-md-2">
+        <div class="card stat-card" style="border-left-color:#198754;"><div class="card-body text-center">
+            <h3>{{ nb_success }}</h3><small class="text-muted">Réussies</small>
+        </div></div>
+    </div>
+    <div class="col-md-2">
+        <div class="card stat-card" style="border-left-color:#dc3545;"><div class="card-body text-center">
+            <h3>{{ nb_failed }}</h3><small class="text-muted">Échouées</small>
+        </div></div>
+    </div>
+    <div class="col-md-2">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ distinct_users|length }}</h3><small class="text-muted">Utilisateurs</small>
+        </div></div>
+    </div>
+    <div class="col-md-2">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ distinct_ips|length }}</h3><small class="text-muted">IPs distinctes</small>
+        </div></div>
+    </div>
+    <div class="col-md-2">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ country_stats|length }}</h3><small class="text-muted">Pays distincts</small>
+        </div></div>
+    </div>
+</div>
+
+{% if not signins %}
+<div class="alert alert-info">
+    Aucune connexion importée. <a href="{{ url_for('upload_csv', bid=boite.id) }}">Importer un export "Connexions interactives" (Interactive sign-ins)</a>.
+</div>
+{% else %}
+
+<div class="card mb-4 border-danger">
+    <div class="card-header bg-danger text-white">
+        <i class="bi bi-exclamation-triangle"></i> Connexions à examiner en priorité
+    </div>
+    <div class="card-body">
+        <p class="text-muted small">Pays de référence détecté pour ce compte : <strong>{{ baseline_country or 'N/A' }}</strong> (pays le plus fréquent parmi les connexions importées).</p>
+
+        {% if flagged_rows %}
+        <h6><i class="bi bi-flag"></i> Signalées pour révision par Entra ID ({{ flagged_rows|length }})</h6>
+        <div class="table-responsive mb-3" style="max-height:250px; overflow-y:auto;">
+            <table class="table table-sm table-hover">
+                <thead><tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Emplacement</th><th>Application</th></tr></thead>
+                <tbody>
+                {% for s in flagged_rows[:100] %}
+                <tr><td><small>{{ s.date_utc }}</small></td><td><small>{{ s.user_upn }}</small></td>
+                    <td><code><small>{{ s.ip_address }}</small></code></td><td><small>{{ s.location }}</small></td>
+                    <td><small>{{ s.application }}</small></td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        {% if foreign_success %}
+        <h6><i class="bi bi-globe2"></i> Connexions réussies depuis un pays inhabituel ({{ foreign_success|length }})</h6>
+        <div class="table-responsive mb-3" style="max-height:250px; overflow-y:auto;">
+            <table class="table table-sm table-hover">
+                <thead><tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Pays</th><th>Application</th><th>MFA</th></tr></thead>
+                <tbody>
+                {% for s in foreign_success[:100] %}
+                <tr><td><small>{{ s.date_utc }}</small></td><td><small>{{ s.user_upn }}</small></td>
+                    <td><code><small>{{ s.ip_address }}</small></code></td><td><span class="badge bg-warning text-dark">{{ s.country }}</span></td>
+                    <td><small>{{ s.application }}</small></td><td><small>{{ s.mfa_result or '-' }}</small></td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        {% if failed_rows %}
+        <h6><i class="bi bi-x-circle"></i> Connexions échouées ({{ failed_rows|length }})</h6>
+        <div class="table-responsive" style="max-height:250px; overflow-y:auto;">
+            <table class="table table-sm table-hover">
+                <thead><tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Emplacement</th><th>Code erreur</th><th>Raison</th></tr></thead>
+                <tbody>
+                {% for s in failed_rows[:100] %}
+                <tr><td><small>{{ s.date_utc }}</small></td><td><small>{{ s.user_upn }}</small></td>
+                    <td><code><small>{{ s.ip_address }}</small></code></td><td><small>{{ s.location }}</small></td>
+                    <td><small>{{ s.error_code }}</small></td><td><small>{{ s.failure_reason }}</small></td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        {% if not flagged_rows and not foreign_success and not failed_rows %}
+        <div class="alert alert-success mb-0"><i class="bi bi-check-circle"></i> Aucune anomalie détectée automatiquement (à vérifier manuellement malgré tout).</div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">Répartition par pays</div>
+            <div class="card-body table-responsive" style="max-height:300px; overflow-y:auto;">
+                <table class="table table-sm">
+                    <thead><tr><th>Pays</th><th>Connexions</th></tr></thead>
+                    <tbody>
+                    {% for country, cnt in country_stats %}
+                    <tr><td>{{ country }}</td><td><span class="badge bg-primary">{{ cnt }}</span></td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">Applications utilisées</div>
+            <div class="card-body table-responsive" style="max-height:300px; overflow-y:auto;">
+                <table class="table table-sm">
+                    <thead><tr><th>Application</th><th>Connexions</th></tr></thead>
+                    <tbody>
+                    {% for a, cnt in app_stats %}
+                    <tr><td><small>{{ a }}</small></td><td><span class="badge bg-info">{{ cnt }}</span></td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">Résultat MFA</div>
+            <div class="card-body table-responsive" style="max-height:300px; overflow-y:auto;">
+                <table class="table table-sm">
+                    <thead><tr><th>Résultat</th><th>Connexions</th></tr></thead>
+                    <tbody>
+                    {% for m, cnt in mfa_stats %}
+                    <tr><td><small>{{ m }}</small></td><td><span class="badge bg-secondary">{{ cnt }}</span></td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if timeline %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-graph-up"></i> Timeline des connexions (par tranche de 15 min)</div>
+    <div class="card-body">
+        <p class="text-muted small mb-2">Fenêtre : <strong>{{ first_signin or 'N/A' }}</strong> → <strong>{{ last_signin or 'N/A' }}</strong></p>
+        <canvas id="signinTimelineChart" style="max-height:300px;"></canvas>
+    </div>
+</div>
+{% endif %}
+
+{% if ip_info_list %}
+<div class="card mb-4">
+    <div class="card-header">Géolocalisation des IPs</div>
+    <div class="card-body">
+        <div class="row mb-3">
+            {% for info in ip_info_list %}
+            <div class="col-md-6 col-lg-4 mb-3">
+                <div class="card h-100">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <code class="mb-0">{{ info.ip }}</code>
+                        {% if info.is_vpn %}<span class="badge bg-warning">VPN/Proxy</span>{% endif %}
+                    </div>
+                    <div class="card-body">
+                        <p class="mb-1"><i class="bi bi-geo-alt"></i> {{ info.city }}, {{ info.country }} ({{ info.country_code }})</p>
+                        <p class="mb-1"><i class="bi bi-hdd-network"></i> {{ info.isp }}</p>
+                        <p class="mb-1"><small>ASN: {{ info.as_name or 'N/A' }}</small></p>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        <div id="map-signins" style="height:400px;"></div>
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        Toutes les connexions ({{ signins|length }})
+        <div class="input-group input-group-sm w-50">
+            <input type="text" id="filter-signin" class="form-control" placeholder="Filtrer par utilisateur ou IP..." onkeyup="filterSignins()">
+            <span class="input-group-text" id="signin-match-count">0</span>
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:600px; overflow-y:auto;">
+            <table class="table table-hover table-sm" id="signins-table">
+                <thead>
+                    <tr>
+                        <th>Date</th><th>Utilisateur</th><th>IP</th><th>Emplacement</th>
+                        <th>Application</th><th>Statut</th><th>MFA</th><th>Appareil</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in signins %}
+                    <tr>
+                        <td><small>{{ s.date_utc }}</small></td>
+                        <td><small>{{ s.user_upn or s.user_display_name }}</small></td>
+                        <td><code><small>{{ s.ip_address }}</small></code></td>
+                        <td><small>{{ s.location }}</small></td>
+                        <td><small>{{ s.application }}</small></td>
+                        <td>
+                            <span class="badge bg-{% if s.status and 'ussi' in s.status.lower() %}success{% else %}danger{% endif %}">
+                                {{ s.status }}
+                            </span>
+                            {% if s.flagged and s.flagged.lower() in ('true','vrai','oui','1') %}<span class="badge bg-warning text-dark">Signalé</span>{% endif %}
+                        </td>
+                        <td><small>{{ s.mfa_result or '-' }}</small></td>
+                        <td><small>{% if s.is_compliant == 'true' %}<i class="bi bi-check-circle text-success" title="Conforme"></i>{% else %}<i class="bi bi-dash-circle text-muted" title="Non conforme"></i>{% endif %} {% if s.is_managed == 'true' %}<i class="bi bi-pc-display text-success" title="Géré"></i>{% endif %}</small></td>
+                        <td><a href="{{ url_for('view_signin_detail', signin_id=s.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+function filterSignins() {
+    var filter = document.getElementById('filter-signin').value.toLowerCase().trim();
+    var rows = document.querySelectorAll('#signins-table tbody tr');
+    var matchCount = 0;
+    rows.forEach(function(row) {
+        var text = row.textContent.toLowerCase();
+        if (filter === '' || text.indexOf(filter) > -1) {
+            row.style.display = '';
+            matchCount++;
+        } else {
+            row.style.display = 'none';
+        }
+    });
+    document.getElementById('signin-match-count').textContent = matchCount + ' / ' + rows.length;
+}
+
+{% if ip_info_list %}
+var mapSignins = L.map('map-signins').setView([48.8566, 2.3522], 2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors'
+}).addTo(mapSignins);
+var signinIps = {{ ip_info_list|tojson }};
+signinIps.forEach(function(ip) {
+    if (ip.lat && ip.lon) {
+        L.marker([ip.lat, ip.lon]).addTo(mapSignins)
+            .bindPopup('<strong>' + ip.ip + '</strong><br>' + ip.city + ', ' + ip.country + '<br>' + ip.isp);
+    }
+});
+{% endif %}
+
+{% if timeline %}
+var signinTimelineData = {{ timeline|tojson }};
+new Chart(document.getElementById('signinTimelineChart').getContext('2d'), {
+    type: 'line',
+    data: {
+        labels: signinTimelineData.map(t => t.hour),
+        datasets: [{
+            label: 'Nombre de connexions',
+            data: signinTimelineData.map(t => t.cnt),
+            borderColor: 'rgb(111, 66, 193)',
+            backgroundColor: 'rgba(111, 66, 193, 0.2)',
+            tension: 0.1,
+            fill: true
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+            y: { beginAtZero: true },
+            x: { ticks: { maxRotation: 45, autoSkip: true, maxTicksLimit: 20 } }
+        }
+    }
+});
+{% endif %}
+</script>
+{% endif %}
+{% endblock %}

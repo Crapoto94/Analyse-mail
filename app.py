@@ -1,6 +1,8 @@
 import os
 import csv
 import sqlite3
+import re
+import unicodedata
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response
 from werkzeug.utils import secure_filename
@@ -93,7 +95,62 @@ def init_db():
         recipient TEXT,
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
-    
+
+    c.execute('''CREATE TABLE IF NOT EXISTS signin_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        boite_id INTEGER,
+        date_utc TEXT,
+        request_id TEXT,
+        correlation_id TEXT,
+        user_display_name TEXT,
+        user_upn TEXT,
+        ip_address TEXT,
+        location TEXT,
+        country TEXT,
+        status TEXT,
+        error_code TEXT,
+        failure_reason TEXT,
+        application TEXT,
+        client_app TEXT,
+        device_id TEXT,
+        browser TEXT,
+        os TEXT,
+        is_compliant TEXT,
+        is_managed TEXT,
+        conditional_access TEXT,
+        mfa_result TEXT,
+        mfa_method TEXT,
+        asn TEXT,
+        flagged TEXT,
+        user_agent TEXT,
+        csv_source TEXT,
+        raw_json TEXT,
+        FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        boite_id INTEGER,
+        date_utc TEXT,
+        correlation_id TEXT,
+        service TEXT,
+        categorie TEXT,
+        activite TEXT,
+        resultat TEXT,
+        result_reason TEXT,
+        actor_type TEXT,
+        actor_display_name TEXT,
+        actor_upn TEXT,
+        ip_address TEXT,
+        target_type TEXT,
+        target_display_name TEXT,
+        target_upn TEXT,
+        modifications_summary TEXT,
+        csv_source TEXT,
+        raw_json TEXT,
+        FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
+    )''')
+
     # Migration: ajouter colonne hostname si elle n'existe pas
     try:
         c.execute('ALTER TABLE ip_info ADD COLUMN hostname TEXT')
@@ -285,7 +342,9 @@ def index():
             'nb_ips': conn.execute('SELECT COUNT(DISTINCT from_ip) as c FROM messages WHERE boite_id=? AND from_ip!=""', (bid,)).fetchone()['c'],
             'statuts': dict(conn.execute('SELECT status, COUNT(*) as c FROM messages WHERE boite_id=? GROUP BY status', (bid,)).fetchall()),
             'nb_ivry': nb_ivry,
-            'nb_external': nb_external
+            'nb_external': nb_external,
+            'nb_signins': conn.execute('SELECT COUNT(*) as c FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['c'],
+            'nb_audit': conn.execute('SELECT COUNT(*) as c FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['c'],
         }
     conn.close()
     return render_template('index.html', boites=boites, stats=stats)
@@ -317,6 +376,8 @@ def view_boite(bid):
             return redirect(url_for('index'))
         
         messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
+        nb_signins = conn.execute('SELECT COUNT(*) as c FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['c']
+        nb_audit = conn.execute('SELECT COUNT(*) as c FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['c']
         ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
         recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
         all_recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
@@ -395,12 +456,185 @@ def view_boite(bid):
         conn.close()
     
     return render_template('view_boite.html', 
-                         boite=boite, messages=messages, ips=ips, 
-                         recipients=recipients, statuts=statuts, 
+                         boite=boite, messages=messages, ips=ips,
+                         recipients=recipients, statuts=statuts,
                          top_domains=top_domains, ip_info_list=ip_info_list,
                          timeline=timeline, domain_stats=domain_stats,
                          first_msg=first_msg, last_msg=last_msg,
-                         sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc)
+                         sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc,
+                         nb_signins=nb_signins, nb_audit=nb_audit)
+
+def _timeline_query(conn, table, bid):
+    rows = conn.execute(f'''SELECT
+        CASE
+            WHEN strftime('%M', date_utc) < '15' THEN strftime('%Y-%m-%d %H:00', date_utc)
+            WHEN strftime('%M', date_utc) < '30' THEN strftime('%Y-%m-%d %H:15', date_utc)
+            WHEN strftime('%M', date_utc) < '45' THEN strftime('%Y-%m-%d %H:30', date_utc)
+            ELSE strftime('%Y-%m-%d %H:45', date_utc)
+        END as time_slot,
+        COUNT(*) as cnt
+        FROM {table} WHERE boite_id=? AND date_utc IS NOT NULL AND date_utc != ''
+        GROUP BY time_slot
+        ORDER BY time_slot''', (bid,)).fetchall()
+    return [{'hour': row['time_slot'], 'cnt': row['cnt']} for row in rows]
+
+
+def _is_success_status(status):
+    s = (status or '').lower()
+    return 'réussi' in s or 'success' in s or 'reussi' in s
+
+
+def _is_truthy(value):
+    return (value or '').strip().lower() in ('true', 'vrai', 'yes', 'oui', '1')
+
+
+@app.route('/boite/<int:bid>/signins')
+def view_signins(bid):
+    conn = get_db()
+    try:
+        boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+        if not boite:
+            flash('Boîte non trouvée')
+            return redirect(url_for('index'))
+
+        signins = conn.execute('SELECT * FROM signin_logs WHERE boite_id=? ORDER BY date_utc DESC', (bid,)).fetchall()
+        total = len(signins)
+        nb_success = sum(1 for s in signins if _is_success_status(s['status']))
+        nb_failed = total - nb_success
+
+        distinct_users = sorted(set(s['user_upn'] for s in signins if s['user_upn']))
+        distinct_ips = sorted(set(s['ip_address'] for s in signins if s['ip_address']))
+
+        country_counts = {}
+        for s in signins:
+            c = s['country'] or 'Inconnu'
+            country_counts[c] = country_counts.get(c, 0) + 1
+        country_stats = sorted(country_counts.items(), key=lambda x: x[1], reverse=True)
+        baseline_country = country_stats[0][0] if country_stats else ''
+
+        app_counts = {}
+        for s in signins:
+            a = s['application'] or 'Inconnu'
+            app_counts[a] = app_counts.get(a, 0) + 1
+        app_stats = sorted(app_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+
+        mfa_counts = {}
+        for s in signins:
+            m = s['mfa_result'] or 'N/A'
+            mfa_counts[m] = mfa_counts.get(m, 0) + 1
+        mfa_stats = sorted(mfa_counts.items(), key=lambda x: x[1], reverse=True)
+
+        ip_info_list = []
+        for ip in distinct_ips:
+            info = get_ip_info(ip)
+            if info:
+                ip_info_list.append(dict(info))
+
+        flagged_rows = [s for s in signins if _is_truthy(s['flagged'])]
+        foreign_success = [s for s in signins if _is_success_status(s['status']) and baseline_country
+                            and s['country'] and s['country'] != baseline_country]
+        failed_rows = [s for s in signins if not _is_success_status(s['status'])]
+
+        timeline = _timeline_query(conn, 'signin_logs', bid)
+        first_signin = conn.execute('SELECT MIN(date_utc) as first FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['first']
+        last_signin = conn.execute('SELECT MAX(date_utc) as last FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['last']
+    finally:
+        conn.close()
+
+    return render_template('signins.html', boite=boite, signins=signins, total=total,
+                         nb_success=nb_success, nb_failed=nb_failed,
+                         distinct_users=distinct_users, distinct_ips=distinct_ips,
+                         country_stats=country_stats, baseline_country=baseline_country,
+                         app_stats=app_stats, mfa_stats=mfa_stats, ip_info_list=ip_info_list,
+                         flagged_rows=flagged_rows, foreign_success=foreign_success, failed_rows=failed_rows,
+                         timeline=timeline, first_signin=first_signin, last_signin=last_signin)
+
+
+@app.route('/signin/<int:signin_id>')
+def view_signin_detail(signin_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM signin_logs WHERE id=?', (signin_id,)).fetchone()
+    conn.close()
+    if not row:
+        flash('Connexion non trouvée')
+        return redirect(url_for('index'))
+    try:
+        raw = json.loads(row['raw_json']) if row['raw_json'] else {}
+    except Exception:
+        raw = {}
+    return render_template('raw_detail.html', row=row, raw=raw,
+                         title=f"Connexion #{row['id']} - {row['user_upn'] or row['user_display_name']}",
+                         subtitle=row['date_utc'],
+                         back_url=url_for('view_signins', bid=row['boite_id']),
+                         back_label='Retour aux connexions')
+
+
+@app.route('/boite/<int:bid>/audit')
+def view_audit(bid):
+    conn = get_db()
+    try:
+        boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+        if not boite:
+            flash('Boîte non trouvée')
+            return redirect(url_for('index'))
+
+        events = conn.execute('SELECT * FROM audit_logs WHERE boite_id=? ORDER BY date_utc DESC', (bid,)).fetchall()
+        total = len(events)
+
+        activity_counts = {}
+        for e in events:
+            a = e['activite'] or 'Inconnu'
+            activity_counts[a] = activity_counts.get(a, 0) + 1
+        activity_stats = sorted(activity_counts.items(), key=lambda x: x[1], reverse=True)
+
+        result_counts = {}
+        for e in events:
+            r = e['resultat'] or 'Inconnu'
+            result_counts[r] = result_counts.get(r, 0) + 1
+        result_stats = sorted(result_counts.items(), key=lambda x: x[1], reverse=True)
+
+        actor_counts = {}
+        for e in events:
+            a = e['actor_display_name'] or e['actor_upn'] or 'Inconnu'
+            actor_counts[a] = actor_counts.get(a, 0) + 1
+        actor_stats = sorted(actor_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+
+        def is_suspicious(activite):
+            norm = _normalize_header(activite or '')
+            return any(kw in norm for kw in SUSPICIOUS_AUDIT_KEYWORDS)
+
+        suspicious_events = [e for e in events if is_suspicious(e['activite'])]
+
+        timeline = _timeline_query(conn, 'audit_logs', bid)
+        first_event = conn.execute('SELECT MIN(date_utc) as first FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['first']
+        last_event = conn.execute('SELECT MAX(date_utc) as last FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['last']
+    finally:
+        conn.close()
+
+    return render_template('audit.html', boite=boite, events=events, total=total,
+                         activity_stats=activity_stats, result_stats=result_stats,
+                         actor_stats=actor_stats, suspicious_events=suspicious_events,
+                         timeline=timeline, first_event=first_event, last_event=last_event)
+
+
+@app.route('/auditevent/<int:event_id>')
+def view_audit_detail(event_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM audit_logs WHERE id=?', (event_id,)).fetchone()
+    conn.close()
+    if not row:
+        flash('Événement non trouvé')
+        return redirect(url_for('index'))
+    try:
+        raw = json.loads(row['raw_json']) if row['raw_json'] else {}
+    except Exception:
+        raw = {}
+    return render_template('raw_detail.html', row=row, raw=raw,
+                         title=f"Événement d'audit #{row['id']} - {row['activite']}",
+                         subtitle=row['date_utc'],
+                         back_url=url_for('view_audit', bid=row['boite_id']),
+                         back_label="Retour au journal d'audit")
+
 
 @app.route('/boite/<int:bid>/upload', methods=['GET', 'POST'])
 def upload_csv(bid):
@@ -411,22 +645,39 @@ def upload_csv(bid):
         flash('Boîte non trouvée')
         return redirect(url_for('index'))
     if request.method == 'POST':
-        if 'csv_file' not in request.files:
-            flash('Aucun fichier sélectionné')
-            return redirect(request.url)
-        file = request.files['csv_file']
-        if file.filename == '':
-            flash('Aucun fichier sélectionné')
-            return redirect(request.url)
-        if file and file.filename.endswith('.csv'):
+        uploads = [
+            ('csv_file', import_csv, 'message(s)'),
+            ('audit_file', import_audit_logs, "événement(s) d'audit"),
+            ('signin_file', import_signin_logs, 'connexion(s) interactive(s)'),
+        ]
+        summary = []
+        any_file = False
+        for field_name, importer, label in uploads:
+            file = request.files.get(field_name)
+            if not file or file.filename == '':
+                continue
+            any_file = True
+            if not file.filename.endswith('.csv'):
+                flash(f'Format non supporté pour {file.filename} (CSV uniquement)')
+                continue
             filename = secure_filename(file.filename)
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
-            count = import_csv(bid, filepath, filename)
-            flash(f'{count} messages importés avec succès')
-            return redirect(url_for('view_boite', bid=bid))
-        else:
-            flash('Format de fichier non supporté (CSV uniquement)')
+            try:
+                count, duplicates = importer(bid, filepath, filename)
+                line = f'{count} {label}'
+                if duplicates:
+                    line += f' ({duplicates} doublon(s) ignoré(s))'
+                summary.append(line)
+            except Exception as e:
+                flash(f"Erreur lors de l'import de {file.filename}: {e}")
+
+        if not any_file:
+            flash('Aucun fichier sélectionné')
+            return redirect(request.url)
+        if summary:
+            flash('Import réussi : ' + ', '.join(summary))
+        return redirect(url_for('view_boite', bid=bid))
     return render_template('upload.html', boite=boite)
 
 def detect_delimiter(filepath):
@@ -439,50 +690,325 @@ def detect_delimiter(filepath):
 def import_csv(boite_id, filepath, source):
     conn = get_db()
     count = 0
+    duplicates = 0
     delimiter = detect_delimiter(filepath)
+    existing = set(
+        (r['message_id'], r['recipient_address'], r['received'])
+        for r in conn.execute('SELECT message_id, recipient_address, received FROM messages WHERE boite_id=?', (boite_id,)).fetchall()
+    )
     with open(filepath, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
             try:
+                message_id = row.get('MessageId', '').strip('"')
+                received = row.get('Received', '').strip('"')
+                recipient_address = row.get('RecipientAddress', '').strip('"')
+                key = (message_id, recipient_address, received)
+                if key in existing:
+                    duplicates += 1
+                    continue
+
                 from_ip = row.get('FromIP', '').strip().split(';')[0].strip('"')
                 size_raw = row.get('Size', '0')
                 if not size_raw.isdigit():
                     size_raw = row.get('FromIP', '').split(';')[-1].strip('"') if ';' in row.get('FromIP', '') else '0'
                 size = int(size_raw) if str(size_raw).isdigit() else 0
-                
+
                 # Gestion des nouveaux champs (peuvent ne pas exister dans l'ancien CSV)
                 attachments = row.get('Attachments', '').strip('"') or None
                 urls = row.get('Urls', '').strip('"') or None
-                
-                conn.execute('''INSERT INTO messages 
+
+                conn.execute('''INSERT INTO messages
                     (boite_id, message_id, received, sender_address, recipient_address,
                      subject, status, to_ip, from_ip, size, message_trace_id, csv_source,
                      attachments, urls)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                    (boite_id, row.get('MessageId','').strip('"'), row.get('Received','').strip('"'),
-                     row.get('SenderAddress','').strip('"'), row.get('RecipientAddress','').strip('"'),
+                    (boite_id, message_id, received,
+                     row.get('SenderAddress','').strip('"'), recipient_address,
                      row.get('Subject','').strip('"'), row.get('Status','').strip('"'),
                      row.get('ToIP','').strip('"'), from_ip,
                      size,
                      row.get('MessageTraceId','').strip('"'), source,
                      attachments, urls))
+                existing.add(key)
                 count += 1
             except Exception as e:
                 print(f"Erreur ligne: {e}")
                 continue
     conn.commit()
     conn.close()
-    return count
+    return count, duplicates
+
+def _normalize_header(h):
+    """Normalise un nom de colonne CSV pour le rendre tolérant aux variations
+    d'export (accents, apostrophes typographiques, espaces insécables, casse)."""
+    if not h:
+        return ''
+    h = h.replace('’', "'").replace('–', '-').replace('\xa0', ' ')
+    h = unicodedata.normalize('NFKD', h)
+    h = ''.join(ch for ch in h if not unicodedata.combining(ch))
+    h = h.lower()
+    return re.sub(r'[^a-z0-9]+', '', h)
+
+
+# Colonnes attendues pour l'export "Interactive sign-ins" de Microsoft Entra ID (Azure AD),
+# avec variantes possibles selon la version/langue de l'export.
+SIGNIN_FIELD_CANDIDATES = {
+    'date': ['Date (UTC)'],
+    'request_id': ['ID de requête'],
+    'user_agent': ['Agent utilisateur'],
+    'correlation_id': ['ID de corrélation'],
+    'user_id': ['Identifiant utilisateur'],
+    'user_display_name': ['Utilisateur'],
+    'user_upn': ["Nom d'utilisateur"],
+    'application': ['Application'],
+    'ip_address': ['Adresse IP'],
+    'location': ['Emplacement'],
+    'status': ['Statut'],
+    'error_code': ["Code d'erreur de connexion"],
+    'failure_reason': ["Raison de l'échec"],
+    'client_app': ['Application cliente'],
+    'device_id': ["ID de l'appareil"],
+    'browser': ['Navigateur'],
+    'os': ["Système d'exploitation"],
+    'is_compliant': ['Conforme'],
+    'is_managed': ['Géré'],
+    'conditional_access': ['Accès conditionnel'],
+    'mfa_result': ["Résultat de l'authentification multifacteur", 'Résultat de l’authentification multifacteur'],
+    'mfa_method': ["Méthode d'authentification multifacteur", 'Méthode d’authentification multifacteur'],
+    'asn': ['Numéro de système autonome'],
+    'flagged': ['Signalé pour révision'],
+}
+
+# Colonnes attendues pour l'export "Audit logs" de Microsoft Entra ID (Azure AD).
+AUDIT_FIELD_CANDIDATES = {
+    'date': ['Date (UTC)'],
+    'correlation_id': ['CorrelationId'],
+    'service': ['Service'],
+    'categorie': ['Catégorie'],
+    'activite': ['Activité'],
+    'resultat': ['Résultat'],
+    'result_reason': ['ResultReason'],
+    'actor_type': ['ActorType'],
+    'actor_display_name': ['ActorDisplayName'],
+    'actor_upn': ['ActorUserPrincipalName'],
+    'ip_address': ['IPAddress'],
+    'target_type': ['Target1Type'],
+    'target_display_name': ['Target1DisplayName'],
+    'target_upn': ['Cible1UserPrincipalName'],
+}
+
+# Mots-clés (normalisés) d'activités d'audit sensibles à surveiller en priorité
+# lors d'une investigation de compromission de compte.
+SUSPICIOUS_AUDIT_KEYWORDS = [
+    'inboxrule', 'transportrule', 'forward', 'redirect', 'delegate', 'consent',
+    'serviceprincipal', 'approleassignment', 'addowner', 'federation', 'password',
+    'credential', 'authenticationmethod', 'strongauthentication', 'mfa', 'phonenumber',
+    'permission', 'roleassignment', 'admin', 'stsrefreshtokenvalidfrom',
+]
+
+
+def _build_header_lookup(fieldnames):
+    return {_normalize_header(h): h for h in (fieldnames or [])}
+
+
+def _get_field(row, norm_to_orig, field_map, key):
+    for candidate in field_map.get(key, []):
+        orig = norm_to_orig.get(_normalize_header(candidate))
+        if orig is not None:
+            value = row.get(orig, '')
+            if value is not None:
+                return value.strip().strip('"')
+    return ''
+
+
+def _parse_country(location):
+    """Extrait le code pays depuis un champ 'Emplacement' du type 'Paris, Paris, FR'."""
+    if not location:
+        return ''
+    parts = [p.strip() for p in location.split(',') if p.strip()]
+    return parts[-1] if parts else ''
+
+
+def import_signin_logs(boite_id, filepath, source):
+    conn = get_db()
+    count = 0
+    duplicates = 0
+    delimiter = detect_delimiter(filepath)
+    existing = set(
+        (r['request_id'], r['date_utc'], r['user_upn'], r['ip_address'])
+        for r in conn.execute('SELECT request_id, date_utc, user_upn, ip_address FROM signin_logs WHERE boite_id=?', (boite_id,)).fetchall()
+    )
+    with open(filepath, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f, delimiter=delimiter)
+        norm_to_orig = _build_header_lookup(reader.fieldnames)
+        for row in reader:
+            try:
+                def g(key):
+                    return _get_field(row, norm_to_orig, SIGNIN_FIELD_CANDIDATES, key)
+                request_id = g('request_id')
+                date_utc = g('date')
+                user_upn = g('user_upn')
+                ip_address = g('ip_address')
+                key = (request_id, date_utc, user_upn, ip_address)
+                if key in existing:
+                    duplicates += 1
+                    continue
+
+                location = g('location')
+                conn.execute('''INSERT INTO signin_logs
+                    (boite_id, date_utc, request_id, correlation_id, user_display_name, user_upn,
+                     ip_address, location, country, status, error_code, failure_reason, application,
+                     client_app, device_id, browser, os, is_compliant, is_managed, conditional_access,
+                     mfa_result, mfa_method, asn, flagged, user_agent, csv_source, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (boite_id, date_utc, request_id, g('correlation_id'), g('user_display_name'),
+                     user_upn, ip_address, location, _parse_country(location), g('status'),
+                     g('error_code'), g('failure_reason'), g('application'), g('client_app'),
+                     g('device_id'), g('browser'), g('os'), g('is_compliant'), g('is_managed'),
+                     g('conditional_access'), g('mfa_result'), g('mfa_method'), g('asn'), g('flagged'),
+                     g('user_agent'), source, json.dumps(row, ensure_ascii=False)))
+                existing.add(key)
+                count += 1
+            except Exception as e:
+                print(f"Erreur ligne sign-in: {e}")
+                continue
+    conn.commit()
+    conn.close()
+    return count, duplicates
+
+
+def _summarize_modifications(row, norm_to_orig):
+    """Reconstruit un résumé lisible des propriétés modifiées (Target1..3, Property1..5)
+    présentes dans un export Audit Logs Entra ID."""
+    parts = []
+    for target_idx in (1, 2, 3):
+        for prop_idx in (1, 2, 3, 4, 5):
+            name_key = f'Target{target_idx}ModifiedProperty{prop_idx}Name'
+            old_key = f'Target{target_idx}ModifiedProperty{prop_idx}OldValue'
+            new_key = f'Target{target_idx}ModifiedProperty{prop_idx}NewValue'
+            orig_name = norm_to_orig.get(_normalize_header(name_key))
+            if not orig_name:
+                continue
+            prop_name = (row.get(orig_name) or '').strip().strip('"')
+            if not prop_name:
+                continue
+            orig_old = norm_to_orig.get(_normalize_header(old_key))
+            orig_new = norm_to_orig.get(_normalize_header(new_key))
+            old_val = (row.get(orig_old) or '').strip().strip('"') if orig_old else ''
+            new_val = (row.get(orig_new) or '').strip().strip('"') if orig_new else ''
+            parts.append(f'{prop_name}: {old_val} -> {new_val}')
+    return ' | '.join(parts)
+
+
+def import_audit_logs(boite_id, filepath, source):
+    conn = get_db()
+    count = 0
+    duplicates = 0
+    delimiter = detect_delimiter(filepath)
+    existing = set(
+        (r['date_utc'], r['correlation_id'], r['activite'], r['target_upn'])
+        for r in conn.execute('SELECT date_utc, correlation_id, activite, target_upn FROM audit_logs WHERE boite_id=?', (boite_id,)).fetchall()
+    )
+    with open(filepath, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f, delimiter=delimiter)
+        norm_to_orig = _build_header_lookup(reader.fieldnames)
+        for row in reader:
+            try:
+                def g(key):
+                    return _get_field(row, norm_to_orig, AUDIT_FIELD_CANDIDATES, key)
+                date_utc = g('date')
+                correlation_id = g('correlation_id')
+                activite = g('activite')
+                target_upn = g('target_upn')
+                key = (date_utc, correlation_id, activite, target_upn)
+                if key in existing:
+                    duplicates += 1
+                    continue
+
+                conn.execute('''INSERT INTO audit_logs
+                    (boite_id, date_utc, correlation_id, service, categorie, activite, resultat,
+                     result_reason, actor_type, actor_display_name, actor_upn, ip_address,
+                     target_type, target_display_name, target_upn, modifications_summary,
+                     csv_source, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (boite_id, date_utc, correlation_id, g('service'), g('categorie'),
+                     activite, g('resultat'), g('result_reason'), g('actor_type'),
+                     g('actor_display_name'), g('actor_upn'), g('ip_address'), g('target_type'),
+                     g('target_display_name'), target_upn, _summarize_modifications(row, norm_to_orig),
+                     source, json.dumps(row, ensure_ascii=False)))
+                existing.add(key)
+                count += 1
+            except Exception as e:
+                print(f"Erreur ligne audit: {e}")
+                continue
+    conn.commit()
+    conn.close()
+    return count, duplicates
+
 
 @app.route('/boite/<int:bid>/delete', methods=['POST'])
 def delete_boite(bid):
     conn = get_db()
     conn.execute('DELETE FROM messages WHERE boite_id=?', (bid,))
+    conn.execute('DELETE FROM signin_logs WHERE boite_id=?', (bid,))
+    conn.execute('DELETE FROM audit_logs WHERE boite_id=?', (bid,))
     conn.execute('DELETE FROM boites_compromises WHERE id=?', (bid,))
     conn.commit()
     conn.close()
     flash('Boîte supprimée')
     return redirect(url_for('index'))
+
+
+@app.route('/boite/<int:bid>/messages/clear', methods=['POST'])
+def clear_messages(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    cnt = conn.execute('SELECT COUNT(*) as c FROM messages WHERE boite_id=?', (bid,)).fetchone()['c']
+    conn.execute('DELETE FROM messages WHERE boite_id=?', (bid,))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'IMPORT', f'Messages importés effacés pour la boîte {bid} ({boite["user_email"]})', f'{cnt} message(s) supprimé(s)', bid)
+    flash(f'{cnt} message(s) importé(s) effacé(s)')
+    return redirect(url_for('view_boite', bid=bid))
+
+
+@app.route('/boite/<int:bid>/signins/clear', methods=['POST'])
+def clear_signins(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    cnt = conn.execute('SELECT COUNT(*) as c FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['c']
+    conn.execute('DELETE FROM signin_logs WHERE boite_id=?', (bid,))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'IMPORT', f'Connexions importées effacées pour la boîte {bid} ({boite["user_email"]})', f'{cnt} connexion(s) supprimée(s)', bid)
+    flash(f'{cnt} connexion(s) importée(s) effacée(s)')
+    return redirect(url_for('view_boite', bid=bid))
+
+
+@app.route('/boite/<int:bid>/audit/clear', methods=['POST'])
+def clear_audit(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    cnt = conn.execute('SELECT COUNT(*) as c FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['c']
+    conn.execute('DELETE FROM audit_logs WHERE boite_id=?', (bid,))
+    conn.commit()
+    conn.close()
+    add_log('INFO', 'IMPORT', f'Événements d\'audit importés effacés pour la boîte {bid} ({boite["user_email"]})', f'{cnt} événement(s) supprimé(s)', bid)
+    flash(f'{cnt} événement(s) d\'audit importé(s) effacé(s)')
+    return redirect(url_for('view_boite', bid=bid))
 
 @app.route('/logs')
 @login_required

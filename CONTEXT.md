@@ -1,5 +1,18 @@
 # CONTEXT - Analyse de Compromission
 
+## État de la session - 2026-09-09
+
+### Ajout : import et analyse AuditLogs / InteractiveSignIns (Microsoft Entra ID)
+- Nouvelles tables SQLite `signin_logs` et `audit_logs` (liées à `boites_compromises` par `boite_id`), avec conservation de la ligne brute en JSON (`raw_json`) pour l'export CSV français d'Entra ID.
+- Page `/boite/<id>/upload` : un seul formulaire avec 3 champs fichiers indépendants (Messages / Journal d'audit / Connexions interactives), tous optionnels, importables en une fois.
+- Parsing tolérant aux variations d'export (accents, apostrophes typographiques, espaces insécables) via `_normalize_header()` + tables de correspondance `SIGNIN_FIELD_CANDIDATES` / `AUDIT_FIELD_CANDIDATES`.
+- Nouvelles pages d'analyse :
+  - `/boite/<id>/signins` : stats connexions (réussies/échouées, pays, applications, MFA), géolocalisation IP (réutilise `get_ip_info`), timeline 15 min, et détection heuristique de connexions à examiner (signalées par Entra ID, pays inhabituel par rapport au pays majoritaire du compte, échecs).
+  - `/boite/<id>/audit` : stats par activité/résultat/acteur, timeline, détection heuristique d'activités sensibles par mot-clé (règles de messagerie/transfert, délégation, consentement d'appli, mot de passe, MFA, rôles/permissions...).
+  - Détail brut d'une ligne : `/signin/<id>` et `/auditevent/<id>` (template partagé `raw_detail.html`).
+- `index.html` et `view_boite.html` affichent désormais les compteurs de connexions/événements d'audit par boîte.
+- Testé (hors app Flask, en isolant les fonctions d'import) avec les 2 fichiers d'exemple fournis (`AuditLogs_2026-09-08.csv`, `InteractiveSignIns_2026-09-01_2026-09-08.csv`) : 21 événements d'audit / 50 connexions importés sans erreur, détection correcte d'un changement de mot de passe + connexions réussies depuis l'Espagne (pays inhabituel) dans le jeu de test.
+
 ## État de la session - 2026-04-29
 
 ### Projet

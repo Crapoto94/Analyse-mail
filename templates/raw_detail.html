@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h2>{{ title }}</h2>
+{% if subtitle %}<p class="text-muted">{{ subtitle }}</p>{% endif %}
+
+<div class="card">
+    <div class="card-header">Toutes les colonnes importées</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm table-striped">
+                <tbody>
+                    {% for key, value in raw.items() %}
+                    {% if value %}
+                    <tr>
+                        <th style="width:30%; white-space:nowrap;"><small>{{ key }}</small></th>
+                        <td><small style="white-space:pre-wrap; word-break:break-word;">{{ value }}</small></td>
+                    </tr>
+                    {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card-footer">
+        <a href="{{ back_url }}" class="btn btn-secondary"><i class="bi bi-arrow-left"></i> {{ back_label }}</a>
+    </div>
+</div>
+{% endblock %}

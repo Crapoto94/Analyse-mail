@@ -55,6 +55,35 @@
     </div>
 </div>
 
+<div class="row mb-4">
+    <div class="col-md-6">
+        <a href="{{ url_for('view_signins', bid=boite.id) }}" class="text-decoration-none">
+            <div class="card stat-card h-100" style="border-left-color:#6f42c1;">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div>
+                        <h3 class="mb-0">{{ nb_signins }}</h3>
+                        <small class="text-muted"><i class="bi bi-shield-lock"></i> Connexions interactives (sign-ins)</small>
+                    </div>
+                    <i class="bi bi-chevron-right fs-3 text-muted"></i>
+                </div>
+            </div>
+        </a>
+    </div>
+    <div class="col-md-6">
+        <a href="{{ url_for('view_audit', bid=boite.id) }}" class="text-decoration-none">
+            <div class="card stat-card h-100" style="border-left-color:#fd7e14;">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div>
+                        <h3 class="mb-0">{{ nb_audit }}</h3>
+                        <small class="text-muted"><i class="bi bi-journal-text"></i> Événements du journal d'audit</small>
+                    </div>
+                    <i class="bi bi-chevron-right fs-3 text-muted"></i>
+                </div>
+            </div>
+        </a>
+    </div>
+</div>
+
 <div class="card mb-4">
     <div class="card-header">Informations sur la compromission</div>
     <div class="card-body">
@@ -419,10 +448,18 @@
 </div>
 
 <!-- Bouton Export CSV -->
-<div class="mb-3">
+<div class="mb-3 d-flex gap-2">
     <a href="{{ url_for('export_messages', bid=boite.id) }}" class="btn btn-outline-success">
         <i class="bi bi-download"></i> Exporter les messages filtrés en CSV
     </a>
+    {% if messages %}
+    <form method="POST" action="{{ url_for('clear_messages', bid=boite.id) }}"
+          onsubmit="return confirm('Effacer les {{ messages|length }} message(s) importé(s) pour cette boîte ? Cette action est irréversible.')">
+        <button type="submit" class="btn btn-outline-danger">
+            <i class="bi bi-trash"></i> Effacer les messages importés
+        </button>
+    </form>
+    {% endif %}
 </div>
 
 <div class="card">

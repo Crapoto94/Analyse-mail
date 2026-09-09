@@ -64,6 +64,10 @@
                             </div>
                         </div>
                     </div>
+                    <div class="d-flex gap-2 mb-2 flex-wrap">
+                        <span class="badge bg-light text-dark border"><i class="bi bi-shield-lock"></i> {{ stats[boite.id].nb_signins }} connexions</span>
+                        <span class="badge bg-light text-dark border"><i class="bi bi-journal-text"></i> {{ stats[boite.id].nb_audit }} événements d'audit</span>
+                    </div>
                     <div class="d-grid gap-2">
                         <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-outline-primary btn-sm">
                             <i class="bi bi-eye"></i> Voir les détails

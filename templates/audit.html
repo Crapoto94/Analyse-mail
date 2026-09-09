@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% block title %}Journal d'audit - {{ boite.user_email }}{% endblock %}
+{% block content %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-journal-text"></i> Journal d'audit - {{ boite.user_email }}</h1>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('upload_csv', bid=boite.id) }}" class="btn btn-success">
+            <i class="bi bi-cloud-upload"></i> Importer CSV
+        </a>
+        {% if events %}
+        <form method="POST" action="{{ url_for('clear_audit', bid=boite.id) }}"
+              onsubmit="return confirm('Effacer les {{ events|length }} événement(s) d\'audit importé(s) pour cette boîte ? Cette action est irréversible.')">
+            <button type="submit" class="btn btn-outline-danger">
+                <i class="bi bi-trash"></i> Effacer les événements importés
+            </button>
+        </form>
+        {% endif %}
+        <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Retour à la boîte
+        </a>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ total }}</h3><small class="text-muted">Événements totaux</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card" style="border-left-color:#fd7e14;"><div class="card-body text-center">
+            <h3>{{ suspicious_events|length }}</h3><small class="text-muted">Activités sensibles</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ activity_stats|length }}</h3><small class="text-muted">Types d'activité</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ actor_stats|length }}</h3><small class="text-muted">Acteurs distincts</small>
+        </div></div>
+    </div>
+</div>
+
+{% if not events %}
+<div class="alert alert-info">
+    Aucun événement importé. <a href="{{ url_for('upload_csv', bid=boite.id) }}">Importer un export "Journal d'audit" (Audit logs)</a>.
+</div>
+{% else %}
+
+<div class="card mb-4 border-warning">
+    <div class="card-header bg-warning">
+        <i class="bi bi-exclamation-triangle"></i> Activités sensibles à examiner en priorité
+    </div>
+    <div class="card-body">
+        <p class="text-muted small">Détection par mot-clé : règles de messagerie (transfert/redirection), délégation, consentement d'application, ajout de service principal / propriétaire, changement de mot de passe ou de méthode MFA/téléphone, attribution de rôle ou de permission, révocation de session, changement de fédération de domaine.</p>
+        {% if suspicious_events %}
+        <div class="table-responsive" style="max-height:350px; overflow-y:auto;">
+            <table class="table table-sm table-hover">
+                <thead><tr><th>Date</th><th>Activité</th><th>Résultat</th><th>Acteur</th><th>Cible</th><th>IP</th><th></th></tr></thead>
+                <tbody>
+                {% for e in suspicious_events[:200] %}
+                <tr>
+                    <td><small>{{ e.date_utc }}</small></td>
+                    <td><small><strong>{{ e.activite }}</strong></small></td>
+                    <td><span class="badge bg-{% if e.resultat == 'Success' %}success{% else %}danger{% endif %}">{{ e.resultat }}</span></td>
+                    <td><small>{{ e.actor_display_name or e.actor_upn }}</small></td>
+                    <td><small>{{ e.target_upn or e.target_display_name }}</small></td>
+                    <td><code><small>{{ e.ip_address }}</small></code></td>
+                    <td><a href="{{ url_for('view_audit_detail', event_id=e.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="alert alert-success mb-0"><i class="bi bi-check-circle"></i> Aucune activité sensible détectée automatiquement (à vérifier manuellement malgré tout).</div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">Activités les plus fréquentes</div>
+            <div class="card-body table-responsive" style="max-height:300px; overflow-y:auto;">
+                <table class="table table-sm">
+                    <thead><tr><th>Activité</th><th>Nb</th></tr></thead>
+                    <tbody>
+                    {% for a, cnt in activity_stats %}
+                    <tr><td><small>{{ a }}</small></td><td><span class="badge bg-primary">{{ cnt }}</span></td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">Résultat</div>
+            <div class="card-body table-responsive" style="max-height:300px; overflow-y:auto;">
+                <table class="table table-sm">
+                    <thead><tr><th>Résultat</th><th>Nb</th></tr></thead>
+                    <tbody>
+                    {% for r, cnt in result_stats %}
+                    <tr><td>{{ r }}</td><td><span class="badge bg-{% if r == 'Success' %}success{% else %}danger{% endif %}">{{ cnt }}</span></td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-header">Acteurs (auteurs des actions)</div>
+            <div class="card-body table-responsive" style="max-height:300px; overflow-y:auto;">
+                <table class="table table-sm">
+                    <thead><tr><th>Acteur</th><th>Nb</th></tr></thead>
+                    <tbody>
+                    {% for a, cnt in actor_stats %}
+                    <tr><td><small>{{ a }}</small></td><td><span class="badge bg-secondary">{{ cnt }}</span></td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if timeline %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-graph-up"></i> Timeline des événements (par tranche de 15 min)</div>
+    <div class="card-body">
+        <p class="text-muted small mb-2">Fenêtre : <strong>{{ first_event or 'N/A' }}</strong> → <strong>{{ last_event or 'N/A' }}</strong></p>
+        <canvas id="auditTimelineChart" style="max-height:300px;"></canvas>
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        Tous les événements ({{ events|length }})
+        <div class="input-group input-group-sm w-50">
+            <input type="text" id="filter-audit" class="form-control" placeholder="Filtrer par activité, acteur, cible..." onkeyup="filterAudit()">
+            <span class="input-group-text" id="audit-match-count">0</span>
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:600px; overflow-y:auto;">
+            <table class="table table-hover table-sm" id="audit-table">
+                <thead>
+                    <tr><th>Date</th><th>Activité</th><th>Résultat</th><th>Acteur</th><th>Cible</th><th>IP</th><th>Modifications</th><th></th></tr>
+                </thead>
+                <tbody>
+                    {% for e in events %}
+                    <tr>
+                        <td><small>{{ e.date_utc }}</small></td>
+                        <td><small>{{ e.activite }}</small></td>
+                        <td><span class="badge bg-{% if e.resultat == 'Success' %}success{% else %}danger{% endif %}">{{ e.resultat }}</span></td>
+                        <td><small>{{ e.actor_display_name or e.actor_upn }}</small></td>
+                        <td><small>{{ e.target_upn or e.target_display_name }}</small></td>
+                        <td><code><small>{{ e.ip_address }}</small></code></td>
+                        <td><small>{{ (e.modifications_summary or '')[:80] }}{% if e.modifications_summary and e.modifications_summary|length > 80 %}...{% endif %}</small></td>
+                        <td><a href="{{ url_for('view_audit_detail', event_id=e.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+function filterAudit() {
+    var filter = document.getElementById('filter-audit').value.toLowerCase().trim();
+    var rows = document.querySelectorAll('#audit-table tbody tr');
+    var matchCount = 0;
+    rows.forEach(function(row) {
+        var text = row.textContent.toLowerCase();
+        if (filter === '' || text.indexOf(filter) > -1) {
+            row.style.display = '';
+            matchCount++;
+        } else {
+            row.style.display = 'none';
+        }
+    });
+    document.getElementById('audit-match-count').textContent = matchCount + ' / ' + rows.length;
+}
+
+{% if timeline %}
+var auditTimelineData = {{ timeline|tojson }};
+new Chart(document.getElementById('auditTimelineChart').getContext('2d'), {
+    type: 'line',
+    data: {
+        labels: auditTimelineData.map(t => t.hour),
+        datasets: [{
+            label: "Nombre d'événements",
+            data: auditTimelineData.map(t => t.cnt),
+            borderColor: 'rgb(253, 126, 20)',
+            backgroundColor: 'rgba(253, 126, 20, 0.2)',
+            tension: 0.1,
+            fill: true
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+            y: { beginAtZero: true },
+            x: { ticks: { maxRotation: 45, autoSkip: true, maxTicksLimit: 20 } }
+        }
+    }
+});
+{% endif %}
+</script>
+{% endif %}
+{% endblock %}
