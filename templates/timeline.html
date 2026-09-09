@@ -95,7 +95,15 @@
                         <strong>{{ e.title }}</strong>
                         <span class="badge bg-{% if e.type == 'signin' %}purple{% else %}orange{% endif %}" style="background-color:{% if e.type == 'signin' %}#6f42c1{% else %}#fd7e14{% endif %};">{{ 'Connexion' if e.type == 'signin' else 'Audit' }}</span>
                     </div>
-                    <small class="text-muted text-nowrap ms-2">{{ e.timestamp|paris }}</small>
+                    <div class="text-nowrap ms-2">
+                        <small class="text-muted">{{ e.timestamp|paris }}</small>
+                        {% if e.ref_id %}
+                        <a href="{{ url_for('view_signin_detail', signin_id=e.ref_id) if e.type == 'signin' else url_for('view_audit_detail', event_id=e.ref_id) }}"
+                           class="btn btn-sm btn-outline-secondary py-0 px-1 ms-1" title="Voir le détail">
+                            <i class="bi bi-eye"></i>
+                        </a>
+                        {% endif %}
+                    </div>
                 </div>
                 <div class="small text-muted">{{ e.detail }}</div>
             </div>
