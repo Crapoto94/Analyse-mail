@@ -5,30 +5,25 @@
 
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h1><i class="bi bi-bar-chart-line"></i> Tableau de bord</h1>
-    <a href="{{ url_for('index') }}" class="btn btn-secondary">
-        <i class="bi bi-arrow-left"></i> Accueil
+    <a href="{{ url_for('list_boites') }}" class="btn btn-primary">
+        <i class="bi bi-folder2-open"></i> Voir les boîtes
     </a>
 </div>
 
 <div class="row mb-4">
-    <div class="col-md-3">
+    <div class="col-md-4">
         <div class="card stat-card"><div class="card-body text-center">
-            <h3>{{ nb_boites_total }}</h3><small class="text-muted">Incidents au total</small>
+            <h3>{{ nb_boites_total }}</h3><small class="text-muted">Incidents confirmés</small>
         </div></div>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-4">
         <div class="card stat-card" style="border-left-color:#198754;"><div class="card-body text-center">
-            <h3>{{ nb_monitored_active }}</h3><small class="text-muted">Boîtes surveillées actives</small>
+            <h3>{{ nb_monitored_active }} / {{ nb_monitored_total }}</h3><small class="text-muted">Boîtes surveillées actives</small>
         </div></div>
     </div>
-    <div class="col-md-3">
-        <div class="card stat-card" style="border-left-color:#dc3545;"><div class="card-body text-center">
-            <h3>{{ nb_monitored_alert }}</h3><small class="text-muted">En compromission probable</small>
-        </div></div>
-    </div>
-    <div class="col-md-3">
+    <div class="col-md-4">
         <div class="card stat-card" style="border-left-color:#fd7e14;"><div class="card-body text-center">
-            <h3>{{ nb_signins_failed_24h }} / {{ nb_signins_24h }}</h3><small class="text-muted">Échecs de connexion (24h, tenant)</small>
+            <h3>{{ signin_failure_rate }}%</h3><small class="text-muted">Taux d'échec connexions ({{ signins_window_hours }}h, tenant)</small>
         </div></div>
     </div>
 </div>
@@ -49,11 +44,57 @@
     <div class="col-md-4">
         <div class="card h-100">
             <div class="card-header">
-                <i class="bi bi-pie-chart"></i> Verdicts actuels
-                <small class="text-muted">(sur les {{ scored_boites_count }} incidents les plus récents)</small>
+                <i class="bi bi-pie-chart"></i> Signaux détectés
+                <small class="text-muted d-block">sur les {{ scored_boites_count }} incidents les plus récents — reflète les preuves déjà importées, pas si l'incident est réel (il l'est déjà, par définition)</small>
             </div>
             <div class="card-body">
                 <canvas id="verdictChart" style="max-height:280px;"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-eye"></i> Surveillance automatisée (boîtes suivies)</div>
+            <div class="card-body">
+                <div class="row text-center mb-3">
+                    <div class="col-4"><h5 class="mb-0">{{ nb_monitored_total }}</h5><small class="text-muted">Total</small></div>
+                    <div class="col-4"><h5 class="mb-0">{{ nb_monitored_active }}</h5><small class="text-muted">Actives</small></div>
+                    <div class="col-4"><h5 class="mb-0 {% if nb_monitored_errors %}text-danger{% endif %}">{{ nb_monitored_errors }}</h5><small class="text-muted">En erreur</small></div>
+                </div>
+                <canvas id="monitoredVerdictChart" style="max-height:220px;"></canvas>
+            </div>
+            <div class="card-footer">
+                <a href="{{ url_for('view_monitoring') }}" class="btn btn-sm btn-outline-secondary">Voir le détail</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-shield-lock"></i> Connexions (tenant, {{ signins_window_hours }}h glissantes)</div>
+            <div class="card-body">
+                <div class="row text-center mb-3">
+                    <div class="col-3"><h5 class="mb-0">{{ nb_signins_window }}</h5><small class="text-muted">Total</small></div>
+                    <div class="col-3"><h5 class="mb-0 {% if nb_signins_failed_window %}text-danger{% endif %}">{{ nb_signins_failed_window }}</h5><small class="text-muted">Échecs</small></div>
+                    <div class="col-3"><h5 class="mb-0">{{ nb_signins_foreign }}</h5><small class="text-muted">Hors {{ home_country_code }}</small></div>
+                    <div class="col-3"><h5 class="mb-0">{% if avg_trust_score is not none %}{{ avg_trust_score }}%{% else %}—{% endif %}</h5><small class="text-muted">Confiance moy.</small></div>
+                </div>
+                {% if nb_low_trust %}
+                <p class="text-warning small mb-2"><i class="bi bi-exclamation-triangle"></i> {{ nb_low_trust }} connexion(s) à confiance faible (&lt; 50%).</p>
+                {% endif %}
+                {% if top_failed_users %}
+                <p class="small text-muted mb-1">Utilisateurs les plus en échec :</p>
+                <ul class="list-unstyled small mb-0">
+                    {% for u in top_failed_users %}
+                    <li>{{ u.user_upn }} — <span class="badge bg-danger">{{ u.c }}</span></li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+            </div>
+            <div class="card-footer">
+                <a href="{{ url_for('view_tenant_signins') }}" class="btn btn-sm btn-outline-secondary">Voir le détail</a>
             </div>
         </div>
     </div>
@@ -133,6 +174,23 @@ new Chart(document.getElementById('verdictChart').getContext('2d'), {
         datasets: [{
             data: [{{ verdict_counts.compromise_likely }}, {{ verdict_counts.signals_to_check }}, {{ verdict_counts.no_strong_signal }}],
             backgroundColor: ['#dc3545', '#fd7e14', '#198754']
+        }]
+    },
+    options: { plugins: { legend: { position: 'bottom' } } }
+});
+
+new Chart(document.getElementById('monitoredVerdictChart').getContext('2d'), {
+    type: 'doughnut',
+    data: {
+        labels: ['Compromission probable', 'Signaux à vérifier', 'RAS', 'Jamais scannée'],
+        datasets: [{
+            data: [
+                {{ monitored_verdict_counts.compromise_likely }},
+                {{ monitored_verdict_counts.signals_to_check }},
+                {{ monitored_verdict_counts.no_strong_signal }},
+                {{ monitored_verdict_counts.not_scanned }}
+            ],
+            backgroundColor: ['#dc3545', '#fd7e14', '#198754', '#adb5bd']
         }]
     },
     options: { plugins: { legend: { position: 'bottom' } } }

@@ -34,7 +34,7 @@ def test_default_admin_is_admin_admin_and_forces_password_change(client):
 
 def test_password_change_unlocks_the_rest_of_the_app(client):
     login_as_default_admin(client)
-    r = client.get('/dashboard')
+    r = client.get('/')
     assert r.status_code == 200
 
 

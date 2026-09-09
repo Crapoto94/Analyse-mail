@@ -2024,8 +2024,8 @@ def reset_user_password(user_id):
     return redirect(url_for('list_users'))
 
 
-@app.route('/')
-def index():
+@app.route('/boites')
+def list_boites():
     conn = get_db()
     boites = conn.execute('SELECT * FROM boites_compromises ORDER BY created_at DESC').fetchall()
     stats = {}
@@ -2101,18 +2101,28 @@ def global_search():
     return render_template('search_results.html', q=q, results=results, total=total, too_short=False)
 
 
-# Nombre maximum de boites sur lesquelles le tableau de bord recalcule le score de risque
-# actuel (voir analyze_compromise) : plafonne pour rester rapide meme sur une base avec
-# beaucoup d'incidents deja cloture — les plus recents sont les plus pertinents a afficher.
+# Nombre maximum de boites sur lesquelles le tableau de bord recalcule le detail des
+# signaux detectes (voir analyze_compromise) : plafonne pour rester rapide meme sur une
+# base avec beaucoup d'incidents deja clotures — les plus recents sont les plus pertinents
+# a afficher. NB : ce n'est PAS ce qui determine si une boite est "un incident" — chaque
+# ligne de boites_compromises EST par definition un incident deja confirme (c'est pour ca
+# qu'elle a ete creee) ; ce recalcul ne sert qu'a illustrer la force des preuves deja
+# importees pour chacune, pas a re-decider si elle est compromise ou non.
 DASHBOARD_MAX_SCORED_BOITES = 100
 
+# Fenetre glissante sur laquelle sont calculees les statistiques de connexions du tableau
+# de bord (echecs, score de confiance moyen, top utilisateurs en echec...).
+DASHBOARD_SIGNINS_WINDOW_HOURS = 24
 
-@app.route('/dashboard')
-def dashboard():
-    """Tableau de bord agrege : tendance des incidents dans le temps, repartition des
-    verdicts actuels, IPs qui reviennent sur plusieurs boites (signal de compromission
-    croisee), et etat de la surveillance/du monitoring connexions — pour avoir une vue
-    d'ensemble sans ouvrir boite par boite."""
+
+@app.route('/')
+def index():
+    """Page d'accueil de l'application (pour tout le monde, pas seulement les admins) :
+    tableau de bord agrege plutot que la liste des boites (voir /boites, accessible via le
+    bouton "Voir les boîtes"). Tendance des incidents dans le temps, IPs qui reviennent sur
+    plusieurs boites (signal de compromission croisee), et KPI sur la surveillance
+    automatisee (boites suivies) et le monitoring des connexions (tout le tenant) — pour
+    avoir une vue d'ensemble sans ouvrir boite par boite ni page par page."""
     conn = get_db()
 
     incidents_by_month = conn.execute('''
@@ -2124,6 +2134,11 @@ def dashboard():
         (DASHBOARD_MAX_SCORED_BOITES,)).fetchall()]
     conn.close()
 
+    # Repartition du niveau de signal detecte sur les incidents deja enregistres — PAS "sont-ils
+    # compromis" (ils le sont tous, par definition, voir docstring) mais "les preuves deja
+    # importees suffisent-elles a le confirmer heuristiquement". Un incident en "signaux à
+    # vérifier" ou "RAS" ici manque simplement d'import Graph (connexions/audit), pas de
+    # compromission reelle.
     verdict_counts = {'compromise_likely': 0, 'signals_to_check': 0, 'no_strong_signal': 0}
     for bid in boite_ids:
         try:
@@ -2145,26 +2160,69 @@ def dashboard():
         ) GROUP BY ip HAVING nb_boites >= 2 ORDER BY nb_boites DESC LIMIT 20''').fetchall()
 
     nb_boites_total = conn.execute('SELECT COUNT(*) as c FROM boites_compromises').fetchone()['c']
-    nb_monitored_active = conn.execute('SELECT COUNT(*) as c FROM monitored_mailboxes WHERE is_active=1').fetchone()['c']
-    nb_monitored_alert = conn.execute(
-        "SELECT COUNT(*) as c FROM monitored_mailboxes WHERE is_active=1 AND last_scan_verdict='compromise_likely'"
-    ).fetchone()['c']
-    nb_signins_24h = conn.execute(
-        "SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= datetime('now','-1 day')").fetchone()['c']
-    nb_signins_failed_24h = conn.execute(
-        "SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= datetime('now','-1 day') AND status != 'Success'"
-    ).fetchone()['c']
     top_recipients = conn.execute('''
         SELECT recipient_address, COUNT(*) as c FROM messages
         WHERE recipient_address != '' GROUP BY recipient_address ORDER BY c DESC LIMIT 10''').fetchall()
+
+    # --- KPI surveillance automatisee (monitored_mailboxes) -----------------------------
+    # A partir des colonnes deja stockees (dernier resultat de scan), pas d'un recalcul —
+    # coherent avec ce que la page Surveillance affiche elle-meme, contrairement au
+    # verdict_counts ci-dessus qui, lui, recalcule a la volee sur les boites d'incident.
+    nb_monitored_total = conn.execute('SELECT COUNT(*) as c FROM monitored_mailboxes').fetchone()['c']
+    nb_monitored_active = conn.execute('SELECT COUNT(*) as c FROM monitored_mailboxes WHERE is_active=1').fetchone()['c']
+    monitored_verdict_rows = conn.execute('''
+        SELECT COALESCE(last_scan_verdict, 'not_scanned') as verdict, COUNT(*) as c
+        FROM monitored_mailboxes WHERE is_active=1 GROUP BY verdict''').fetchall()
+    monitored_verdict_counts = {'compromise_likely': 0, 'signals_to_check': 0, 'no_strong_signal': 0, 'not_scanned': 0}
+    for row in monitored_verdict_rows:
+        monitored_verdict_counts[row['verdict']] = row['c']
+    nb_monitored_errors = conn.execute('''
+        SELECT COUNT(*) as c FROM monitored_mailboxes
+        WHERE is_active=1 AND last_error IS NOT NULL AND last_error != ''
+    ''').fetchone()['c']
+
+    # --- KPI monitoring connexions (tenant_signins), fenetre glissante ------------------
+    window_clause = f"datetime('now','-{DASHBOARD_SIGNINS_WINDOW_HOURS} hour')"
+    nb_signins_window = conn.execute(
+        f"SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= {window_clause}").fetchone()['c']
+    nb_signins_failed_window = conn.execute(
+        f"SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= {window_clause} AND status != 'Success'"
+    ).fetchone()['c']
+    signin_failure_rate = round(100 * nb_signins_failed_window / nb_signins_window) if nb_signins_window else 0
+    top_failed_users = conn.execute(f'''
+        SELECT COALESCE(NULLIF(user_upn, ''), '(inconnu)') as user_upn, COUNT(*) as c
+        FROM tenant_signins WHERE date_utc >= {window_clause} AND status != 'Success'
+        GROUP BY user_upn ORDER BY c DESC LIMIT 5''').fetchall()
+
+    home_country = get_home_country_code()
+    signin_window_rows = conn.execute(
+        f"SELECT ip_address, country FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
     conn.close()
+
+    nb_signins_foreign = 0
+    trust_scores = []
+    for r in signin_window_rows:
+        if (r['country'] or '').strip().upper() != home_country:
+            nb_signins_foreign += 1
+        try:
+            ip_payload = ip_reputation_payload(r['ip_address'])
+        except Exception:
+            ip_payload = None
+        trust_scores.append(compute_connection_trust_score(ip_payload, r['country']))
+    avg_trust_score = round(sum(trust_scores) / len(trust_scores)) if trust_scores else None
+    nb_low_trust = sum(1 for s in trust_scores if s < 50)
 
     return render_template('dashboard.html',
         incidents_by_month=incidents_by_month, verdict_counts=verdict_counts,
         shared_ips=shared_ips, nb_boites_total=nb_boites_total,
-        nb_monitored_active=nb_monitored_active, nb_monitored_alert=nb_monitored_alert,
-        nb_signins_24h=nb_signins_24h, nb_signins_failed_24h=nb_signins_failed_24h,
-        top_recipients=top_recipients, scored_boites_count=len(boite_ids))
+        top_recipients=top_recipients, scored_boites_count=len(boite_ids),
+        nb_monitored_total=nb_monitored_total, nb_monitored_active=nb_monitored_active,
+        monitored_verdict_counts=monitored_verdict_counts, nb_monitored_errors=nb_monitored_errors,
+        nb_signins_window=nb_signins_window, nb_signins_failed_window=nb_signins_failed_window,
+        signin_failure_rate=signin_failure_rate, top_failed_users=top_failed_users,
+        nb_signins_foreign=nb_signins_foreign, avg_trust_score=avg_trust_score,
+        nb_low_trust=nb_low_trust, signins_window_hours=DASHBOARD_SIGNINS_WINDOW_HOURS,
+        home_country_code=home_country)
 
 
 @app.route('/boite/add', methods=['GET', 'POST'])
@@ -2191,7 +2249,7 @@ def view_boite(bid):
         boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
         if not boite:
             flash('Boîte non trouvée')
-            return redirect(url_for('index'))
+            return redirect(url_for('list_boites'))
         
         messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
         nb_signins = conn.execute('SELECT COUNT(*) as c FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['c']
@@ -3119,7 +3177,7 @@ def view_timeline(bid):
     conn.close()
     if not boite:
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
 
     analysis = analyze_compromise(bid)
     return render_template('timeline.html', boite=boite, **analysis)
@@ -3160,7 +3218,7 @@ def view_signins(bid):
         boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
         if not boite:
             flash('Boîte non trouvée')
-            return redirect(url_for('index'))
+            return redirect(url_for('list_boites'))
 
         signins = conn.execute('SELECT * FROM signin_logs WHERE boite_id=? ORDER BY date_utc DESC', (bid,)).fetchall()
         total = len(signins)
@@ -3233,7 +3291,7 @@ def view_signin_detail(signin_id):
     conn.close()
     if not row:
         flash('Connexion non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     try:
         raw = json.loads(row['raw_json']) if row['raw_json'] else {}
     except Exception:
@@ -3252,7 +3310,7 @@ def view_audit(bid):
         boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
         if not boite:
             flash('Boîte non trouvée')
-            return redirect(url_for('index'))
+            return redirect(url_for('list_boites'))
 
         events = conn.execute('SELECT * FROM audit_logs WHERE boite_id=? ORDER BY date_utc DESC', (bid,)).fetchall()
         total = len(events)
@@ -3300,7 +3358,7 @@ def view_audit_detail(event_id):
     conn.close()
     if not row:
         flash('Événement non trouvé')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     try:
         raw = json.loads(row['raw_json']) if row['raw_json'] else {}
     except Exception:
@@ -3350,7 +3408,7 @@ def quick_scan_result_page(job_id):
     job = _job_get(job_id)
     if not job or job['status'] != 'done' or not job.get('result'):
         flash('Résultat du scan introuvable ou expiré — relancez une analyse rapide')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     return render_template('quick_scan_result.html', **job['result'])
 
 
@@ -3370,7 +3428,7 @@ def quick_scan_create():
     email = request.form.get('email', '').strip()
     if not email or '@' not in email:
         flash('Adresse email invalide')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     try:
         days = max(1, min(int(request.form.get('days', '7')), 90))
     except ValueError:
@@ -4289,7 +4347,7 @@ def view_rules(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     rules = conn.execute('SELECT * FROM mailbox_rules WHERE boite_id=? ORDER BY is_suspicious DESC, sequence ASC', (bid,)).fetchall()
     conn.close()
     return render_template('rules.html', boite=boite, rules=rules)
@@ -4302,7 +4360,7 @@ def clear_rules(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     cnt = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
     conn.execute('DELETE FROM mailbox_rules WHERE boite_id=?', (bid,))
     conn.commit()
@@ -4319,7 +4377,7 @@ def upload_csv(bid):
     conn.close()
     if not boite:
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     if request.method == 'POST':
         uploads = [
             ('csv_file', import_csv, 'message(s)'),
@@ -4651,7 +4709,7 @@ def delete_boite(bid):
     conn.commit()
     conn.close()
     flash('Boîte supprimée')
-    return redirect(url_for('index'))
+    return redirect(url_for('list_boites'))
 
 
 @app.route('/boite/<int:bid>/dsi-actions/add', methods=['POST'])
@@ -4665,7 +4723,7 @@ def add_dsi_action(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     action_text = request.form.get('action_text', '').strip()
     # Date/heure de l'action : saisie librement par l'utilisateur (champ datetime-local,
     # donc deja en heure locale) — a defaut, on prend la date/heure actuelle, pour ne pas
@@ -4722,7 +4780,7 @@ def clear_messages(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     cnt = conn.execute('SELECT COUNT(*) as c FROM messages WHERE boite_id=?', (bid,)).fetchone()['c']
     conn.execute('DELETE FROM messages WHERE boite_id=?', (bid,))
     conn.commit()
@@ -4739,7 +4797,7 @@ def clear_signins(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     cnt = conn.execute('SELECT COUNT(*) as c FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['c']
     conn.execute('DELETE FROM signin_logs WHERE boite_id=?', (bid,))
     conn.commit()
@@ -4756,7 +4814,7 @@ def clear_audit(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     cnt = conn.execute('SELECT COUNT(*) as c FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['c']
     conn.execute('DELETE FROM audit_logs WHERE boite_id=?', (bid,))
     conn.commit()
@@ -5307,7 +5365,7 @@ def export_boite_pdf(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     
     messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
     ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
@@ -5381,7 +5439,7 @@ def export_messages(bid):
     if not boite:
         conn.close()
         flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return redirect(url_for('list_boites'))
     
     messages = conn.execute('SELECT * FROM messages WHERE boite_id=? ORDER BY received DESC', (bid,)).fetchall()
     conn.close()
