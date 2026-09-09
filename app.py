@@ -78,12 +78,51 @@ def format_mfa_status(row):
     if mfa_result:
         return MFA_REQUIREMENT_LABELS.get(mfa_result.lower(), mfa_result)
 
-    error_code = _get('error_code')
-    failure_reason = _get('failure_reason').lower()
-    if error_code in MFA_FAILURE_ERROR_CODES or any(kw in failure_reason for kw in MFA_FAILURE_KEYWORDS):
+    if _is_mfa_failure_row(row):
         return 'MFA requise (non complétée)'
 
     return '-'
+
+
+def _is_mfa_failure_row(row):
+    """True si une ligne signin_logs correspond a un echec specifiquement du au MFA
+    (code d'erreur ou motif connu), independamment du champ mfa_result (souvent absent)."""
+    def _get(key):
+        try:
+            return (row[key] or '').strip()
+        except Exception:
+            return ''
+    error_code = _get('error_code')
+    failure_reason = _get('failure_reason').lower()
+    return error_code in MFA_FAILURE_ERROR_CODES or any(kw in failure_reason for kw in MFA_FAILURE_KEYWORDS)
+
+
+def _correlate_signin_mfa(signins):
+    """Microsoft Graph journalise parfois l'etape d'authentification primaire et l'etape
+    MFA d'une meme sequence de connexion comme deux lignes signIns distinctes, reliees par
+    le meme correlation_id. Regroupe les lignes par correlation_id et indique, pour chaque
+    groupe, s'il contient a la fois un succes ET un echec specifiquement MFA — auquel cas
+    la connexion ne doit pas etre consideree comme un succes "propre" sans reserve : le MFA
+    a echoue a un moment de la meme sequence, meme si l'acces a finalement abouti.
+    Retourne { correlation_id: {'any_success': bool, 'mfa_failure': bool, 'mfa_failure_reason': str} }."""
+    groups = {}
+    for s in signins:
+        try:
+            cid = (s['correlation_id'] or '').strip()
+        except Exception:
+            cid = ''
+        if not cid:
+            continue
+        g = groups.setdefault(cid, {'any_success': False, 'mfa_failure': False, 'mfa_failure_reason': ''})
+        if _is_success_status(s['status']):
+            g['any_success'] = True
+        elif _is_mfa_failure_row(s):
+            g['mfa_failure'] = True
+            try:
+                g['mfa_failure_reason'] = s['failure_reason'] or 'MFA non complétée'
+            except Exception:
+                g['mfa_failure_reason'] = 'MFA non complétée'
+    return groups
 
 
 app.jinja_env.filters['mfa_status'] = format_mfa_status
@@ -1304,9 +1343,15 @@ def _parse_iso(value):
         return None
 
 
-def _build_signin_event(s, ref_id=None):
+def _build_signin_event(s, ref_id=None, mfa_groups=None):
     """Construit un evenement de timeline a partir d'une ligne signin_logs (sqlite3.Row
-    ou dict). Fonction pure : reutilisee pour les boites en base et le scan rapide."""
+    ou dict). Fonction pure : reutilisee pour les boites en base et le scan rapide.
+
+    Si `mfa_groups` (voir _correlate_signin_mfa) indique que la meme sequence
+    d'authentification (correlation_id) contient a la fois ce succes ET un echec MFA,
+    la connexion est marquee 'mfa_linked_failure' : elle a materiellement abouti, mais
+    le MFA a echoue a un moment de la meme sequence — a ne pas compter comme un succes
+    sans reserve (l'utilisateur/l'attaquant a du contourner ou re-essayer le MFA)."""
     success = _is_success_status(s['status'])
     title = ('Connexion réussie' if success else 'Connexion échouée')
     if s['application']:
@@ -1318,6 +1363,20 @@ def _build_signin_event(s, ref_id=None):
         detail_parts.append(f"({s['location']})")
     if not success and s['failure_reason']:
         detail_parts.append(f"— {s['failure_reason']}")
+
+    mfa_linked_failure = False
+    mfa_linked_reason = ''
+    if success and mfa_groups:
+        try:
+            cid = (s['correlation_id'] or '').strip()
+        except Exception:
+            cid = ''
+        group = mfa_groups.get(cid) if cid else None
+        if group and group['mfa_failure']:
+            mfa_linked_failure = True
+            mfa_linked_reason = group['mfa_failure_reason']
+            detail_parts.append(f"⚠ MFA échouée dans la même séquence d'authentification ({mfa_linked_reason})")
+
     return {
         'timestamp': s['date_utc'],
         'dt': _parse_iso(s['date_utc']),
@@ -1329,6 +1388,8 @@ def _build_signin_event(s, ref_id=None):
         'country': s['country'],
         'user': s['user_upn'] or s['user_display_name'] or '',
         'ref_id': ref_id if ref_id is not None else s['id'] if 'id' in s.keys() else None,
+        'mfa_linked_failure': mfa_linked_failure,
+        'mfa_linked_reason': mfa_linked_reason,
     }
 
 
@@ -1362,8 +1423,10 @@ def _build_audit_event(a, ref_id=None):
 def build_timeline_events(signins, audits):
     """Fusionne des lignes signin_logs/audit_logs (ou dicts equivalents issus d'un scan
     rapide) en une seule liste d'evenements tries chronologiquement. Fonction pure,
-    aucun acces DB."""
-    events = [_build_signin_event(s) for s in signins] + [_build_audit_event(a) for a in audits]
+    aucun acces DB. Corrige aussi les succes de connexion dont le MFA a echoue dans la
+    meme sequence (voir _correlate_signin_mfa / _build_signin_event)."""
+    mfa_groups = _correlate_signin_mfa(signins)
+    events = [_build_signin_event(s, mfa_groups=mfa_groups) for s in signins] + [_build_audit_event(a) for a in audits]
     events.sort(key=lambda e: e['timestamp'] or '')
     return events
 
@@ -1439,6 +1502,22 @@ def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
                 'severity': 'high',
                 'title': 'Connexion réussie depuis un pays inhabituel',
                 'description': f"{e['user']} s'est connecté avec succès depuis {e['country']} ({e['ip']}) le {e['timestamp']}, alors que le pays habituel est {baseline_country}.",
+                'events': [e],
+            })
+
+    # 2bis) Authentification aboutie malgre un echec MFA dans la meme sequence
+    #    (meme correlation_id cote Microsoft Graph) : la connexion n'est un succes
+    #    "propre" que si l'etape primaire ET le MFA ont reussi. Un succes accompagne
+    #    d'un echec MFA lie merite verification, meme si l'acces a materiellement abouti.
+    for e in successful_signins:
+        if e.get('mfa_linked_failure'):
+            findings.append({
+                'severity': 'medium',
+                'title': 'Authentification aboutie malgré un échec MFA associé',
+                'description': (f"{e['user']} — la connexion à {e['timestamp']} depuis {e['ip']} a réussi, mais un échec MFA "
+                                 f"({e.get('mfa_linked_reason') or 'MFA non complétée'}) a été journalisé dans la même séquence "
+                                 f"d'authentification (même identifiant de corrélation). À vérifier : l'accès a-t-il réellement "
+                                 f"validé le second facteur, ou s'agit-il d'un contournement/rejeu ?"),
                 'events': [e],
             })
 
@@ -1595,7 +1674,7 @@ def analyze_compromise(boite_id):
     return analyze_compromise_events(events, suspicious_rules=suspicious_rules, owner_domain=owner_domain)
 
 
-def quick_scan_mailbox(user_upn, days=7):
+def quick_scan_mailbox(user_upn, days=7, on_step=None):
     """Scan rapide et EPHEMERE d'une boite via Microsoft Graph (rien n'est ecrit en base) :
     recupere connexions + journal d'audit + regles de messagerie sur les N derniers jours,
     et applique la meme analyse heuristique que pour une boite deja suivie.
@@ -1603,21 +1682,34 @@ def quick_scan_mailbox(user_upn, days=7):
     Chaque source est recuperee independamment : si l'une d'elles echoue (timeout reseau,
     permission manquante...), le scan continue avec les autres plutot que d'echouer
     entierement — le resultat indique alors quelles sources n'ont pas pu etre lues
-    (cle 'errors'), et le score/verdict restent calcules sur les donnees disponibles."""
+    (cle 'errors'), et le score/verdict restent calcules sur les donnees disponibles.
+
+    `on_step(step_name, state)` est appele (si fourni) avant/apres chaque source, avec
+    state parmi 'running'/'done'/'error', pour permettre un affichage de progression."""
     from datetime import datetime, timedelta, timezone
     import urllib.parse
+
+    def notify(step, state):
+        if on_step:
+            try:
+                on_step(step, state)
+            except Exception:
+                pass
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
     upn_escaped = (user_upn or '').replace("'", "''")
     errors = []
 
     signin_dicts = []
+    notify('signins', 'running')
     try:
         signin_items = graph_get_all('/auditLogs/signIns', params={
             '$filter': f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}", '$top': '500'})
         signin_dicts = [_map_graph_signin(it) for it in signin_items]
+        notify('signins', 'done')
     except Exception as e:
         errors.append(f'Connexions : {e}')
+        notify('signins', 'error')
 
     # Filtre serveur sur l'initiateur (rapide et fiable) : capte le scenario le plus frequent
     # d'une boite compromise, l'attaquant agissant via la session de l'utilisateur lui-meme.
@@ -1626,23 +1718,29 @@ def quick_scan_mailbox(user_upn, days=7):
     # pas incluses ici (elles restent visibles via "Récupérer via Microsoft Graph" sur la
     # fiche de la boite, une fois celle-ci creee, qui fait une recherche plus large).
     audit_dicts = []
+    notify('audit', 'running')
     try:
         audit_items = graph_get_all('/auditLogs/directoryAudits', params={
             '$filter': f"activityDateTime ge {since} and initiatedBy/user/userPrincipalName eq '{upn_escaped}'",
             '$top': '500'})
         audit_dicts = [_map_graph_audit(it) for it in audit_items]
+        notify('audit', 'done')
     except Exception as e:
         errors.append(f"Journal d'audit : {e}")
+        notify('audit', 'error')
 
     rule_dicts = []
     suspicious_rules = []
+    notify('rules', 'running')
     try:
         encoded_upn = urllib.parse.quote(user_upn or '')
         rule_items = graph_get_all(f'/users/{encoded_upn}/mailFolders/inbox/messageRules')
         rule_dicts = [_map_graph_rule(it) for it in rule_items]
         suspicious_rules = [r for r in rule_dicts if r['is_suspicious'] == 'true']
+        notify('rules', 'done')
     except Exception as e:
         errors.append(f'Règles de messagerie : {e}')
+        notify('rules', 'error')
 
     if len(errors) == 3:
         # Les 3 sources ont echoue : remonter une vraie erreur plutot qu'un scan "propre" trompeur
@@ -1721,6 +1819,17 @@ def view_signins(bid):
                             and s['country'] and s['country'] != baseline_country]
         failed_rows = [s for s in signins if not _is_success_status(s['status'])]
 
+        # Une connexion "reussie" dont le MFA a echoue dans la meme sequence d'authentification
+        # (meme correlation_id : Microsoft Graph journalise parfois l'etape primaire et l'etape
+        # MFA comme deux lignes distinctes) n'est pas un succes sans reserve — a signaler.
+        mfa_groups = _correlate_signin_mfa(signins)
+        mfa_linked_failure_ids = set()
+        for s in signins:
+            if _is_success_status(s['status']):
+                cid = (s['correlation_id'] or '').strip()
+                if cid and mfa_groups.get(cid, {}).get('mfa_failure'):
+                    mfa_linked_failure_ids.add(s['id'])
+
         timeline = _timeline_query(conn, 'signin_logs', bid)
         first_signin = conn.execute('SELECT MIN(date_utc) as first FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['first']
         last_signin = conn.execute('SELECT MAX(date_utc) as last FROM signin_logs WHERE boite_id=?', (bid,)).fetchone()['last']
@@ -1733,7 +1842,8 @@ def view_signins(bid):
                          country_stats=country_stats, baseline_country=baseline_country,
                          app_stats=app_stats, mfa_stats=mfa_stats, ip_info_list=ip_info_list,
                          flagged_rows=flagged_rows, foreign_success=foreign_success, failed_rows=failed_rows,
-                         timeline=timeline, first_signin=first_signin, last_signin=last_signin)
+                         timeline=timeline, first_signin=first_signin, last_signin=last_signin,
+                         mfa_linked_failure_ids=mfa_linked_failure_ids)
 
 
 @app.route('/signin/<int:signin_id>')
@@ -1822,36 +1932,57 @@ def view_audit_detail(event_id):
                          back_label="Retour au journal d'audit")
 
 
-@app.route('/quick-scan', methods=['POST'])
-def quick_scan():
+@app.route('/quick-scan/start', methods=['POST'])
+def quick_scan_start():
+    """Demarre un scan rapide en tache de fond et retourne immediatement un identifiant
+    de job ; la progression (par source : connexions/audit/regles) est ensuite consultee
+    via /jobs/<job_id>/poll pour afficher une vraie barre de progression cote client."""
     email = request.form.get('email', '').strip()
     if not email or '@' not in email:
-        flash('Adresse email invalide pour le scan rapide')
-        return redirect(url_for('index'))
-
+        return jsonify({'error': 'Adresse email invalide pour le scan rapide'}), 400
     try:
         days = max(1, min(int(request.form.get('days', '7')), 90))
     except ValueError:
         days = 7
 
-    try:
-        result = quick_scan_mailbox(email, days)
-    except Exception as e:
-        add_log('ERROR', 'GRAPH', f'Échec du scan rapide pour {email}', str(e))
-        flash(f"Erreur lors du scan rapide via Microsoft Graph : {e}")
+    job_id = _job_create(['signins', 'audit', 'rules'])
+
+    def worker():
+        try:
+            result = quick_scan_mailbox(email, days, on_step=lambda s, st: _job_step(job_id, s, st))
+            add_log('INFO', 'GRAPH', f'Scan rapide effectué pour {email}',
+                    f"score {result['score']}/10, verdict {result['verdict']}, {len(result['findings'])} signal(aux)")
+            conn = get_db()
+            row = conn.execute('SELECT id FROM boites_compromises WHERE user_email=? ORDER BY id DESC LIMIT 1', (email,)).fetchone()
+            conn.close()
+            payload = {'email': email, 'existing_boite_id': row['id'] if row else None, **result}
+            _job_finish(job_id, redirect=f'/quick-scan/result/{job_id}', result=payload)
+        except Exception as e:
+            add_log('ERROR', 'GRAPH', f'Échec du scan rapide pour {email}', str(e))
+            _job_finish(job_id, error=f"Erreur lors du scan rapide via Microsoft Graph : {e}")
+
+    threading.Thread(target=worker, daemon=True, name=f'quick-scan-{job_id[:8]}').start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/quick-scan/result/<job_id>')
+def quick_scan_result_page(job_id):
+    job = _job_get(job_id)
+    if not job or job['status'] != 'done' or not job.get('result'):
+        flash('Résultat du scan introuvable ou expiré — relancez une analyse rapide')
         return redirect(url_for('index'))
+    return render_template('quick_scan_result.html', **job['result'])
 
-    add_log('INFO', 'GRAPH', f'Scan rapide effectué pour {email}',
-            f"score {result['score']}/10, verdict {result['verdict']}, {len(result['findings'])} signal(aux)")
 
-    existing = None
-    conn = get_db()
-    row = conn.execute('SELECT id FROM boites_compromises WHERE user_email=? ORDER BY id DESC LIMIT 1', (email,)).fetchone()
-    conn.close()
-    if row:
-        existing = row['id']
-
-    return render_template('quick_scan_result.html', email=email, existing_boite_id=existing, **result)
+@app.route('/jobs/<job_id>/poll')
+def poll_job(job_id):
+    """Etat courant d'un job en arriere-plan (scan rapide, import Microsoft Graph...),
+    pour affichage d'une barre de progression cote client."""
+    job = _job_get(job_id)
+    if not job:
+        return jsonify({'status': 'not_found'}), 404
+    return jsonify({'status': job['status'], 'steps': job['steps'], 'order': job['order'],
+                     'error': job['error'], 'redirect': job['redirect']})
 
 
 @app.route('/quick-scan/create', methods=['POST'])
@@ -1916,9 +2047,75 @@ def quick_scan_create():
 
 import threading
 import time as _time
+import uuid
+
+# ============================================================================
+# Jobs en arriere-plan : execute une action longue (appels Microsoft Graph) dans un
+# thread separe et expose sa progression etape par etape, pour que la page puisse
+# afficher une vraie barre de progression (et pas un simple spinner "ca charge")
+# pendant que la requete HTTP initiale revient immediatement avec un identifiant de job.
+# Stockage en memoire (process unique, waitress/reloader) : suffisant pour un outil
+# interne mono-instance ; les jobs termines sont purges au bout de quelques minutes.
+# ============================================================================
+
+_bg_jobs = {}
+_bg_jobs_lock = threading.Lock()
+_BG_JOB_TTL_SECONDS = 900
+
+
+def _job_create(steps):
+    """Cree un nouveau job avec la liste ordonnee des etapes (cles techniques, ex:
+    ['signins', 'audit', 'rules']), toutes initialement 'pending'. Retourne son id."""
+    job_id = uuid.uuid4().hex
+    with _bg_jobs_lock:
+        # Purge legere des jobs perimes a chaque creation
+        now = _time.time()
+        for jid in [j for j, v in _bg_jobs.items() if now - v['created_at'] > _BG_JOB_TTL_SECONDS]:
+            del _bg_jobs[jid]
+        _bg_jobs[job_id] = {
+            'steps': {s: 'pending' for s in steps},
+            'order': list(steps),
+            'status': 'running',
+            'error': None,
+            'result': None,
+            'redirect': None,
+            'created_at': now,
+        }
+    return job_id
+
+
+def _job_step(job_id, step, state):
+    """Met a jour l'etat d'une etape : 'pending' | 'running' | 'done' | 'error'."""
+    with _bg_jobs_lock:
+        job = _bg_jobs.get(job_id)
+        if job:
+            job['steps'][step] = state
+
+
+def _job_finish(job_id, redirect=None, error=None, result=None):
+    with _bg_jobs_lock:
+        job = _bg_jobs.get(job_id)
+        if job:
+            job['status'] = 'error' if error else 'done'
+            job['error'] = error
+            job['redirect'] = redirect
+            job['result'] = result
+
+
+def _job_get(job_id):
+    with _bg_jobs_lock:
+        return _bg_jobs.get(job_id)
+
 
 _monitoring_thread_started = False
 _monitoring_lock = threading.Lock()
+
+# Fenetre d'analyse (en jours) utilisee par chaque scan periodique de surveillance.
+# Doit correspondre a ce que l'analyse rapide utilise par defaut (7 jours) : une fenetre
+# plus courte (ex: 1 jour) faisait manquer des signaux plus anciens que la derniere
+# execution du planificateur, donnant un score incoherent avec un scan rapide manuel
+# portant sur la meme boite.
+MONITORING_SCAN_WINDOW_DAYS = 7
 
 
 def run_monitoring_scan(mailbox_row):
@@ -1934,7 +2131,7 @@ def run_monitoring_scan(mailbox_row):
         conn.execute('UPDATE monitored_mailboxes SET last_scan_at=? WHERE id=?', (now_iso, mailbox_row['id']))
         conn.commit()
 
-        result = quick_scan_mailbox(email, days=1)
+        result = quick_scan_mailbox(email, days=MONITORING_SCAN_WINDOW_DAYS)
         partial_note = ('Scan partiel : ' + ' / '.join(result['errors'])) if result.get('errors') else None
 
         conn.execute('''UPDATE monitored_mailboxes SET
@@ -2181,57 +2378,77 @@ def scan_now_monitored_mailbox(mailbox_id):
     return redirect(url_for('view_monitoring'))
 
 
-@app.route('/boite/<int:bid>/graph/fetch', methods=['POST'])
-def graph_fetch(bid):
+@app.route('/boite/<int:bid>/graph/fetch/start', methods=['POST'])
+def graph_fetch_start(bid):
+    """Lance l'import Microsoft Graph (connexions/audit/regles, messages en option) en
+    tache de fond et retourne un identifiant de job pour suivre la progression par
+    source via /jobs/<job_id>/poll (voir quick_scan_start pour le meme principe)."""
     conn = get_db()
     boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
     conn.close()
     if not boite:
-        flash('Boîte non trouvée')
-        return redirect(url_for('index'))
+        return jsonify({'error': 'Boîte non trouvée'}), 404
 
     try:
         days = max(1, min(int(request.form.get('days', '30')), 90))
     except ValueError:
         days = 30
-
     include_messages = request.form.get('include_messages') == 'on'
-    summary = []
-    errors = []
+    email = boite['user_email']
 
-    if include_messages:
+    steps = (['messages'] if include_messages else []) + ['signins', 'audit', 'rules']
+    job_id = _job_create(steps)
+
+    def worker():
+        summary = []
+        errors = []
+
+        if include_messages:
+            _job_step(job_id, 'messages', 'running')
+            try:
+                c, d = fetch_sent_messages_from_graph(bid, email, days)
+                summary.append(f'{c} message(s) envoyé(s) ({d} doublon(s) ignoré(s))')
+                _job_step(job_id, 'messages', 'done')
+            except Exception as e:
+                errors.append(f'Messages envoyés : {e}')
+                _job_step(job_id, 'messages', 'error')
+
+        _job_step(job_id, 'signins', 'running')
         try:
-            c, d = fetch_sent_messages_from_graph(bid, boite['user_email'], days)
-            summary.append(f'{c} message(s) envoyé(s) ({d} doublon(s) ignoré(s))')
+            c, d = fetch_signins_from_graph(bid, email, days)
+            summary.append(f'{c} connexion(s) ({d} doublon(s) ignoré(s))')
+            _job_step(job_id, 'signins', 'done')
         except Exception as e:
-            errors.append(f'Messages envoyés : {e}')
+            errors.append(f'Connexions : {e}')
+            _job_step(job_id, 'signins', 'error')
 
-    try:
-        c, d = fetch_signins_from_graph(bid, boite['user_email'], days)
-        summary.append(f'{c} connexion(s) ({d} doublon(s) ignoré(s))')
-    except Exception as e:
-        errors.append(f'Connexions : {e}')
+        _job_step(job_id, 'audit', 'running')
+        try:
+            c, d = fetch_audit_from_graph(bid, email, days)
+            summary.append(f"{c} événement(s) d'audit ({d} doublon(s) ignoré(s))")
+            _job_step(job_id, 'audit', 'done')
+        except Exception as e:
+            errors.append(f"Journal d'audit : {e}")
+            _job_step(job_id, 'audit', 'error')
 
-    try:
-        c, d = fetch_audit_from_graph(bid, boite['user_email'], days)
-        summary.append(f"{c} événement(s) d'audit ({d} doublon(s) ignoré(s))")
-    except Exception as e:
-        errors.append(f'Journal d\'audit : {e}')
+        _job_step(job_id, 'rules', 'running')
+        try:
+            c = fetch_inbox_rules_from_graph(bid, email)
+            summary.append(f'{c} règle(s) de messagerie')
+            _job_step(job_id, 'rules', 'done')
+        except Exception as e:
+            errors.append(f'Règles de messagerie : {e}')
+            _job_step(job_id, 'rules', 'error')
 
-    try:
-        c = fetch_inbox_rules_from_graph(bid, boite['user_email'])
-        summary.append(f'{c} règle(s) de messagerie')
-    except Exception as e:
-        errors.append(f'Règles de messagerie : {e}')
+        if summary:
+            add_log('INFO', 'GRAPH', f'Import Microsoft Graph pour {email}', ', '.join(summary), bid)
+        for err in errors:
+            add_log('ERROR', 'GRAPH', f'Erreur import Microsoft Graph pour {email}', err, bid)
 
-    if summary:
-        add_log('INFO', 'GRAPH', f"Import Microsoft Graph pour {boite['user_email']}", ', '.join(summary), bid)
-        flash('Import Microsoft Graph (' + str(days) + ' jours) : ' + ', '.join(summary))
-    for err in errors:
-        add_log('ERROR', 'GRAPH', f"Erreur import Microsoft Graph pour {boite['user_email']}", err, bid)
-        flash(f'Erreur Microsoft Graph — {err}')
+        _job_finish(job_id, redirect=f'/boite/{bid}', result={'summary': summary, 'errors': errors})
 
-    return redirect(url_for('view_boite', bid=bid))
+    threading.Thread(target=worker, daemon=True, name=f'graph-fetch-{job_id[:8]}').start()
+    return jsonify({'job_id': job_id})
 
 
 @app.route('/boite/<int:bid>/rules')

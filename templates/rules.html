@@ -4,7 +4,7 @@
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h1><i class="bi bi-envelope-arrow-up"></i> Règles de messagerie - {{ boite.user_email }}</h1>
     <div class="d-flex gap-2">
-        <form method="POST" action="{{ url_for('graph_fetch', bid=boite.id) }}">
+        <form onsubmit="event.preventDefault(); runBackgroundJob('{{ url_for('graph_fetch_start', bid=boite.id) }}', new FormData(this), ['signins','audit','rules'], 'Interrogation de Microsoft Graph en cours…');">
             <input type="hidden" name="days" value="7">
             <button type="submit" class="btn btn-dark">
                 <i class="bi bi-arrow-repeat"></i> Rafraîchir depuis Microsoft Graph

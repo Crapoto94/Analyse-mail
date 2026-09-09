@@ -27,24 +27,116 @@
 </head>
 <body>
 <div id="global-loading-overlay">
-    <div class="bg-white rounded-3 shadow p-4 text-center" style="min-width: 300px; max-width: 90%;">
-        <div class="spinner-border text-primary mb-3" role="status">
-            <span class="visually-hidden">Chargement...</span>
+    <div class="bg-white rounded-3 shadow p-4 text-start" style="min-width: 320px; max-width: 420px;">
+        <div class="text-center mb-2">
+            <div id="global-loading-spinner" class="spinner-border text-primary mb-2" role="status">
+                <span class="visually-hidden">Chargement...</span>
+            </div>
+            <div id="global-loading-message" class="fw-semibold">Traitement en cours, veuillez patienter…</div>
         </div>
-        <div id="global-loading-message" class="fw-semibold">Traitement en cours, veuillez patienter…</div>
-        <div class="text-muted small mt-1">Cette fenêtre se fermera automatiquement.</div>
+        <div id="global-loading-steps" class="mt-3" style="display:none;"></div>
+        <div id="global-loading-error" class="alert alert-danger small mt-3 mb-0" style="display:none;"></div>
+        <div id="global-loading-close-wrap" class="text-center mt-3" style="display:none;">
+            <button type="button" class="btn btn-sm btn-secondary" onclick="hideGlobalLoading()">Fermer</button>
+        </div>
     </div>
 </div>
 <script>
+var STEP_LABELS = {
+    'messages': 'Messages envoyés',
+    'signins': 'Connexions',
+    'audit': "Journal d'audit",
+    'rules': 'Règles de messagerie'
+};
+
 function showGlobalLoading(message) {
     var overlay = document.getElementById('global-loading-overlay');
     var msgEl = document.getElementById('global-loading-message');
     if (msgEl && message) { msgEl.textContent = message; }
+    document.getElementById('global-loading-spinner').style.display = '';
+    document.getElementById('global-loading-steps').style.display = 'none';
+    document.getElementById('global-loading-error').style.display = 'none';
+    document.getElementById('global-loading-close-wrap').style.display = 'none';
     if (overlay) { overlay.classList.add('active'); }
 }
 function hideGlobalLoading() {
     var overlay = document.getElementById('global-loading-overlay');
     if (overlay) { overlay.classList.remove('active'); }
+}
+
+function stepIconHtml(state) {
+    if (state === 'running') return '<span class="spinner-border spinner-border-sm text-primary" role="status"></span>';
+    if (state === 'done') return '<i class="bi bi-check-circle-fill text-success"></i>';
+    if (state === 'error') return '<i class="bi bi-x-circle-fill text-danger"></i>';
+    return '<i class="bi bi-circle text-muted"></i>';
+}
+
+function showGlobalLoadingSteps(message, stepKeys) {
+    showGlobalLoading(message);
+    var container = document.getElementById('global-loading-steps');
+    container.style.display = 'block';
+    container.innerHTML = stepKeys.map(function(key) {
+        return '<div class="d-flex align-items-center gap-2 mb-1" id="gl-step-' + key + '">' +
+            '<span class="gl-step-icon" style="width:1.2em; display:inline-block;">' + stepIconHtml('pending') + '</span>' +
+            '<span>' + (STEP_LABELS[key] || key) + '</span>' +
+            '</div>';
+    }).join('');
+}
+
+function updateGlobalLoadingStep(key, state) {
+    var el = document.getElementById('gl-step-' + key);
+    if (!el) return;
+    var icon = el.querySelector('.gl-step-icon');
+    if (icon) { icon.innerHTML = stepIconHtml(state); }
+}
+
+/**
+ * Lance une action longue en tache de fond avec suivi de progression par etape.
+ * startUrl: endpoint POST qui retourne {job_id} immediatement.
+ * formData: FormData a envoyer.
+ * stepKeys: liste ordonnee des cles d'etapes affichees (ex: ['signins','audit','rules']).
+ * message: texte affiche au-dessus des etapes.
+ * onDone(redirectUrl): appele quand le job est termine avec succes (par defaut, navigue).
+ */
+function runBackgroundJob(startUrl, formData, stepKeys, message, onDone) {
+    showGlobalLoadingSteps(message, stepKeys);
+    fetch(startUrl, { method: 'POST', body: formData })
+        .then(function(r) { return r.json().then(function(data) { return {ok: r.ok, data: data}; }); })
+        .then(function(res) {
+            if (!res.ok || res.data.error) { throw new Error(res.data.error || 'Erreur au démarrage'); }
+            var jobId = res.data.job_id;
+            (function poll() {
+                fetch('/jobs/' + jobId + '/poll')
+                    .then(function(r) { return r.json(); })
+                    .then(function(status) {
+                        if (status.status === 'not_found') { throw new Error('Job introuvable (le serveur a peut-être redémarré)'); }
+                        Object.keys(status.steps || {}).forEach(function(k) { updateGlobalLoadingStep(k, status.steps[k]); });
+                        if (status.status === 'running') {
+                            setTimeout(poll, 500);
+                        } else if (status.status === 'done') {
+                            document.getElementById('global-loading-spinner').style.display = 'none';
+                            if (onDone) { onDone(status.redirect); }
+                            else { window.location.href = status.redirect; }
+                        } else {
+                            document.getElementById('global-loading-spinner').style.display = 'none';
+                            var errEl = document.getElementById('global-loading-error');
+                            errEl.textContent = status.error || 'Erreur inconnue';
+                            errEl.style.display = 'block';
+                            document.getElementById('global-loading-close-wrap').style.display = 'block';
+                        }
+                    })
+                    .catch(function(err) { showGlobalLoadingFatalError(err); });
+            })();
+        })
+        .catch(function(err) { showGlobalLoadingFatalError(err); });
+}
+
+function showGlobalLoadingFatalError(err) {
+    document.getElementById('global-loading-spinner').style.display = 'none';
+    var errEl = document.getElementById('global-loading-error');
+    errEl.textContent = (err && err.message) ? err.message : String(err);
+    errEl.style.display = 'block';
+    document.getElementById('global-loading-close-wrap').style.display = 'block';
 }
 </script>
 <nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">

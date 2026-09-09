@@ -134,8 +134,10 @@
     <div class="col-md-6">
         <div class="card h-100 border-dark">
             <div class="card-body">
-                <form method="POST" action="{{ url_for('graph_fetch', bid=boite.id) }}" class="d-flex align-items-center gap-2 flex-wrap"
-                      onsubmit="showGlobalLoading('Interrogation de Microsoft Graph en cours (connexions, audit, règles, messages)…'); return true;">
+                <form class="d-flex align-items-center gap-2 flex-wrap"
+                      onsubmit="event.preventDefault();
+                                var steps = this.include_messages.checked ? ['messages','signins','audit','rules'] : ['signins','audit','rules'];
+                                runBackgroundJob('{{ url_for('graph_fetch_start', bid=boite.id) }}', new FormData(this), steps, 'Interrogation de Microsoft Graph en cours…');">
                     <span class="text-nowrap"><i class="bi bi-microsoft"></i> <strong>Microsoft Graph</strong></span>
                     <select name="days" class="form-select form-select-sm w-auto">
                         <option value="1">1 jour</option>

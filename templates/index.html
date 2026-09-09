@@ -18,8 +18,8 @@
             règles de messagerie), sans créer d'investigation. Rien n'est enregistré tant que vous ne le demandez pas.
         </p>
         {% if graph_configured %}
-        <form method="POST" action="{{ url_for('quick_scan') }}" class="row g-2 align-items-end"
-              onsubmit="showGlobalLoading('Scan rapide en cours via Microsoft Graph…'); return true;">
+        <form class="row g-2 align-items-end" id="quick-scan-form"
+              onsubmit="event.preventDefault(); runBackgroundJob('{{ url_for('quick_scan_start') }}', new FormData(this), ['signins','audit','rules'], 'Analyse rapide en cours via Microsoft Graph…');">
             <div class="col-md-6">
                 <label class="form-label small mb-1">Adresse email de la boîte à vérifier</label>
                 <input type="email" class="form-control" name="email" placeholder="utilisateur@ivry94.fr" required>

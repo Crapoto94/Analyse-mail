@@ -34,6 +34,11 @@
     <div class="col-md-2">
         <div class="card stat-card" style="border-left-color:#198754;"><div class="card-body text-center">
             <h3>{{ nb_success }}</h3><small class="text-muted">Réussies</small>
+            {% if mfa_linked_failure_ids %}
+            <div><small class="text-danger" title="Connexions réussies dont le MFA a échoué dans la même séquence d'authentification">
+                <i class="bi bi-shield-x"></i> dont {{ mfa_linked_failure_ids|length }} MFA échouée liée
+            </small></div>
+            {% endif %}
         </div></div>
     </div>
     <div class="col-md-2">
@@ -239,6 +244,7 @@
                                 {{ s.status }}
                             </span>
                             {% if s.flagged and s.flagged.lower() in ('true','vrai','oui','1') %}<span class="badge bg-warning text-dark">Signalé</span>{% endif %}
+                            {% if s.id in mfa_linked_failure_ids %}<span class="badge bg-danger" title="MFA échouée dans la même séquence d'authentification (même corrélation)"><i class="bi bi-shield-x"></i> MFA échouée liée</span>{% endif %}
                         </td>
                         <td><small>{{ s|mfa_status }}</small></td>
                         <td><small>{% if s.is_compliant == 'true' %}<i class="bi bi-check-circle text-success" title="Conforme"></i>{% else %}<i class="bi bi-dash-circle text-muted" title="Non conforme"></i>{% endif %} {% if s.is_managed == 'true' %}<i class="bi bi-pc-display text-success" title="Géré"></i>{% endif %}</small></td>
