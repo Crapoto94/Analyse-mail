@@ -1231,6 +1231,20 @@ def logout():
     return redirect(url_for('login'))
 
 
+def _microsoft_redirect_uri():
+    """Calcule l'URI de redirection OAuth Microsoft. Si un administrateur a renseigne
+    une "URL publique de l'application" (config 'public_base_url'), elle est utilisee
+    directement — independamment de ce que le reverse proxy transmet comme en-tetes
+    X-Forwarded-*. Utile quand ProxyFix ne suffit pas (en-tetes non transmis par le
+    proxy, chaine de proxies non standard...) : l'admin fixe la valeur une fois pour
+    toutes plutot que de deboguer indefiniment la configuration reseau. A defaut,
+    reprend le comportement base sur ProxyFix/url_for(_external=True)."""
+    base = get_config('public_base_url', '').strip().rstrip('/')
+    if base:
+        return base + url_for('microsoft_callback')
+    return url_for('microsoft_callback', _external=True)
+
+
 @app.route('/auth/microsoft/login')
 def microsoft_login():
     """Demarre la connexion via Microsoft Entra ID (flux OAuth2 authorization code),
@@ -1250,7 +1264,7 @@ def microsoft_login():
     session['ms_oauth_state'] = state
     session['ms_oauth_next'] = request.args.get('next', '')
 
-    redirect_uri = url_for('microsoft_callback', _external=True)
+    redirect_uri = _microsoft_redirect_uri()
     params = {
         'client_id': client_id,
         'response_type': 'code',
@@ -1305,7 +1319,7 @@ def microsoft_callback():
     import urllib.parse
     import urllib.error
 
-    redirect_uri = url_for('microsoft_callback', _external=True)
+    redirect_uri = _microsoft_redirect_uri()
     token_url = f'https://login.microsoftonline.com/{urllib.parse.quote(tenant_id)}/oauth2/v2.0/token'
     data = urllib.parse.urlencode({
         'client_id': client_id,
@@ -3739,6 +3753,7 @@ def config():
             new_secret = request.form.get('graph_client_secret', '')
             if new_secret:
                 set_config('graph_client_secret', new_secret.strip())
+            set_config('public_base_url', request.form.get('public_base_url', '').strip())
             _graph_token_cache['token'] = None
             flash('Configuration Microsoft Graph enregistrée avec succès')
         elif 'groq_api_key' in request.form or 'nvidia_api_key' in request.form:
@@ -3772,7 +3787,9 @@ def config():
         graph_tenant_id=get_config('graph_tenant_id', ''),
         graph_client_id=get_config('graph_client_id', ''),
         graph_client_secret_set=bool(get_config('graph_client_secret', '')),
-        microsoft_redirect_uri=url_for('microsoft_callback', _external=True),
+        public_base_url=get_config('public_base_url', ''),
+        microsoft_redirect_uri=_microsoft_redirect_uri(),
+        microsoft_redirect_uri_auto=url_for('microsoft_callback', _external=True),
         groq_api_key_set=bool(get_config('groq_api_key', '')),
         groq_model=get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
         groq_available_models=GROQ_AVAILABLE_MODELS,
@@ -3793,7 +3810,9 @@ def diag_proxy_headers():
     indice, une version anterieure du code n'aurait pas cette route)."""
     return jsonify({
         'computed_scheme (request.scheme)': request.scheme,
-        'computed_redirect_uri_example': url_for('microsoft_callback', _external=True),
+        'redirect_uri_auto (ProxyFix/headers)': url_for('microsoft_callback', _external=True),
+        'redirect_uri_effective (utilisée réellement, tient compte de public_base_url si défini)': _microsoft_redirect_uri(),
+        'public_base_url_configured': get_config('public_base_url', '') or None,
         'wsgi.url_scheme': request.environ.get('wsgi.url_scheme'),
         'header_Host': request.headers.get('Host'),
         'header_X-Forwarded-Proto': request.headers.get('X-Forwarded-Proto'),

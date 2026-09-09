@@ -123,16 +123,21 @@
                 <div class="alert alert-secondary small">
                     <strong><i class="bi bi-box-arrow-in-right"></i> En plus, pour activer "Se connecter avec Microsoft" (page de connexion) :</strong>
                     <ol class="mb-0 mt-2">
-                        <li>Sur la même inscription d'application, dans <em>Authentification</em> → <em>Ajouter une plateforme</em> → <strong>Web</strong>, ajoutez cette URI de redirection :
+                        <li>Sur la même inscription d'application, dans <em>Authentification</em> → <em>Ajouter une plateforme</em> → <strong>Web</strong>, ajoutez cette URI de redirection (celle réellement utilisée, ci-dessous) :
                             <div class="input-group input-group-sm mt-1 mb-1">
                                 <input type="text" class="form-control" value="{{ microsoft_redirect_uri }}" readonly onclick="this.select()">
                             </div>
-                            <span class="text-muted">(doit être en HTTPS en production ; http://localhost fonctionne en développement — cette valeur reflète la façon dont <em>cette</em> requête a atteint l'application, donc rechargez cette page en passant par votre URL de prod pour voir la bonne valeur)</span>
+                            {% if public_base_url %}
+                            <span class="text-success"><i class="bi bi-check-circle"></i> Calculée depuis l'URL publique renseignée ci-dessous (indépendante du reverse proxy).</span>
+                            {% else %}
+                            <span class="text-muted">(doit être en HTTPS en production ; http://localhost fonctionne en développement — cette valeur reflète la façon dont <em>cette</em> requête a atteint l'application via le reverse proxy, donc rechargez cette page en passant par votre URL de prod pour voir la bonne valeur)</span>
+                            {% endif %}
                         </li>
                         <li>
                             Si l'application est derrière un <strong>reverse proxy</strong> (nginx, IIS...) qui termine le HTTPS, celui-ci doit transmettre l'en-tête <code>X-Forwarded-Proto: https</code> (et idéalement <code>X-Forwarded-Host</code>) — sinon l'URI générée reste en <code>http://</code> et Azure refuse la connexion (<code>AADSTS50011</code>). Exemple nginx :
                             <pre class="bg-light p-2 small mb-0 mt-1">proxy_set_header X-Forwarded-Proto $scheme;
 proxy_set_header X-Forwarded-Host $host;</pre>
+                            Si malgré une configuration correcte du proxy l'en-tête n'arrive toujours pas jusqu'à l'application (diagnostic possible sur <code>/api/diag/proxy-headers</code>), renseignez le champ <strong>"URL publique de l'application"</strong> ci-dessous : l'URI de redirection sera alors calculée directement depuis cette valeur, sans dépendre du proxy.
                         </li>
                         <li>Toujours dans <em>Autorisations API</em>, ajoutez cette fois des <strong>autorisations déléguées</strong> Microsoft Graph :
                             <code>openid</code>, <code>profile</code>, <code>email</code>, <code>User.Read</code> (généralement sans consentement admin requis).
@@ -155,6 +160,15 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                         {% if graph_client_secret_set %}
                         <div class="form-text text-success"><i class="bi bi-check-circle"></i> Un secret est déjà enregistré.</div>
                         {% endif %}
+                    </div>
+                    <div class="mb-3">
+                        <label for="public_base_url" class="form-label">URL publique de l'application <span class="text-muted fw-normal">(optionnel — solution de repli si le reverse proxy ne transmet pas les bons en-têtes)</span></label>
+                        <input type="text" class="form-control" id="public_base_url" name="public_base_url" value="{{ public_base_url }}" placeholder="https://analyse-mail.ivry.local">
+                        <div class="form-text">
+                            Laissez vide pour laisser l'application déduire l'URL depuis les en-têtes du reverse proxy (comportement par défaut, via <code>X-Forwarded-Proto</code>).
+                            Si renseigné (sans <code>/</code> final), cette valeur est utilisée telle quelle pour construire l'URI de redirection Microsoft, sans dépendre du proxy.
+                            {% if microsoft_redirect_uri_auto %}Valeur actuellement déduite automatiquement des en-têtes : <code>{{ microsoft_redirect_uri_auto }}</code>{% endif %}
+                        </div>
                     </div>
                     <button type="submit" class="btn btn-dark">
                         <i class="bi bi-check-lg"></i> Enregistrer
