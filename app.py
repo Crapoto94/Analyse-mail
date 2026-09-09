@@ -2115,19 +2115,18 @@ DASHBOARD_MAX_SCORED_BOITES = 100
 DASHBOARD_SIGNINS_WINDOW_HOURS = 24
 
 
-@app.route('/')
-def index():
-    """Page d'accueil de l'application (pour tout le monde, pas seulement les admins) :
-    tableau de bord agrege plutot que la liste des boites (voir /boites, accessible via le
-    bouton "Voir les boîtes"). Tendance des incidents dans le temps, IPs qui reviennent sur
-    plusieurs boites (signal de compromission croisee), et KPI sur la surveillance
-    automatisee (boites suivies) et le monitoring des connexions (tout le tenant) — pour
-    avoir une vue d'ensemble sans ouvrir boite par boite ni page par page."""
+def compute_dashboard_kpis():
+    """Calcule tous les KPI du tableau de bord : incidents (tendance, signaux detectes, IPs
+    partagees), surveillance automatisee (monitored_mailboxes) et monitoring connexions
+    (tenant_signins). Point d'entree UNIQUE pour cette logique — utilise a la fois par la
+    page d'accueil (rendu HTML) et par l'API externe (/api/v1/kpis, voir api_v1_kpis), pour
+    garantir que les deux affichent exactement les memes chiffres. Ne retourne que des
+    types JSON-serialisables (dict/list/str/int/float/None), pas de sqlite3.Row."""
     conn = get_db()
 
-    incidents_by_month = conn.execute('''
+    incidents_by_month = [dict(r) for r in conn.execute('''
         SELECT strftime('%Y-%m', created_at) as month, COUNT(*) as c
-        FROM boites_compromises GROUP BY month ORDER BY month''').fetchall()
+        FROM boites_compromises GROUP BY month ORDER BY month''').fetchall()]
 
     boite_ids = [r['id'] for r in conn.execute(
         'SELECT id FROM boites_compromises ORDER BY created_at DESC LIMIT ?',
@@ -2150,19 +2149,19 @@ def index():
     conn = get_db()
     # IPs qui reviennent sur plusieurs boites differentes (messages + connexions + audit
     # confondus) : signal fort de compromission croisee (meme attaquant, plusieurs comptes).
-    shared_ips = conn.execute('''
+    shared_ips = [dict(r) for r in conn.execute('''
         SELECT ip, COUNT(DISTINCT boite_id) as nb_boites FROM (
             SELECT from_ip as ip, boite_id FROM messages WHERE from_ip != ''
             UNION ALL
             SELECT ip_address as ip, boite_id FROM signin_logs WHERE ip_address != ''
             UNION ALL
             SELECT ip_address as ip, boite_id FROM audit_logs WHERE ip_address != ''
-        ) GROUP BY ip HAVING nb_boites >= 2 ORDER BY nb_boites DESC LIMIT 20''').fetchall()
+        ) GROUP BY ip HAVING nb_boites >= 2 ORDER BY nb_boites DESC LIMIT 20''').fetchall()]
 
     nb_boites_total = conn.execute('SELECT COUNT(*) as c FROM boites_compromises').fetchone()['c']
-    top_recipients = conn.execute('''
+    top_recipients = [dict(r) for r in conn.execute('''
         SELECT recipient_address, COUNT(*) as c FROM messages
-        WHERE recipient_address != '' GROUP BY recipient_address ORDER BY c DESC LIMIT 10''').fetchall()
+        WHERE recipient_address != '' GROUP BY recipient_address ORDER BY c DESC LIMIT 10''').fetchall()]
 
     # --- KPI surveillance automatisee (monitored_mailboxes) -----------------------------
     # A partir des colonnes deja stockees (dernier resultat de scan), pas d'un recalcul —
@@ -2189,10 +2188,10 @@ def index():
         f"SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= {window_clause} AND status != 'Success'"
     ).fetchone()['c']
     signin_failure_rate = round(100 * nb_signins_failed_window / nb_signins_window) if nb_signins_window else 0
-    top_failed_users = conn.execute(f'''
+    top_failed_users = [dict(r) for r in conn.execute(f'''
         SELECT COALESCE(NULLIF(user_upn, ''), '(inconnu)') as user_upn, COUNT(*) as c
         FROM tenant_signins WHERE date_utc >= {window_clause} AND status != 'Success'
-        GROUP BY user_upn ORDER BY c DESC LIMIT 5''').fetchall()
+        GROUP BY user_upn ORDER BY c DESC LIMIT 5''').fetchall()]
 
     home_country = get_home_country_code()
     signin_window_rows = conn.execute(
@@ -2212,17 +2211,30 @@ def index():
     avg_trust_score = round(sum(trust_scores) / len(trust_scores)) if trust_scores else None
     nb_low_trust = sum(1 for s in trust_scores if s < 50)
 
-    return render_template('dashboard.html',
-        incidents_by_month=incidents_by_month, verdict_counts=verdict_counts,
-        shared_ips=shared_ips, nb_boites_total=nb_boites_total,
-        top_recipients=top_recipients, scored_boites_count=len(boite_ids),
-        nb_monitored_total=nb_monitored_total, nb_monitored_active=nb_monitored_active,
-        monitored_verdict_counts=monitored_verdict_counts, nb_monitored_errors=nb_monitored_errors,
-        nb_signins_window=nb_signins_window, nb_signins_failed_window=nb_signins_failed_window,
-        signin_failure_rate=signin_failure_rate, top_failed_users=top_failed_users,
-        nb_signins_foreign=nb_signins_foreign, avg_trust_score=avg_trust_score,
-        nb_low_trust=nb_low_trust, signins_window_hours=DASHBOARD_SIGNINS_WINDOW_HOURS,
-        home_country_code=home_country)
+    return {
+        'incidents_by_month': incidents_by_month, 'verdict_counts': verdict_counts,
+        'shared_ips': shared_ips, 'nb_boites_total': nb_boites_total,
+        'top_recipients': top_recipients, 'scored_boites_count': len(boite_ids),
+        'nb_monitored_total': nb_monitored_total, 'nb_monitored_active': nb_monitored_active,
+        'monitored_verdict_counts': monitored_verdict_counts, 'nb_monitored_errors': nb_monitored_errors,
+        'nb_signins_window': nb_signins_window, 'nb_signins_failed_window': nb_signins_failed_window,
+        'signin_failure_rate': signin_failure_rate, 'top_failed_users': top_failed_users,
+        'nb_signins_foreign': nb_signins_foreign, 'avg_trust_score': avg_trust_score,
+        'nb_low_trust': nb_low_trust, 'signins_window_hours': DASHBOARD_SIGNINS_WINDOW_HOURS,
+        'home_country_code': home_country,
+    }
+
+
+@app.route('/')
+def index():
+    """Page d'accueil de l'application (pour tout le monde, pas seulement les admins) :
+    tableau de bord agrege plutot que la liste des boites (voir /boites, accessible via le
+    bouton "Voir les boîtes"). Tendance des incidents dans le temps, IPs qui reviennent sur
+    plusieurs boites (signal de compromission croisee), et KPI sur la surveillance
+    automatisee (boites suivies) et le monitoring des connexions (tout le tenant) — pour
+    avoir une vue d'ensemble sans ouvrir boite par boite ni page par page. Memes chiffres
+    que l'API externe /api/v1/kpis (voir compute_dashboard_kpis)."""
+    return render_template('dashboard.html', **compute_dashboard_kpis())
 
 
 @app.route('/boite/add', methods=['GET', 'POST'])
@@ -5815,6 +5827,16 @@ def api_v1_ip_reputation(ip):
     return jsonify(payload)
 
 
+@app.route('/api/v1/kpis')
+@require_api_key
+def api_v1_kpis():
+    """KPI du tableau de bord pour les applications externes — memes chiffres que la page
+    d'accueil (voir compute_dashboard_kpis, source unique partagee par les deux)."""
+    kpis = compute_dashboard_kpis()
+    kpis['generated_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return jsonify(kpis)
+
+
 @app.route('/api/v1/openapi.json')
 def api_v1_openapi():
     """Specification OpenAPI 3.0 de l'API externe (/api/v1/*), consommee par la page
@@ -5889,6 +5911,46 @@ def api_v1_openapi():
         }
     }
 
+    kpis_schema = {
+        'type': 'object',
+        'description': "Memes chiffres que la page d'accueil de l'application (tableau de bord).",
+        'properties': {
+            'nb_boites_total': {'type': 'integer', 'description': 'Nombre total d\'incidents confirmés.'},
+            'incidents_by_month': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'month': {'type': 'string', 'example': '2026-01'}, 'c': {'type': 'integer'}}}},
+            'verdict_counts': {'type': 'object', 'description': (
+                "Répartition du niveau de signal détecté sur les incidents les plus récents "
+                "(scored_boites_count), à partir des preuves déjà importées — pas si l'incident "
+                "est réel (il l'est déjà, par définition)."),
+                'properties': {
+                    'compromise_likely': {'type': 'integer'}, 'signals_to_check': {'type': 'integer'},
+                    'no_strong_signal': {'type': 'integer'}}},
+            'scored_boites_count': {'type': 'integer'},
+            'shared_ips': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'ip': {'type': 'string'}, 'nb_boites': {'type': 'integer'}}},
+                'description': 'IPs présentes sur plusieurs boîtes différentes (signal de compromission croisée).'},
+            'top_recipients': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'recipient_address': {'type': 'string'}, 'c': {'type': 'integer'}}}},
+            'nb_monitored_total': {'type': 'integer'},
+            'nb_monitored_active': {'type': 'integer'},
+            'nb_monitored_errors': {'type': 'integer'},
+            'monitored_verdict_counts': {'type': 'object', 'properties': {
+                'compromise_likely': {'type': 'integer'}, 'signals_to_check': {'type': 'integer'},
+                'no_strong_signal': {'type': 'integer'}, 'not_scanned': {'type': 'integer'}}},
+            'signins_window_hours': {'type': 'integer'},
+            'nb_signins_window': {'type': 'integer'},
+            'nb_signins_failed_window': {'type': 'integer'},
+            'signin_failure_rate': {'type': 'integer', 'description': 'Pourcentage (0-100).'},
+            'top_failed_users': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'user_upn': {'type': 'string'}, 'c': {'type': 'integer'}}}},
+            'nb_signins_foreign': {'type': 'integer', 'description': 'Connexions hors du pays de référence.'},
+            'home_country_code': {'type': 'string', 'example': 'FR'},
+            'avg_trust_score': {'type': 'integer', 'nullable': True, 'minimum': 0, 'maximum': 100},
+            'nb_low_trust': {'type': 'integer', 'description': 'Connexions à score de confiance < 50.'},
+            'generated_at': {'type': 'string', 'format': 'date-time'},
+        }
+    }
+
     spec = {
         'openapi': '3.0.3',
         'info': {
@@ -5912,6 +5974,7 @@ def api_v1_openapi():
                 'Boite': boite_schema,
                 'BoiteDetail': boite_detail_schema,
                 'IpReputation': ip_reputation_schema,
+                'Kpis': kpis_schema,
             },
             'responses': {
                 'Unauthorized': error_response,
@@ -5976,6 +6039,15 @@ def api_v1_openapi():
                         '$ref': '#/components/schemas/IpReputation'}}}},
                     '401': {'$ref': '#/components/responses/Unauthorized'},
                     '404': {'description': 'IP invalide ou réputation indisponible'},
+                },
+            }},
+            '/kpis': {'get': {
+                'summary': "KPI du tableau de bord (incidents, surveillance, connexions)",
+                'operationId': 'getKpis',
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        '$ref': '#/components/schemas/Kpis'}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
                 },
             }},
         },
