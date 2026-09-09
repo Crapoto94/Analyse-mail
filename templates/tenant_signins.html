@@ -103,7 +103,7 @@
                         <td><small>{{ r.date_utc|paris }}</small></td>
                         <td><small>{{ r.user_display_name or r.user_upn }}</small></td>
                         <td><small>{{ ip_badge(r.ip_address) }}</small></td>
-                        <td><small>{{ r.location }}</small></td>
+                        <td><small>{{ item.display_location }}</small></td>
                         <td><small>{{ r.application }}</small></td>
                         <td><small>{{ r.mfa_result or '—' }}</small></td>
                         <td><span class="badge bg-{% if r.status == 'Success' %}success{% else %}danger{% endif %}">{{ 'Réussie' if r.status == 'Success' else 'Échec' }}</span></td>

@@ -386,9 +386,23 @@ def init_db():
         ip TEXT UNIQUE NOT NULL,
         label TEXT NOT NULL DEFAULT 'Ville',
         note TEXT,
+        city TEXT,
+        lat REAL,
+        lon REAL,
         created_by TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+
+    # Migration : localisation precise declarable manuellement pour une IP de confiance
+    # (bases existantes) — la geolocalisation automatique (ipwho.is, ou celle deja fournie
+    # par Microsoft Graph dans les journaux de connexion) retombe souvent sur la grande
+    # ville la plus proche du bloc IP plutot que la commune exacte (ex: Paris au lieu
+    # d'Ivry-sur-Seine pour une IP de la ville) ; un administrateur peut ici corriger.
+    for _col in ('city TEXT', 'lat REAL', 'lon REAL'):
+        try:
+            c.execute(f'ALTER TABLE trusted_ips ADD COLUMN {_col}')
+        except Exception:
+            pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -783,6 +797,42 @@ def get_trusted_ip(ip):
     return dict(row) if row else None
 
 
+def get_ip_geo(ip):
+    """Geolocalisation d'une IP pour affichage (carte, colonne 'Localisation'...), avec
+    priorite a la localisation precise declaree manuellement pour une IP de confiance : la
+    geolocalisation automatique par bloc IP (ipwho.is, ou celle deja fournie par Microsoft
+    Graph dans les journaux de connexion) retombe souvent sur la grande ville la plus
+    proche plutot que la commune exacte (ex: Paris au lieu d'Ivry-sur-Seine pour une IP de
+    la ville) — corrige ici plutot que de faire confiance a un tiers pour une IP dont on
+    connait deja l'emplacement reel. Retourne un dict {city, country, country_code, lat,
+    lon} (valeurs possiblement None si indisponibles), jamais None lui-meme."""
+    trusted = get_trusted_ip(ip)
+    info = get_ip_info(ip) or {}
+    result = {
+        'city': info.get('city'), 'country': info.get('country'),
+        'country_code': info.get('country_code'), 'lat': info.get('lat'), 'lon': info.get('lon'),
+    }
+    if trusted and trusted.get('lat') is not None and trusted.get('lon') is not None:
+        result['lat'] = trusted['lat']
+        result['lon'] = trusted['lon']
+        if trusted.get('city'):
+            result['city'] = trusted['city']
+        result['country'] = result['country'] or 'France'
+        result['country_code'] = result['country_code'] or 'FR'
+    return result
+
+
+def get_display_location(ip, raw_location=''):
+    """Libelle de localisation a afficher pour une IP (ex: colonne 'Localisation' de
+    /connexions) : la ville declaree pour une IP de confiance prime sur le texte brut
+    fourni par Microsoft Graph (souvent imprecis — voir get_ip_geo). A defaut de
+    surcharge, renvoie le texte d'origine tel quel."""
+    trusted = get_trusted_ip(ip)
+    if trusted and trusted.get('city'):
+        return f"{trusted['city']}, France"
+    return raw_location
+
+
 def get_ip_reputation(ip):
     """Geolocalisation (get_ip_info, cache permanent) + reputation (score d'abus, type
     d'usage — servie depuis la base locale pendant IP_REPUTATION_CACHE_HOURS avant tout
@@ -809,6 +859,13 @@ def get_ip_reputation(ip):
         info['reputation_basis'] = 'trusted'
         info['is_trusted'] = True
         info['trusted_label'] = trusted.get('label') or 'Ville'
+        # Localisation precise declaree manuellement prevaut sur la geolocalisation
+        # automatique par bloc IP (souvent imprecise — voir get_ip_geo pour le detail).
+        if trusted.get('lat') is not None and trusted.get('lon') is not None:
+            info['lat'] = trusted['lat']
+            info['lon'] = trusted['lon']
+            if trusted.get('city'):
+                info['city'] = trusted['city']
         return info
 
     needs_refresh = True
@@ -2219,7 +2276,7 @@ def compute_dashboard_kpis():
         trust_scores.append(row_trust)
 
         try:
-            geo = get_ip_info(r['ip_address'])
+            geo = get_ip_geo(r['ip_address'])
         except Exception:
             geo = None
         if geo and geo.get('lat') is not None and geo.get('lon') is not None:
@@ -4086,7 +4143,11 @@ def view_tenant_signins():
         except Exception:
             ip_payload = None
         trust = compute_connection_trust_score(ip_payload, r['country'])
-        rows_with_trust.append({'row': r, 'trust': trust})
+        try:
+            display_location = get_display_location(r['ip_address'], r['location'])
+        except Exception:
+            display_location = r['location']
+        rows_with_trust.append({'row': r, 'trust': trust, 'display_location': display_location})
 
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     last_refresh = get_config('tenant_signins_last_fetch_at', '')
@@ -5740,13 +5801,26 @@ def add_trusted_ip():
     ip = request.form.get('ip', '').strip()
     label = request.form.get('label', '').strip() or 'Ville'
     note = request.form.get('note', '').strip()
+    city = request.form.get('city', '').strip()
+    lat_raw = request.form.get('lat', '').strip()
+    lon_raw = request.form.get('lon', '').strip()
     if not ip:
         flash('Une adresse IP est requise')
         return redirect(url_for('list_trusted_ips'))
+
+    lat = lon = None
+    if lat_raw or lon_raw:
+        try:
+            lat = float(lat_raw)
+            lon = float(lon_raw)
+        except ValueError:
+            flash('Latitude/longitude invalides (nombres décimaux attendus) — IP non ajoutée')
+            return redirect(url_for('list_trusted_ips'))
+
     conn = get_db()
     try:
-        conn.execute('INSERT INTO trusted_ips (ip, label, note, created_by) VALUES (?, ?, ?, ?)',
-                     (ip, label, note, session.get('username')))
+        conn.execute('INSERT INTO trusted_ips (ip, label, note, city, lat, lon, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (ip, label, note, city or None, lat, lon, session.get('username')))
         conn.commit()
         # Le prochain affichage de cette IP doit refleter immediatement son nouveau statut
         # de confiance plutot que d'attendre l'expiration du cache de reputation existant.
