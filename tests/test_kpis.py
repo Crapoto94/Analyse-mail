@@ -86,3 +86,32 @@ def test_connections_geo_groups_by_city_and_flags_suspicious(app_module, monkeyp
     home_cities = {p['city'] for p in kpis['connections_geo_home']}
     assert 'Paris' in home_cities
     assert 'Nowhere City' not in home_cities
+
+
+def test_graph_provided_coordinates_prevent_two_distinct_cities_from_merging(app_module, monkeypatch):
+    """Regression : deux connexions dont la geolocalisation par bloc IP (ipwho.is)
+    retomberait sur la meme grande ville (ex: Paris) doivent quand meme apparaitre comme
+    deux lieux distincts sur la carte si Microsoft Graph fournit des coordonnees precises
+    differentes pour chacune (ex: Anneville-en-Saire, pas ecrasee sous Paris)."""
+    conn = app_module.get_db()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, city, country, lat, lon, status, fetched_at) "
+                 "VALUES ('graph-1', ?, '198.51.100.10', 'Anneville-en-Saire', 'FR', 49.6167, -1.2833, 'Success', ?)",
+                 (now, now))
+    conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, city, country, lat, lon, status, fetched_at) "
+                 "VALUES ('graph-2', ?, '198.51.100.20', 'Paris', 'FR', 48.8566, 2.3522, 'Success', ?)",
+                 (now, now))
+    conn.commit()
+    conn.close()
+
+    # Meme si ipwho.is (jamais appele ici, mais on s'assure qu'il ne l'est pas) renverrait
+    # autre chose, les coordonnees Graph deja stockees doivent primer.
+    monkeypatch.setattr(app_module, 'get_ip_geo', lambda ip: (_ for _ in ()).throw(
+        AssertionError('get_ip_geo ne doit pas etre appele quand Graph a deja fourni des coordonnees')))
+
+    kpis = app_module.compute_dashboard_kpis()
+    cities = {p['city'] for p in kpis['connections_geo_world']}
+    assert 'Anneville-en-Saire' in cities
+    assert 'Paris' in cities

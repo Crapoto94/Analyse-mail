@@ -459,7 +459,10 @@ def init_db():
         user_display_name TEXT,
         ip_address TEXT,
         location TEXT,
+        city TEXT,
         country TEXT,
+        lat REAL,
+        lon REAL,
         status TEXT,
         error_code TEXT,
         failure_reason TEXT,
@@ -470,6 +473,15 @@ def init_db():
         fetched_at TEXT
     )''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_tenant_signins_date ON tenant_signins(date_utc)')
+
+    # Migration : ville + coordonnees fournies directement par Microsoft Graph pour chaque
+    # connexion (bases existantes) — voir _map_graph_signin, nettement plus precises qu'une
+    # geolocalisation par bloc IP pour le placement sur les cartes du tableau de bord.
+    for _col in ('city TEXT', 'lat REAL', 'lon REAL'):
+        try:
+            c.execute(f'ALTER TABLE tenant_signins ADD COLUMN {_col}')
+        except Exception:
+            pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1314,6 +1326,11 @@ def _map_graph_signin(item):
     country = location.get('countryOrRegion', '') or ''
     location_str = ', '.join(p for p in [location.get('city', ''), location.get('state', ''), country] if p)
     risky = item.get('riskLevelAggregated') in ('medium', 'high') or item.get('riskState') == 'atRisk'
+    # Coordonnees fournies directement par Microsoft Graph (signInLocation.geoCoordinates),
+    # quand disponibles : nettement plus precises qu'une geolocalisation par bloc IP
+    # (ipwho.is) qui retombe souvent sur la grande ville la plus proche plutot que la
+    # commune exacte — utilisees en priorite pour le placement sur les cartes.
+    geo_coords = location.get('geoCoordinates') or {}
     return {
         'date_utc': item.get('createdDateTime', ''),
         'request_id': item.get('id', ''),
@@ -1322,7 +1339,10 @@ def _map_graph_signin(item):
         'user_upn': item.get('userPrincipalName', ''),
         'ip_address': item.get('ipAddress', ''),
         'location': location_str,
+        'city': location.get('city', ''),
         'country': country,
+        'lat': geo_coords.get('latitude'),
+        'lon': geo_coords.get('longitude'),
         'status': _graph_status_text(status),
         'error_code': str(status.get('errorCode', '') if status.get('errorCode') is not None else ''),
         'failure_reason': status.get('failureReason', ''),
@@ -2252,17 +2272,20 @@ def compute_dashboard_kpis():
 
     home_country = get_home_country_code()
     signin_window_rows = conn.execute(
-        f"SELECT ip_address, country, status FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
+        f"SELECT ip_address, country, city, lat, lon, status FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
     conn.close()
 
     nb_signins_foreign = 0
     trust_scores = []
     # Agregation par lieu (ville + pays) pour les cartes du tableau de bord : un cercle par
     # lieu, dont le rayon depend du nombre de connexions et la couleur/le clignotement du
-    # niveau de suspicion (echecs et/ou score de confiance faible a cet endroit). La
-    # position du cercle est la moyenne des coordonnees des IPs vues a cet endroit
-    # (get_ip_info, deja en cache local — aucun appel reseau supplementaire ici,
-    # ip_reputation_payload ci-dessus l'a deja rempli pour chaque IP de la fenetre).
+    # niveau de suspicion (echecs et/ou score de confiance faible a cet endroit). Position
+    # du cercle : priorite aux coordonnees fournies directement par Microsoft Graph pour
+    # cette connexion precise (city/lat/lon, nettement plus fiables qu'une geolocalisation
+    # par bloc IP qui regroupe a tort des lieux distincts sous la grande ville la plus
+    # proche — ex: Anneville-en-Saire ecrasee sous Paris) ; repli sur get_ip_geo (IP de
+    # confiance en priorite, puis ipwho.is en cache local) seulement si Graph n'a pas
+    # fourni de coordonnees pour cet evenement.
     geo_buckets = {}
     for r in signin_window_rows:
         row_country = (r['country'] or '').strip().upper()
@@ -2275,22 +2298,35 @@ def compute_dashboard_kpis():
         row_trust = compute_connection_trust_score(ip_payload, r['country'])
         trust_scores.append(row_trust)
 
-        try:
-            geo = get_ip_geo(r['ip_address'])
-        except Exception:
-            geo = None
-        if geo and geo.get('lat') is not None and geo.get('lon') is not None:
-            key = (geo.get('city') or '', geo.get('country') or '')
+        city, country, country_code, lat, lon = r['city'], None, row_country, r['lat'], r['lon']
+        # Une IP de confiance (localisation declaree manuellement) prime toujours, meme sur
+        # les coordonnees Graph — c'est justement le cas ou l'admin sait mieux que quiconque.
+        trusted = get_trusted_ip(r['ip_address'])
+        if trusted and trusted.get('lat') is not None and trusted.get('lon') is not None:
+            lat, lon = trusted['lat'], trusted['lon']
+            city = trusted.get('city') or city
+        elif lat is None or lon is None:
+            try:
+                geo = get_ip_geo(r['ip_address'])
+            except Exception:
+                geo = None
+            if geo and geo.get('lat') is not None and geo.get('lon') is not None:
+                city, lat, lon = geo.get('city'), geo['lat'], geo['lon']
+                country_code = (geo.get('country_code') or country_code or '').upper()
+                country = geo.get('country')
+
+        if lat is not None and lon is not None:
+            key = (city or '', country_code or '')
             bucket = geo_buckets.setdefault(key, {
-                'city': geo.get('city') or '', 'country': geo.get('country') or '',
-                'country_code': geo.get('country_code') or '', 'count': 0, 'fail_count': 0,
+                'city': city or '', 'country': country or r['country'] or '',
+                'country_code': country_code or '', 'count': 0, 'fail_count': 0,
                 'lats': [], 'lons': [], 'trust_scores': [],
             })
             bucket['count'] += 1
             if (r['status'] or 'Success') != 'Success':
                 bucket['fail_count'] += 1
-            bucket['lats'].append(geo['lat'])
-            bucket['lons'].append(geo['lon'])
+            bucket['lats'].append(lat)
+            bucket['lons'].append(lon)
             bucket['trust_scores'].append(row_trust)
 
     avg_trust_score = round(sum(trust_scores) / len(trust_scores)) if trust_scores else None
@@ -4025,11 +4061,12 @@ def refresh_tenant_signins():
     before = conn.total_changes
     for m in mapped:
         conn.execute('''INSERT OR IGNORE INTO tenant_signins
-            (request_id, date_utc, user_upn, user_display_name, ip_address, location, country,
-             status, error_code, failure_reason, application, client_app, mfa_result, flagged, fetched_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (request_id, date_utc, user_upn, user_display_name, ip_address, location, city, country,
+             lat, lon, status, error_code, failure_reason, application, client_app, mfa_result, flagged, fetched_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (m['request_id'], m['date_utc'], m['user_upn'], m['user_display_name'], m['ip_address'],
-             m['location'], m['country'], m['status'], m['error_code'], m['failure_reason'],
+             m['location'], m.get('city', ''), m['country'], m.get('lat'), m.get('lon'),
+             m['status'], m['error_code'], m['failure_reason'],
              m['application'], m['client_app'], m['mfa_result'], m['flagged'], fetched_at))
     new_rows = conn.total_changes - before
 
