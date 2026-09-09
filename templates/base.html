@@ -256,7 +256,9 @@ function showGlobalLoadingFatalError(err) {
                 '<strong>' + (info.level_label || '') + '</strong>' +
                 (info.is_trusted ? ' <span class="badge bg-primary">' + (info.trusted_label || 'Ville') + '</span>' : '') +
                 (info.is_vpn ? ' <span class="badge bg-warning text-dark">VPN/Proxy</span>' : '') +
-                (info.is_datacenter ? ' <span class="badge bg-secondary">DC</span>' : '');
+                (info.is_datacenter ? ' <span class="badge bg-secondary">DC</span>' : '') +
+                (info.is_fixed_line_isp ? ' <span class="badge bg-info text-dark">FAI Fixe</span>' : '') +
+                (info.is_mobile_isp ? ' <span class="badge text-white" style="background-color:#6f42c1;">Mobile</span>' : '');
 
             var location = [info.city, info.country].filter(Boolean).join(', ');
             setText('ipInfoLocation', location);
@@ -383,6 +385,12 @@ function showGlobalLoadingFatalError(err) {
                               }
                               if (info.is_datacenter) {
                                   badgesHtml += ' <span class="badge bg-secondary" style="font-size:0.65em;">DC</span>';
+                              }
+                              if (info.is_fixed_line_isp) {
+                                  badgesHtml += ' <span class="badge bg-info text-dark" style="font-size:0.65em;">FAI Fixe</span>';
+                              }
+                              if (info.is_mobile_isp) {
+                                  badgesHtml += ' <span class="badge text-white" style="font-size:0.65em;background-color:#6f42c1;">Mobile</span>';
                               }
                               if (badgesHtml) a.insertAdjacentHTML('afterend', badgesHtml);
                           }

@@ -995,6 +995,11 @@ def ip_reputation_payload(ip):
         # identifiee et validee par un administrateur, meme si AbuseIPDB la classe ainsi.
         'is_datacenter': (not info.get('is_trusted')) and any(
             kw in (info.get('usage_type') or '').lower() for kw in ('data center', 'datacenter')),
+        # Badges "FAI Fixe" / "Mobile" : type d'usage AbuseIPDB "Fixed Line ISP" / "Mobile
+        # ISP" — contexte rassurant (connexion grand public typique), affiche que l'IP soit
+        # de confiance ou non, contrairement au badge DC qui est un signal d'attention.
+        'is_fixed_line_isp': 'fixed line isp' in (info.get('usage_type') or '').lower(),
+        'is_mobile_isp': 'mobile isp' in (info.get('usage_type') or '').lower(),
     }
 
 
@@ -1012,6 +1017,10 @@ def _ip_badge_html(payload):
         extra_badges += ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>'
     if payload.get('is_datacenter'):
         extra_badges += ' <span class="badge bg-secondary" style="font-size:0.65em;">DC</span>'
+    if payload.get('is_fixed_line_isp'):
+        extra_badges += ' <span class="badge bg-info text-dark" style="font-size:0.65em;">FAI Fixe</span>'
+    if payload.get('is_mobile_isp'):
+        extra_badges += ' <span class="badge text-white" style="font-size:0.65em;background-color:#6f42c1;">Mobile</span>'
     data_attr = escape(json.dumps(payload, ensure_ascii=False))
     return Markup(
         f'<span class="ip-badge text-nowrap"><code>{escape(ip)}</code> '
@@ -6080,6 +6089,8 @@ def api_v1_openapi():
             'trusted_label': {'type': 'string'},
             'is_datacenter': {'type': 'boolean', 'description': (
                 "Type d'usage \"Data Center/Web Hosting/Transit\" — jamais vrai pour une IP de confiance.")},
+            'is_fixed_line_isp': {'type': 'boolean', 'description': 'Type d\'usage "Fixed Line ISP".'},
+            'is_mobile_isp': {'type': 'boolean', 'description': 'Type d\'usage "Mobile ISP".'},
         }
     }
 

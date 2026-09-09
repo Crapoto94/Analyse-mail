@@ -118,3 +118,32 @@ def test_no_datacenter_badge_for_residential_isp(app_module, monkeypatch):
                          lambda ip: {'ip': ip, 'isp': 'Orange SA', 'org': '', 'country': 'France'})
     payload = app_module.ip_reputation_payload('198.51.100.70')
     assert payload['is_datacenter'] is False
+
+
+def test_fixed_line_and_mobile_isp_badges():
+    """Verifie juste la logique de detection (pure, insensible a la casse) — le champ
+    usage_type vient d'AbuseIPDB, jamais mocke via get_ip_info comme is_datacenter (voir
+    ci-dessus, c'est get_ip_reputation qui le derive reellement)."""
+    assert 'fixed line isp' in 'Fixed Line ISP'.lower()
+    assert 'mobile isp' in 'Mobile ISP'.lower()
+    assert 'fixed line isp' not in 'Mobile ISP'.lower()
+    assert 'mobile isp' not in 'Fixed Line ISP'.lower()
+
+
+def test_fixed_line_isp_badge_shown_regardless_of_trust(app_module, client, monkeypatch):
+    """Contrairement au badge DC, FAI Fixe/Mobile ne sont pas des signaux d'attention —
+    pas de raison de les masquer pour une IP de confiance."""
+    login_as_default_admin(client)
+    client.post('/admin/trusted-ips/add', data={'ip': '198.51.100.80', 'label': 'Ville', 'note': ''})
+
+    conn = app_module.get_db()
+    conn.execute("INSERT OR REPLACE INTO ip_info (ip, usage_type, country) VALUES (?, ?, ?)",
+                 ('198.51.100.80', 'Fixed Line ISP', 'France'))
+    conn.execute("UPDATE ip_info SET reputation_source='abuseipdb', reputation_checked_at=? WHERE ip=?",
+                 (__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), '198.51.100.80'))
+    conn.commit()
+    conn.close()
+
+    payload = app_module.ip_reputation_payload('198.51.100.80')
+    assert payload['is_trusted'] is True
+    assert payload['is_fixed_line_isp'] is True
