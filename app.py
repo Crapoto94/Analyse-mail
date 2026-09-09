@@ -97,32 +97,90 @@ def _is_mfa_failure_row(row):
     return error_code in MFA_FAILURE_ERROR_CODES or any(kw in failure_reason for kw in MFA_FAILURE_KEYWORDS)
 
 
-def _correlate_signin_mfa(signins):
-    """Microsoft Graph journalise parfois l'etape d'authentification primaire et l'etape
-    MFA d'une meme sequence de connexion comme deux lignes signIns distinctes, reliees par
-    le meme correlation_id. Regroupe les lignes par correlation_id et indique, pour chaque
-    groupe, s'il contient a la fois un succes ET un echec specifiquement MFA — auquel cas
-    la connexion ne doit pas etre consideree comme un succes "propre" sans reserve : le MFA
-    a echoue a un moment de la meme sequence, meme si l'acces a finalement abouti.
-    Retourne { correlation_id: {'any_success': bool, 'mfa_failure': bool, 'mfa_failure_reason': str} }."""
-    groups = {}
+def _row_get(row, key, default=''):
+    try:
+        val = row[key]
+        return val if val is not None else default
+    except Exception:
+        return default
+
+
+def _compute_mfa_linkage(signins, window_seconds=15):
+    """Determine, pour chaque connexion reussie, si un echec specifiquement MFA doit lui
+    etre associe. Microsoft Graph journalise parfois l'etape d'authentification primaire
+    et l'etape MFA d'une meme tentative de connexion comme deux lignes signIns distinctes,
+    et n'attribue PAS toujours le meme correlation_id aux deux (en particulier quand le
+    MFA est declenche apres coup par une exigence d'acces conditionnel). Deux signaux sont
+    donc combines :
+      1) meme correlation_id (le lien le plus fiable, quand disponible) ;
+      2) a defaut, meme utilisateur + meme IP, et VOISIN IMMEDIAT dans la chronologie de
+         ce couple (pas seulement "dans une fenetre de N secondes") a moins de
+         `window_seconds` d'ecart. Se limiter au voisin le plus proche evite qu'une seule
+         erreur MFA, au milieu d'une rafale de connexions reussies rapprochees (plusieurs
+         jetons applicatifs demandes en quelques secondes, tres courant), ne se retrouve
+         liee a des dizaines de succes qui n'ont rien a voir avec elle.
+    Retourne { request_id ou identite de repli: {'linked': bool, 'reason': str} } pour les
+    connexions REUSSIES uniquement."""
+    parsed = []
     for s in signins:
-        try:
-            cid = (s['correlation_id'] or '').strip()
-        except Exception:
-            cid = ''
-        if not cid:
+        dt = _parse_iso(_row_get(s, 'date_utc'))
+        success = _is_success_status(_row_get(s, 'status'))
+        parsed.append({
+            'row': s,
+            'dt': dt,
+            'success': success,
+            'mfa_failure': (not success) and _is_mfa_failure_row(s),
+            'cid': _row_get(s, 'correlation_id').strip(),
+            'ip': _row_get(s, 'ip_address').strip(),
+            'user': _row_get(s, 'user_upn').strip(),
+            'request_id': _row_get(s, 'request_id', None),
+            'failure_reason': _row_get(s, 'failure_reason'),
+        })
+
+    # 1) Regroupement par correlation_id
+    cid_groups = {}
+    for p in parsed:
+        if not p['cid']:
             continue
-        g = groups.setdefault(cid, {'any_success': False, 'mfa_failure': False, 'mfa_failure_reason': ''})
-        if _is_success_status(s['status']):
-            g['any_success'] = True
-        elif _is_mfa_failure_row(s):
+        g = cid_groups.setdefault(p['cid'], {'mfa_failure': False, 'reason': ''})
+        if p['mfa_failure']:
             g['mfa_failure'] = True
-            try:
-                g['mfa_failure_reason'] = s['failure_reason'] or 'MFA non complétée'
-            except Exception:
-                g['mfa_failure_reason'] = 'MFA non complétée'
-    return groups
+            g['reason'] = p['failure_reason'] or 'MFA non complétée'
+
+    def row_key(p):
+        return p['request_id'] or id(p['row'])
+
+    linkage = {}
+    for p in parsed:
+        if not p['success']:
+            continue
+        linked, reason = False, ''
+        if p['cid'] and cid_groups.get(p['cid'], {}).get('mfa_failure'):
+            linked, reason = True, cid_groups[p['cid']]['reason']
+        linkage[row_key(p)] = {'linked': linked, 'reason': reason}
+
+    # 2) Complement : meme utilisateur + meme IP, uniquement le voisin immediat dans la
+    #    chronologie de ce couple (pas tout ce qui tombe dans une fenetre large).
+    groups_by_user_ip = {}
+    for p in parsed:
+        if p['dt'] and p['user'] and p['ip']:
+            groups_by_user_ip.setdefault((p['user'], p['ip']), []).append(p)
+    for group in groups_by_user_ip.values():
+        group.sort(key=lambda p: p['dt'])
+        for i, p in enumerate(group):
+            if not p['success']:
+                continue
+            key = row_key(p)
+            if linkage.get(key, {}).get('linked'):
+                continue
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(group):
+                    neighbor = group[j]
+                    if neighbor['mfa_failure'] and abs((p['dt'] - neighbor['dt']).total_seconds()) <= window_seconds:
+                        linkage[key] = {'linked': True, 'reason': neighbor['failure_reason'] or 'MFA non complétée'}
+                        break
+
+    return linkage
 
 
 app.jinja_env.filters['mfa_status'] = format_mfa_status
@@ -287,8 +345,15 @@ def init_db():
         password_hash TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'user',
         is_active INTEGER NOT NULL DEFAULT 1,
+        auth_source TEXT NOT NULL DEFAULT 'local',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+
+    # Migration: ajouter la colonne auth_source si elle n'existe pas (bases existantes)
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'")
+    except Exception:
+        pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS monitored_mailboxes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -988,7 +1053,7 @@ def fetch_sent_messages_from_graph(boite_id, user_upn, days=30):
 from functools import wraps
 
 # Routes accessibles sans etre connecte (endpoints Flask, pas les URLs).
-PUBLIC_ENDPOINTS = {'login', 'static'}
+PUBLIC_ENDPOINTS = {'login', 'static', 'microsoft_login', 'microsoft_callback'}
 
 
 @app.before_request
@@ -1042,13 +1107,146 @@ def login():
             next_url = request.form.get('next') or url_for('index')
             return redirect(next_url)
         flash('Identifiants incorrects')
-    return render_template('login.html', next=request.args.get('next', ''))
+    graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+    return render_template('login.html', next=request.args.get('next', ''), graph_configured=graph_configured)
 
 
 @app.route('/logout', methods=['POST'])
 def logout():
     session.clear()
     return redirect(url_for('login'))
+
+
+@app.route('/auth/microsoft/login')
+def microsoft_login():
+    """Demarre la connexion via Microsoft Entra ID (flux OAuth2 authorization code),
+    en utilisant l'App Registration deja configuree pour l'API Graph. Restreint au
+    tenant configure (endpoint /{tenant_id}/... et non /common/) : seuls les comptes
+    de cette organisation peuvent se connecter."""
+    tenant_id = get_config('graph_tenant_id', '').strip()
+    client_id = get_config('graph_client_id', '').strip()
+    if not (tenant_id and client_id):
+        flash("Connexion Microsoft indisponible : configuration Graph incomplète (voir Configuration)")
+        return redirect(url_for('login'))
+
+    import secrets
+    import urllib.parse
+
+    state = secrets.token_urlsafe(24)
+    session['ms_oauth_state'] = state
+    session['ms_oauth_next'] = request.args.get('next', '')
+
+    redirect_uri = url_for('microsoft_callback', _external=True)
+    params = {
+        'client_id': client_id,
+        'response_type': 'code',
+        'redirect_uri': redirect_uri,
+        'response_mode': 'query',
+        'scope': 'openid profile email User.Read',
+        'state': state,
+    }
+    auth_url = (f'https://login.microsoftonline.com/{urllib.parse.quote(tenant_id)}/oauth2/v2.0/authorize?'
+                + urllib.parse.urlencode(params))
+    return redirect(auth_url)
+
+
+@app.route('/auth/microsoft/callback')
+def microsoft_callback():
+    """Recoit le retour de Microsoft, echange le code contre un jeton, recupere
+    l'identite via Graph /me, puis cree/connecte le compte local correspondant.
+    Les nouveaux comptes sont provisionnes automatiquement : role 'admin' si l'UPN
+    commence par 'adm-' (insensible a la casse), 'user' sinon. Un compte deja existant
+    (cree localement ou lors d'une connexion Microsoft precedente) conserve son role
+    actuel, meme s'il a ete change manuellement depuis /users."""
+    error = request.args.get('error')
+    if error:
+        flash(f"Connexion Microsoft annulée ou refusée : {request.args.get('error_description', error)}")
+        return redirect(url_for('login'))
+
+    state = request.args.get('state', '')
+    expected_state = session.pop('ms_oauth_state', None)
+    next_url = session.pop('ms_oauth_next', '') or url_for('index')
+    if not expected_state or state != expected_state:
+        flash('Connexion Microsoft refusée (état de sécurité invalide) — réessayez')
+        return redirect(url_for('login'))
+
+    code = request.args.get('code')
+    if not code:
+        flash('Connexion Microsoft incomplète (code manquant)')
+        return redirect(url_for('login'))
+
+    tenant_id = get_config('graph_tenant_id', '').strip()
+    client_id = get_config('graph_client_id', '').strip()
+    client_secret = get_config('graph_client_secret', '').strip()
+    if not (tenant_id and client_id and client_secret):
+        flash("Connexion Microsoft indisponible : configuration Graph incomplète")
+        return redirect(url_for('login'))
+
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    redirect_uri = url_for('microsoft_callback', _external=True)
+    token_url = f'https://login.microsoftonline.com/{urllib.parse.quote(tenant_id)}/oauth2/v2.0/token'
+    data = urllib.parse.urlencode({
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': redirect_uri,
+        'scope': 'openid profile email User.Read',
+    }).encode('utf-8')
+
+    try:
+        req = urllib.request.Request(token_url, data=data, method='POST',
+                                      headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            token_payload = json.loads(resp.read().decode('utf-8'))
+        access_token = token_payload['access_token']
+
+        req2 = urllib.request.Request('https://graph.microsoft.com/v1.0/me', headers={
+            'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'})
+        with urllib.request.urlopen(req2, timeout=15) as resp2:
+            me = json.loads(resp2.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        add_log('ERROR', 'AUTH', 'Échec de la connexion Microsoft', f'HTTP {e.code}: {error_body}')
+        flash(f"Échec de la connexion Microsoft (HTTP {e.code})")
+        return redirect(url_for('login'))
+    except Exception as e:
+        add_log('ERROR', 'AUTH', 'Échec de la connexion Microsoft', str(e))
+        flash(f"Échec de la connexion Microsoft : {e}")
+        return redirect(url_for('login'))
+
+    upn = (me.get('userPrincipalName') or me.get('mail') or '').strip()
+    if not upn:
+        flash("Connexion Microsoft impossible : identifiant utilisateur introuvable dans la réponse Graph")
+        return redirect(url_for('login'))
+
+    conn = get_db()
+    user = conn.execute('SELECT * FROM users WHERE username=?', (upn,)).fetchone()
+    if not user:
+        role = 'admin' if upn.lower().startswith('adm-') else 'user'
+        placeholder_hash = generate_password_hash(uuid.uuid4().hex)
+        conn.execute('INSERT INTO users (username, password_hash, role, auth_source) VALUES (?, ?, ?, ?)',
+                      (upn, placeholder_hash, role, 'microsoft'))
+        conn.commit()
+        user = conn.execute('SELECT * FROM users WHERE username=?', (upn,)).fetchone()
+        conn.close()
+        add_log('INFO', 'AUTH', f'Compte {upn} créé automatiquement via connexion Microsoft (rôle {role})')
+    elif not user['is_active']:
+        conn.close()
+        flash('Ce compte est désactivé — contactez un administrateur')
+        return redirect(url_for('login'))
+    else:
+        conn.close()
+
+    session.clear()
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['role'] = user['role']
+    add_log('INFO', 'AUTH', f'Connexion Microsoft réussie pour {upn}')
+    return redirect(next_url)
 
 
 @app.route('/users')
@@ -1366,15 +1564,14 @@ def _parse_iso(value):
         return None
 
 
-def _build_signin_event(s, ref_id=None, mfa_groups=None):
+def _build_signin_event(s, ref_id=None, mfa_linkage=None):
     """Construit un evenement de timeline a partir d'une ligne signin_logs (sqlite3.Row
     ou dict). Fonction pure : reutilisee pour les boites en base et le scan rapide.
 
-    Si `mfa_groups` (voir _correlate_signin_mfa) indique que la meme sequence
-    d'authentification (correlation_id) contient a la fois ce succes ET un echec MFA,
-    la connexion est marquee 'mfa_linked_failure' : elle a materiellement abouti, mais
-    le MFA a echoue a un moment de la meme sequence — a ne pas compter comme un succes
-    sans reserve (l'utilisateur/l'attaquant a du contourner ou re-essayer le MFA)."""
+    Si `mfa_linkage` (voir _compute_mfa_linkage) indique que cette connexion reussie est
+    liee a un echec MFA (meme correlation_id, ou meme utilisateur/IP a quelques instants
+    d'ecart), elle est marquee 'mfa_linked_failure' : elle a materiellement abouti, mais
+    le MFA a echoue au meme moment — a ne pas compter comme un succes sans reserve."""
     success = _is_success_status(s['status'])
     title = ('Connexion réussie' if success else 'Connexion échouée')
     if s['application']:
@@ -1389,15 +1586,12 @@ def _build_signin_event(s, ref_id=None, mfa_groups=None):
 
     mfa_linked_failure = False
     mfa_linked_reason = ''
-    if success and mfa_groups:
-        try:
-            cid = (s['correlation_id'] or '').strip()
-        except Exception:
-            cid = ''
-        group = mfa_groups.get(cid) if cid else None
-        if group and group['mfa_failure']:
+    if success and mfa_linkage:
+        key = _row_get(s, 'request_id', None) or id(s)
+        entry = mfa_linkage.get(key)
+        if entry and entry['linked']:
             mfa_linked_failure = True
-            mfa_linked_reason = group['mfa_failure_reason']
+            mfa_linked_reason = entry['reason']
             detail_parts.append(f"⚠ MFA échouée dans la même séquence d'authentification ({mfa_linked_reason})")
 
     return {
@@ -1446,10 +1640,10 @@ def _build_audit_event(a, ref_id=None):
 def build_timeline_events(signins, audits):
     """Fusionne des lignes signin_logs/audit_logs (ou dicts equivalents issus d'un scan
     rapide) en une seule liste d'evenements tries chronologiquement. Fonction pure,
-    aucun acces DB. Corrige aussi les succes de connexion dont le MFA a echoue dans la
-    meme sequence (voir _correlate_signin_mfa / _build_signin_event)."""
-    mfa_groups = _correlate_signin_mfa(signins)
-    events = [_build_signin_event(s, mfa_groups=mfa_groups) for s in signins] + [_build_audit_event(a) for a in audits]
+    aucun acces DB. Relie aussi les succes de connexion a un echec MFA associe (voir
+    _compute_mfa_linkage / _build_signin_event)."""
+    mfa_linkage = _compute_mfa_linkage(signins)
+    events = [_build_signin_event(s, mfa_linkage=mfa_linkage) for s in signins] + [_build_audit_event(a) for a in audits]
     events.sort(key=lambda e: e['timestamp'] or '')
     return events
 
@@ -1633,21 +1827,35 @@ def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
                 'events': [e],
             })
 
-    # 2bis) Authentification aboutie malgre un echec MFA dans la meme sequence
-    #    (meme correlation_id cote Microsoft Graph) : la connexion n'est un succes
-    #    "propre" que si l'etape primaire ET le MFA ont reussi. Un succes accompagne
-    #    d'un echec MFA lie merite verification, meme si l'acces a materiellement abouti.
-    for e in successful_signins:
-        if e.get('mfa_linked_failure'):
-            findings.append({
-                'severity': 'medium',
-                'title': 'Authentification aboutie malgré un échec MFA associé',
-                'description': (f"{e['user']} — la connexion à {e['timestamp']} depuis {e['ip']} a réussi, mais un échec MFA "
-                                 f"({e.get('mfa_linked_reason') or 'MFA non complétée'}) a été journalisé dans la même séquence "
-                                 f"d'authentification (même identifiant de corrélation). À vérifier : l'accès a-t-il réellement "
-                                 f"validé le second facteur, ou s'agit-il d'un contournement/rejeu ?"),
-                'events': [e],
-            })
+    # 2bis) Authentification aboutie malgre un echec MFA associe (meme correlation_id, ou
+    #    meme utilisateur/IP a quelques secondes d'ecart) : la connexion n'est un succes
+    #    "propre" que si l'etape primaire ET le MFA ont reussi. Regroupe TOUTES les
+    #    occurrences en un seul finding : sur une session chargee, des dizaines de succes
+    #    rapproches peuvent chacun avoir un echec MFA voisin (prompts relances) — c'est
+    #    alors un pattern de friction a examiner globalement, pas N incidents distincts a
+    #    additionner (ce qui gonflait artificiellement le score).
+    mfa_linked = [e for e in successful_signins if e.get('mfa_linked_failure')]
+    if len(mfa_linked) == 1:
+        e = mfa_linked[0]
+        findings.append({
+            'severity': 'medium',
+            'title': 'Authentification aboutie malgré un échec MFA associé',
+            'description': (f"{e['user']} — la connexion à {e['timestamp']} depuis {e['ip']} a réussi, mais un échec MFA "
+                             f"({e.get('mfa_linked_reason') or 'MFA non complétée'}) a été journalisé au même moment. "
+                             f"À vérifier : l'accès a-t-il réellement validé le second facteur, ou s'agit-il d'un contournement/rejeu ?"),
+            'events': [e],
+        })
+    elif len(mfa_linked) > 1:
+        users = sorted(set(e['user'] for e in mfa_linked if e['user']))
+        findings.append({
+            'severity': 'medium',
+            'title': f"{len(mfa_linked)} authentifications abouties malgré un échec MFA associé",
+            'description': (f"Entre {mfa_linked[0]['timestamp']} et {mfa_linked[-1]['timestamp']}, {len(mfa_linked)} connexions "
+                             f"réussies de {', '.join(users) or 'l’utilisateur'} ont chacune un échec MFA journalisé au même "
+                             f"moment — évoque plutôt une session avec friction MFA répétée (prompts relancés) que des "
+                             f"incidents distincts. À vérifier si le volume ou la période sort de l'ordinaire pour ce compte."),
+            'events': mfa_linked,
+        })
 
     # 3) Rafale d'echecs suivie d'un succes (>=3 echecs en 15 min puis succes dans les 15 min suivantes).
     #    Ce n'est un signal fort que si la connexion reussie provient d'un pays INHABITUEL :
@@ -1975,15 +2183,14 @@ def view_signins(bid):
                             and s['country'] and s['country'] != baseline_country]
         failed_rows = [s for s in signins if not _is_success_status(s['status'])]
 
-        # Une connexion "reussie" dont le MFA a echoue dans la meme sequence d'authentification
-        # (meme correlation_id : Microsoft Graph journalise parfois l'etape primaire et l'etape
-        # MFA comme deux lignes distinctes) n'est pas un succes sans reserve — a signaler.
-        mfa_groups = _correlate_signin_mfa(signins)
+        # Une connexion "reussie" dont le MFA a echoue (meme correlation_id, ou meme
+        # utilisateur/IP a quelques instants d'ecart) n'est pas un succes sans reserve.
+        mfa_linkage = _compute_mfa_linkage(signins)
         mfa_linked_failure_ids = set()
         for s in signins:
             if _is_success_status(s['status']):
-                cid = (s['correlation_id'] or '').strip()
-                if cid and mfa_groups.get(cid, {}).get('mfa_failure'):
+                key = s['request_id'] or id(s)
+                if mfa_linkage.get(key, {}).get('linked'):
                     mfa_linked_failure_ids.add(s['id'])
 
         timeline = _timeline_query(conn, 'signin_logs', bid)
@@ -3169,7 +3376,8 @@ def config():
         api_ville_token=get_config('api_ville_token', ''),
         graph_tenant_id=get_config('graph_tenant_id', ''),
         graph_client_id=get_config('graph_client_id', ''),
-        graph_client_secret_set=bool(get_config('graph_client_secret', '')))
+        graph_client_secret_set=bool(get_config('graph_client_secret', '')),
+        microsoft_redirect_uri=url_for('microsoft_callback', _external=True))
 
 @app.route('/api/test-graph')
 def test_api_graph():

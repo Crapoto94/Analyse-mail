@@ -39,6 +39,12 @@
                     <i class="bi bi-box-arrow-in-right"></i> Se connecter
                 </button>
             </form>
+            {% if graph_configured %}
+            <div class="text-center my-3 text-muted small">— ou —</div>
+            <a href="{{ url_for('microsoft_login', next=next) }}" class="btn btn-outline-dark w-100">
+                <i class="bi bi-microsoft"></i> Se connecter avec Microsoft
+            </a>
+            {% endif %}
         </div>
     </div>
 </div>

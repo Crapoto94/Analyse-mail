@@ -119,6 +119,22 @@
                         <li>Cliquez sur <strong>Accorder un consentement admin</strong> pour le locataire (indispensable — sans ça les appels échouent en 403).</li>
                     </ol>
                 </div>
+
+                <div class="alert alert-secondary small">
+                    <strong><i class="bi bi-box-arrow-in-right"></i> En plus, pour activer "Se connecter avec Microsoft" (page de connexion) :</strong>
+                    <ol class="mb-0 mt-2">
+                        <li>Sur la même inscription d'application, dans <em>Authentification</em> → <em>Ajouter une plateforme</em> → <strong>Web</strong>, ajoutez cette URI de redirection :
+                            <div class="input-group input-group-sm mt-1 mb-1">
+                                <input type="text" class="form-control" value="{{ microsoft_redirect_uri }}" readonly onclick="this.select()">
+                            </div>
+                            <span class="text-muted">(doit être en HTTPS en production ; http://localhost fonctionne en développement)</span>
+                        </li>
+                        <li>Toujours dans <em>Autorisations API</em>, ajoutez cette fois des <strong>autorisations déléguées</strong> Microsoft Graph :
+                            <code>openid</code>, <code>profile</code>, <code>email</code>, <code>User.Read</code> (généralement sans consentement admin requis).
+                        </li>
+                        <li>Les comptes se connectant pour la première fois via Microsoft sont créés automatiquement : rôle <strong>administrateur</strong> si leur identifiant commence par <code>adm-</code>, <strong>utilisateur</strong> sinon.</li>
+                    </ol>
+                </div>
                 <form method="POST">
                     <div class="mb-3">
                         <label for="graph_tenant_id" class="form-label">ID du locataire (Tenant ID)</label>

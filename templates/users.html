@@ -48,7 +48,10 @@
                 <tbody>
                     {% for u in users %}
                     <tr>
-                        <td>{{ u.username }} {% if u.id == session.get('user_id') %}<span class="badge bg-info">Vous</span>{% endif %}</td>
+                        <td>{{ u.username }}
+                            {% if u.id == session.get('user_id') %}<span class="badge bg-info">Vous</span>{% endif %}
+                            {% if u.auth_source == 'microsoft' %}<span class="badge bg-dark"><i class="bi bi-microsoft"></i> Microsoft</span>{% endif %}
+                        </td>
                         <td><span class="badge bg-{% if u.role == 'admin' %}dark{% else %}secondary{% endif %}">{{ 'Administrateur' if u.role == 'admin' else 'Utilisateur' }}</span></td>
                         <td>{% if u.is_active %}<span class="badge bg-success">Actif</span>{% else %}<span class="badge bg-secondary">Désactivé</span>{% endif %}</td>
                         <td><small class="text-muted">{{ u.created_at|paris }}</small></td>
