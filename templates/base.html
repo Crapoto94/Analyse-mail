@@ -232,28 +232,19 @@ function showGlobalLoadingFatalError(err) {
         var modalEl = document.getElementById('ipInfoModal');
         if (!modalEl) return;
 
+        var LEVEL_COLORS = {green: '#198754', orange: '#fd7e14', red: '#dc3545'};
+
         function setText(id, value) {
             document.getElementById(id).textContent = (value === null || value === undefined || value === '') ? '—' : value;
         }
 
-        document.addEventListener('click', function(e) {
-            var el = e.target.closest('.ip-rep-badge');
-            if (!el) return;
-            e.preventDefault();
-            var info;
-            try {
-                info = JSON.parse(el.getAttribute('data-ip-info'));
-            } catch (err) {
-                return;
-            }
-
+        function showIpModal(info) {
             document.getElementById('ipInfoIp').textContent = info.ip || '';
-
-            var levelColors = {green: '#198754', orange: '#fd7e14', red: '#dc3545'};
-            var dotColor = levelColors[info.level] || '#6c757d';
+            var dotColor = LEVEL_COLORS[info.level] || '#6c757d';
             document.getElementById('ipInfoLevel').innerHTML =
                 '<span class="ip-rep-dot" style="background-color:' + dotColor + ';"></span> ' +
-                '<strong>' + (info.level_label || '') + '</strong>';
+                '<strong>' + (info.level_label || '') + '</strong>' +
+                (info.is_vpn ? ' <span class="badge bg-warning text-dark">VPN/Proxy</span>' : '');
 
             var location = [info.city, info.country].filter(Boolean).join(', ');
             setText('ipInfoLocation', location);
@@ -271,7 +262,135 @@ function showGlobalLoadingFatalError(err) {
             document.getElementById('ipInfoBasis').textContent = info.basis_label || '';
 
             bootstrap.Modal.getOrCreateInstance(modalEl).show();
+        }
+
+        document.addEventListener('click', function(e) {
+            var el = e.target.closest('.ip-rep-badge');
+            if (!el) return;
+            e.preventDefault();
+            var raw = el.getAttribute('data-ip-info');
+            if (raw) {
+                try { showIpModal(JSON.parse(raw)); return; } catch (err) { /* repli ci-dessous */ }
+            }
+            // IP repérée dans du texte libre (analyse IA, timeline...) : pas encore résolue
+            // par l'appel groupé (batch en échec, ou trop rapide) — on la résout à la volée.
+            var ip = el.getAttribute('data-ip');
+            if (!ip) return;
+            fetch('/api/ip-info/' + encodeURIComponent(ip))
+                .then(function(r) { return r.json(); })
+                .then(function(info) {
+                    if (info && !info.error) {
+                        el.setAttribute('data-ip-info', JSON.stringify(info));
+                        var dot = el.querySelector('.ip-rep-dot');
+                        if (dot) dot.style.backgroundColor = LEVEL_COLORS[info.level] || '#6c757d';
+                        showIpModal(info);
+                    }
+                })
+                .catch(function() {});
         });
+
+        // --- Detection automatique d'IP dans du texte libre (analyse IA, timeline,
+        // journal d'audit, resultats de scan...) : quel que soit l'endroit ou une IP
+        // apparait dans la page, meme non geree explicitement cote serveur par ip_badge(),
+        // elle est reperee et transformee en pastille cliquable. -----------------------
+        var IP_RE = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/g;
+        var SKIP_SELECTOR = '.ip-badge, .ip-rep-badge, script, style, textarea, select, option, [contenteditable], .ql-editor';
+        var pendingIps = new Set();
+        var flushTimer = null;
+
+        function linkifyIPsIn(root) {
+            if (!root || root.nodeType !== 1 || root.closest(SKIP_SELECTOR)) return;
+            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                acceptNode: function(node) {
+                    var p = node.parentElement;
+                    if (!p || p.closest(SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+                    IP_RE.lastIndex = 0;
+                    return (node.nodeValue && IP_RE.test(node.nodeValue)) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+                }
+            });
+            var textNodes = [];
+            var n;
+            while ((n = walker.nextNode())) textNodes.push(n);
+
+            textNodes.forEach(function(node) {
+                var text = node.nodeValue;
+                IP_RE.lastIndex = 0;
+                var frag = document.createDocumentFragment();
+                var lastIndex = 0;
+                var m;
+                var matched = false;
+                while ((m = IP_RE.exec(text))) {
+                    matched = true;
+                    if (m.index > lastIndex) frag.appendChild(document.createTextNode(text.slice(lastIndex, m.index)));
+                    var ip = m[0];
+                    var span = document.createElement('span');
+                    span.className = 'ip-badge text-nowrap';
+                    span.innerHTML = '<code>' + ip + '</code> <a href="#" class="ip-rep-badge" data-bs-toggle="modal" ' +
+                        'data-bs-target="#ipInfoModal" data-ip="' + ip + '" title="Réputation IP — cliquer pour le détail">' +
+                        '<span class="ip-rep-dot" style="background-color:#adb5bd;"></span></a>';
+                    frag.appendChild(span);
+                    pendingIps.add(ip);
+                    lastIndex = m.index + ip.length;
+                }
+                if (!matched) return;
+                if (lastIndex < text.length) frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+                node.parentNode.replaceChild(frag, node);
+            });
+
+            if (pendingIps.size) {
+                if (flushTimer) clearTimeout(flushTimer);
+                flushTimer = setTimeout(flushPendingIps, 400);
+            }
+        }
+
+        function flushPendingIps() {
+            var ips = Array.from(pendingIps);
+            pendingIps.clear();
+            if (!ips.length) return;
+            fetch('/api/ip-info-batch', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ips: ips})
+            }).then(function(r) { return r.json(); })
+              .then(function(data) {
+                  Object.keys(data).forEach(function(ip) {
+                      var info = data[ip];
+                      var color = LEVEL_COLORS[info.level] || '#6c757d';
+                      document.querySelectorAll('.ip-rep-badge[data-ip="' + CSS.escape(ip) + '"]').forEach(function(a) {
+                          a.setAttribute('data-ip-info', JSON.stringify(info));
+                          a.setAttribute('title', (info.level_label || '') + ' — cliquer pour le détail');
+                          var dot = a.querySelector('.ip-rep-dot');
+                          if (dot) dot.style.backgroundColor = color;
+                          if (info.is_vpn && a.parentElement && !a.parentElement.querySelector('.badge')) {
+                              a.insertAdjacentHTML('afterend', ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>');
+                          }
+                      });
+                  });
+              })
+              .catch(function() {});
+        }
+
+        // Detecteur passif : re-scanne tout contenu ajoute dynamiquement a la page (rendu
+        // markdown de l'analyse IA, resultats de scan charges en JS, etc.) sans avoir a
+        // cabler un appel explicite a chaque endroit qui injecte du HTML.
+        var moTimer = null;
+        var moNodes = [];
+        var observer = new MutationObserver(function(mutations) {
+            mutations.forEach(function(m) {
+                m.addedNodes.forEach(function(node) {
+                    if (node.nodeType === 1) moNodes.push(node);
+                });
+            });
+            if (moTimer) clearTimeout(moTimer);
+            moTimer = setTimeout(function() {
+                var nodes = moNodes; moNodes = [];
+                nodes.forEach(linkifyIPsIn);
+            }, 300);
+        });
+
+        // Ce script est charge en fin de body : le DOM initial est deja disponible.
+        linkifyIPsIn(document.body);
+        observer.observe(document.body, {childList: true, subtree: true});
     })();
     </script>
 </body>

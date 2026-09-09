@@ -822,32 +822,27 @@ REPUTATION_BASIS_LABELS = {
 }
 
 
-def render_ip_badge(ip):
-    """Fonction globale Jinja ({{ ip_badge(x) }}) : affiche une IP suivie d'une pastille de
-    reputation verte/orange/rouge cliquable, qui ouvre la modale de detail partagee (voir le
-    gestionnaire JS dans base.html) sans requete AJAX supplementaire — toutes les donnees
-    sont deja embarquees dans l'attribut data-ip-info au moment du rendu de la page."""
+def ip_reputation_payload(ip):
+    """Construit le dict JSON-serialisable decrivant la reputation d'une IP (utilise par le
+    badge Jinja rendu cote serveur ET par les routes AJAX /api/ip-info et /api/ip-info-batch
+    qui alimentent la detection d'IP dans du texte libre — analyse IA, timeline... — cote
+    client). Retourne None si la reputation n'a pas pu etre determinee."""
     ip = (ip or '').strip()
     if not ip:
-        return Markup('')
-
+        return None
     try:
         info = get_ip_reputation(ip)
     except Exception as e:
-        print(f"Erreur ip_badge pour {ip}: {e}")
-        info = None
-
+        print(f"Erreur ip_reputation_payload pour {ip}: {e}")
+        return None
     if not info:
-        return Markup(f'<code>{escape(ip)}</code>')
+        return None
 
     level = info.get('reputation_level') or 'orange'
-    color = REPUTATION_LEVEL_COLOR.get(level, '#6c757d')
-    label = REPUTATION_LEVEL_LABELS.get(level, level)
-
-    payload = {
+    return {
         'ip': ip,
         'level': level,
-        'level_label': label,
+        'level_label': REPUTATION_LEVEL_LABELS.get(level, level),
         'basis_label': REPUTATION_BASIS_LABELS.get(info.get('reputation_basis'), info.get('reputation_basis') or ''),
         'country': info.get('country') or '',
         'city': info.get('city') or '',
@@ -863,17 +858,73 @@ def render_ip_badge(ip):
         'last_reported_at': info.get('last_reported_at') or '',
         'is_vpn': bool(info.get('is_vpn')),
     }
-    data_attr = escape(json.dumps(payload, ensure_ascii=False))
 
+
+def _ip_badge_html(payload):
+    """Construit le HTML d'un badge IP (pastille couleur + badge VPN eventuel) a partir du
+    payload retourne par ip_reputation_payload — factorise entre render_ip_badge (rendu
+    serveur) et la detection cote client (voir /api/ip-info-batch, meme structure de
+    donnees, meme rendu construit en JS dans base.html)."""
+    ip = payload['ip']
+    color = REPUTATION_LEVEL_COLOR.get(payload['level'], '#6c757d')
+    vpn_badge = ''
+    if payload.get('is_vpn'):
+        vpn_badge = ' <span class="badge bg-warning text-dark" style="font-size:0.65em;">VPN/Proxy</span>'
+    data_attr = escape(json.dumps(payload, ensure_ascii=False))
     return Markup(
         f'<span class="ip-badge text-nowrap"><code>{escape(ip)}</code> '
         f'<a href="#" class="ip-rep-badge" data-bs-toggle="modal" data-bs-target="#ipInfoModal" '
-        f'data-ip-info="{data_attr}" title="{escape(label)} — cliquer pour le détail">'
-        f'<span class="ip-rep-dot" style="background-color:{color};"></span></a></span>'
+        f'data-ip-info="{data_attr}" title="{escape(payload["level_label"])} — cliquer pour le détail">'
+        f'<span class="ip-rep-dot" style="background-color:{color};"></span></a>{vpn_badge}</span>'
     )
 
 
+def render_ip_badge(ip):
+    """Fonction globale Jinja ({{ ip_badge(x) }}) : affiche une IP suivie d'une pastille de
+    reputation verte/orange/rouge (+ badge VPN/Proxy si detecte) cliquable, qui ouvre la
+    modale de detail partagee (voir le gestionnaire JS dans base.html) sans requete AJAX
+    supplementaire — toutes les donnees sont deja embarquees dans l'attribut data-ip-info
+    au moment du rendu de la page."""
+    ip = (ip or '').strip()
+    if not ip:
+        return Markup('')
+    payload = ip_reputation_payload(ip)
+    if not payload:
+        return Markup(f'<code>{escape(ip)}</code>')
+    return _ip_badge_html(payload)
+
+
 app.jinja_env.globals['ip_badge'] = render_ip_badge
+
+
+@app.route('/api/ip-info/<ip>')
+def api_ip_info(ip):
+    """Reputation d'une seule IP en JSON — utilise en secours par le detecteur d'IP cote
+    client (voir linkifyIPsIn/flushIpLinkifyQueue dans base.html) si l'appel groupe
+    /api/ip-info-batch a echoue. Necessite une session connectee (avant_request global),
+    pas de restriction admin : c'est une simple consultation, comme les pages elles-memes."""
+    payload = ip_reputation_payload(ip)
+    if not payload:
+        return jsonify({'error': 'IP invalide ou reputation indisponible'}), 404
+    return jsonify(payload)
+
+
+@app.route('/api/ip-info-batch', methods=['POST'])
+def api_ip_info_batch():
+    """Reputation de plusieurs IPs en une seule requete — utilise par le detecteur d'IP
+    cote client pour colorer en un seul aller-retour toutes les IPs reperees dans du texte
+    libre (analyse IA, timeline, journal...) apres coup, sans les avoir fait passer par
+    ip_badge() cote serveur au moment du rendu. Plafonne a 50 IPs par appel."""
+    body = request.get_json(silent=True) or {}
+    ips = body.get('ips') or []
+    if not isinstance(ips, list):
+        return jsonify({'error': 'ips doit être une liste'}), 400
+    results = {}
+    for ip in ips[:50]:
+        payload = ip_reputation_payload(str(ip))
+        if payload:
+            results[str(ip)] = payload
+    return jsonify(results)
 
 
 def render_ip_reputation_label(ip):
@@ -5145,6 +5196,19 @@ def api_v1_boite_detail(bid):
     })
 
 
+@app.route('/api/v1/ip/<ip>')
+@require_api_key
+def api_v1_ip_reputation(ip):
+    """Reputation d'une IP (score d'abus, type d'usage, geolocalisation...) pour les
+    applications externes — meme donnee que la pastille affichee dans l'interface
+    (voir ip_reputation_payload), servie depuis le cache local (rafraichi toutes les
+    IP_REPUTATION_CACHE_HOURS heures) plutot que d'interroger AbuseIPDB a chaque appel."""
+    payload = ip_reputation_payload(ip)
+    if not payload:
+        return jsonify({'error': 'IP invalide ou réputation indisponible'}), 404
+    return jsonify(payload)
+
+
 @app.route('/api/v1/openapi.json')
 def api_v1_openapi():
     """Specification OpenAPI 3.0 de l'API externe (/api/v1/*), consommee par la page
@@ -5196,6 +5260,28 @@ def api_v1_openapi():
         'content': {'application/json': {'schema': {'type': 'object', 'properties': {
             'error': {'type': 'string'}}}}},
     }
+    ip_reputation_schema = {
+        'type': 'object',
+        'properties': {
+            'ip': {'type': 'string'},
+            'level': {'type': 'string', 'enum': ['green', 'orange', 'red']},
+            'level_label': {'type': 'string'},
+            'basis_label': {'type': 'string'},
+            'country': {'type': 'string'},
+            'city': {'type': 'string'},
+            'isp': {'type': 'string'},
+            'org': {'type': 'string'},
+            'asn': {'type': 'string'},
+            'hostname': {'type': 'string'},
+            'usage_type': {'type': 'string'},
+            'domain': {'type': 'string'},
+            'abuse_score': {'type': 'integer', 'nullable': True, 'minimum': 0, 'maximum': 100},
+            'total_reports': {'type': 'integer', 'nullable': True},
+            'is_whitelisted': {'type': 'boolean'},
+            'last_reported_at': {'type': 'string', 'nullable': True},
+            'is_vpn': {'type': 'boolean'},
+        }
+    }
 
     spec = {
         'openapi': '3.0.3',
@@ -5219,6 +5305,7 @@ def api_v1_openapi():
                 'MonitoredMailbox': mailbox_schema,
                 'Boite': boite_schema,
                 'BoiteDetail': boite_detail_schema,
+                'IpReputation': ip_reputation_schema,
             },
             'responses': {
                 'Unauthorized': error_response,
@@ -5272,6 +5359,17 @@ def api_v1_openapi():
                         '$ref': '#/components/schemas/BoiteDetail'}}}},
                     '401': {'$ref': '#/components/responses/Unauthorized'},
                     '404': {'description': 'Non trouvée'},
+                },
+            }},
+            '/ip/{ip}': {'get': {
+                'summary': "Réputation d'une IP (score d'abus, type d'usage, géolocalisation...)",
+                'operationId': 'getIpReputation',
+                'parameters': [{'name': 'ip', 'in': 'path', 'required': True, 'schema': {'type': 'string'}, 'example': '1.1.1.1'}],
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        '$ref': '#/components/schemas/IpReputation'}}}},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                    '404': {'description': 'IP invalide ou réputation indisponible'},
                 },
             }},
         },
