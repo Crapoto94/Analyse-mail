@@ -4,6 +4,17 @@ REM Se place d'abord dans le dossier du script, pour que ca fonctionne
 REM quel que soit l'endroit d'ou ce fichier est double-clique.
 cd /d "%~dp0"
 
+echo Verification des dependances Python (Flask, etc.)...
+python -m pip install -r requirements.txt --quiet --disable-pip-version-check
+if errorlevel 1 (
+    echo.
+    echo ECHEC de l'installation des dependances. Verifiez que Python et pip sont bien installes et accessibles.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
 echo Lancement de l'application...
 echo Une fois demarree, ouvrez votre navigateur sur : http://127.0.0.1:5050
 echo (Utilisez 127.0.0.1 plutot que "localhost" si la connexion est refusee.)
