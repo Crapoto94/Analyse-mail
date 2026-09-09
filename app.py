@@ -683,7 +683,7 @@ def get_graph_token(force_refresh=False):
     return token
 
 
-def graph_get_all(path, params=None, timeout=25, max_pages=25):
+def graph_get_all(path, params=None, timeout=30, max_pages=25, retries=1):
     """Effectue un GET sur Microsoft Graph avec pagination automatique (@odata.nextLink).
     `path` est soit un chemin relatif ('/organization'), soit une URL absolue.
 
@@ -692,10 +692,15 @@ def graph_get_all(path, params=None, timeout=25, max_pages=25):
       sa propre marge de tempo, plutot qu'un timeout global qui echouerait a coup sur.
     - `max_pages` protege contre une pagination incontrolee (ex: requete non filtree sur
       un tenant tres actif) : au-dela, on s'arrete et on retourne ce qui a deja ete recupere
-      plutot que de risquer un blocage tres long ou une consommation memoire excessive."""
+      plutot que de risquer un blocage tres long ou une consommation memoire excessive.
+    - `retries` : nombre de nouvelles tentatives PAR PAGE en cas de timeout/erreur reseau
+      ou de reponse Graph transitoire (429 limitation de debit, 503/504 indisponibilite) —
+      ces incidents sont frequemment ponctuels et une simple relance suffit generalement,
+      evitant de faire echouer tout un import pour un seul alea reseau."""
     import urllib.request
     import urllib.parse
     import urllib.error
+    import time as _time_mod
 
     token = get_graph_token()
     url = path if path.startswith('http') else 'https://graph.microsoft.com/v1.0' + path
@@ -711,14 +716,27 @@ def graph_get_all(path, params=None, timeout=25, max_pages=25):
             'Accept': 'application/json',
             'ConsistencyLevel': 'eventual',
         })
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if e.fp else str(e)
-            raise RuntimeError(f"Erreur Microsoft Graph (HTTP {e.code}) sur {url} : {error_body}")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise RuntimeError(f"Microsoft Graph n'a pas répondu à temps sur {url} : {e}")
+        attempt = 0
+        while True:
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    payload = json.loads(resp.read().decode('utf-8'))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 503, 504) and attempt < retries:
+                    retry_after = e.headers.get('Retry-After') if e.headers else None
+                    wait = float(retry_after) if retry_after and retry_after.strip().isdigit() else 2
+                    _time_mod.sleep(min(wait, 10))
+                    attempt += 1
+                    continue
+                error_body = e.read().decode('utf-8') if e.fp else str(e)
+                raise RuntimeError(f"Erreur Microsoft Graph (HTTP {e.code}) sur {url} : {error_body}")
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if attempt < retries:
+                    attempt += 1
+                    _time_mod.sleep(1)
+                    continue
+                raise RuntimeError(f"Microsoft Graph n'a pas répondu à temps sur {url} : {e}")
         if isinstance(payload, dict) and 'value' in payload:
             results.extend(payload['value'])
             url = payload.get('@odata.nextLink')
@@ -856,7 +874,10 @@ def fetch_signins_from_graph(boite_id, user_upn, days=30):
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
     upn_escaped = (user_upn or '').replace("'", "''")
     filter_q = f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}"
-    items = graph_get_all('/auditLogs/signIns', params={'$filter': filter_q, '$top': '999'})
+    # $top plus modeste (chaque page se genere plus vite cote Graph) et timeout genereux :
+    # cet import complet est declenche a la demande (pas dans la boucle de surveillance),
+    # on peut se permettre d'attendre un peu plus pour eviter un echec sur un simple alea.
+    items = graph_get_all('/auditLogs/signIns', params={'$filter': filter_q, '$top': '500'}, timeout=45)
 
     conn = get_db()
     existing = set(
@@ -899,7 +920,7 @@ def fetch_audit_from_graph(boite_id, user_upn, days=30):
     from datetime import datetime, timedelta, timezone
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    items = graph_get_all('/auditLogs/directoryAudits', params={'$filter': f'activityDateTime ge {since}', '$top': '999'})
+    items = graph_get_all('/auditLogs/directoryAudits', params={'$filter': f'activityDateTime ge {since}', '$top': '500'}, timeout=45)
 
     upn_lower = (user_upn or '').lower()
     relevant = []
