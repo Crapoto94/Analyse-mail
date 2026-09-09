@@ -23,8 +23,9 @@
             justify-content: center;
         }
         #global-loading-overlay.active { display: flex; }
-        .ip-rep-badge { text-decoration: none; font-size: 0.75em; letter-spacing: -1px; cursor: pointer; }
-        .ip-rep-badge:hover { opacity: 0.75; }
+        .ip-rep-badge { text-decoration: none; cursor: pointer; display: inline-block; vertical-align: middle; }
+        .ip-rep-badge:hover { opacity: 0.7; }
+        .ip-rep-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
     </style>
 </head>
 <body>
@@ -202,7 +203,7 @@ function showGlobalLoadingFatalError(err) {
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
-                    <div class="mb-3" id="ipInfoStars" style="font-size:1.3em;"></div>
+                    <div class="mb-3" id="ipInfoLevel" style="font-size:1.1em;"></div>
                     <table class="table table-sm">
                         <tbody>
                             <tr><th class="text-muted" style="width:45%;">Localisation</th><td id="ipInfoLocation">—</td></tr>
@@ -248,12 +249,11 @@ function showGlobalLoadingFatalError(err) {
 
             document.getElementById('ipInfoIp').textContent = info.ip || '';
 
-            var starsColor = info.stars >= 4 ? 'text-success' : (info.stars >= 3 ? 'text-warning' : 'text-danger');
-            var starsHtml = '';
-            for (var i = 0; i < 5; i++) {
-                starsHtml += '<i class="bi ' + (i < info.stars ? 'bi-star-fill' : 'bi-star') + '"></i>';
-            }
-            document.getElementById('ipInfoStars').innerHTML = '<span class="' + starsColor + '">' + starsHtml + '</span> <span class="text-muted" style="font-size:0.6em;">(' + info.stars + '/5)</span>';
+            var levelColors = {green: '#198754', orange: '#fd7e14', red: '#dc3545'};
+            var dotColor = levelColors[info.level] || '#6c757d';
+            document.getElementById('ipInfoLevel').innerHTML =
+                '<span class="ip-rep-dot" style="background-color:' + dotColor + ';"></span> ' +
+                '<strong>' + (info.level_label || '') + '</strong>';
 
             var location = [info.city, info.country].filter(Boolean).join(', ');
             setText('ipInfoLocation', location);

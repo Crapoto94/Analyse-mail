@@ -304,13 +304,20 @@ proxy_set_header X-Forwarded-Host $host;</pre>
             <div class="card-body">
                 <p class="text-muted small">
                     Chaque adresse IP affichée dans l'application (connexions, messages, journal d'audit...) est
-                    accompagnée d'une note de réputation de 1 à 5 étoiles, cliquable pour voir le détail (score
-                    d'abus, type d'usage — résidentiel, hébergeur/datacenter, mobile... — FAI, signalements...).
+                    accompagnée d'une pastille de réputation <span class="text-success">verte</span> /
+                    <span class="text-warning">orange</span> / <span class="text-danger">rouge</span>, cliquable pour voir
+                    le détail (score d'abus, type d'usage — résidentiel, hébergeur/datacenter, mobile... — FAI,
+                    signalements...). Seuils appliqués au score d'abus AbuseIPDB (0-100) : <strong>rouge à partir de
+                    75%</strong> (forte confiance d'abus), <strong>orange entre 25% et 74%</strong> (au moins un
+                    signalement, à vérifier), <strong>vert en dessous de 25%</strong>. Une IP identifiée comme
+                    hébergeur/datacenter ou VPN/proxy/Tor remonte au moins à l'orange même sans signalement — le type
+                    d'infrastructure est déjà un signal en contexte d'investigation.<br>
                     Ces données viennent de <a href="https://www.abuseipdb.com/" target="_blank">AbuseIPDB</a>
                     (clé gratuite sur <a href="https://www.abuseipdb.com/account/api" target="_blank">abuseipdb.com/account/api</a>,
-                    1000 requêtes/jour). <strong>Sans clé configurée</strong>, une estimation grossière est utilisée à la
-                    place (basée uniquement sur la détection heuristique VPN/proxy/Tor déjà utilisée ailleurs dans
-                    l'application) — nettement moins fiable, mais un affichage reste toujours proposé.
+                    1000 requêtes/jour — chaque IP est mise en cache 4h dans la base locale avant tout nouvel appel,
+                    pour ne pas dépasser ce quota). <strong>Sans clé configurée</strong>, une estimation grossière est
+                    utilisée à la place (détection heuristique VPN/proxy/Tor + mots-clés hébergeur/cloud déjà utilisée
+                    ailleurs dans l'application) — nettement moins fiable, mais un affichage reste toujours proposé.
                 </p>
                 <form method="POST">
                     <div class="mb-3">

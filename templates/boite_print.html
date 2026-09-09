@@ -66,7 +66,7 @@
         {% for info in ip_info_list %}
         <tr>
             <td>{{ info.ip }}</td>
-            <td>{{ ip_stars_plain(info.ip) }}</td>
+            <td>{{ ip_reputation_label(info.ip) }}</td>
             <td>{{ info.country }}</td>
             <td>{{ info.city }}</td>
             <td>{{ info.isp }}</td>
@@ -87,7 +87,7 @@
             <td>{{ msg.subject }}</td>
             <td><span class="badge {% if msg.status == 'Delivered' %}bg-success{% elif msg.status == 'Failed' %}bg-danger{% else %}bg-warning{% endif %}">{{ msg.status }}</span></td>
             <td>{{ msg.from_ip }}</td>
-            <td>{{ ip_stars_plain(msg.from_ip) }}</td>
+            <td>{{ ip_reputation_label(msg.from_ip) }}</td>
         </tr>
         {% endfor %}
     </table>

@@ -656,11 +656,13 @@ def get_ip_info(ip):
     return None
 
 
-# Duree de fraicheur du cache de reputation (en jours) : contrairement a la geolocalisation
+# Duree de fraicheur du cache de reputation (en heures) : contrairement a la geolocalisation
 # (get_ip_info, mise en cache indefiniment — une IP ne change pas de pays), la reputation
 # d'une IP evolue dans le temps (nouveaux signalements d'abus...), d'ou un rafraichissement
-# periodique plutot qu'un cache permanent.
-IP_REPUTATION_CACHE_DAYS = 7
+# periodique plutot qu'un cache permanent. Fixe a 4h pour ne pas surcharger le quota gratuit
+# d'AbuseIPDB (1000 requetes/jour) : chaque IP deja recherchee est servie depuis la base
+# locale (table ip_info) pendant 4h avant qu'un nouvel appel a l'API ne soit refait.
+IP_REPUTATION_CACHE_HOURS = 4
 
 # Types d'usage AbuseIPDB consideres comme non residentiels (hebergement/datacenter,
 # infrastructure...), un signal utile en investigation meme quand le score d'abus est bas :
@@ -672,34 +674,43 @@ IP_NON_RESIDENTIAL_USAGE_TYPES = {
 }
 
 
-def _compute_reputation_stars(abuse_score, usage_type, is_vpn_heuristic):
+# Seuils appliques au score d'abus AbuseIPDB (0-100, confiance qu'une IP soit malveillante)
+# pour la pastille verte/orange/rouge. Ce sont les seuils generalement recommandes par
+# AbuseIPDB elle-meme et repris par la plupart des integrations (SIEM, pare-feu...) :
+#   < 25  : vert   — pas de signalement significatif
+#   25-74 : orange — signalee au moins une fois, a verifier
+#   >= 75 : rouge  — forte confiance d'abus
+# Volontairement pas 90+ (seuil parfois utilise pour du blocage automatique reseau, donc
+# plus conservateur) : ici la pastille sert juste a attirer l'oeil pendant une
+# investigation, mieux vaut sur-signaler (faux positif visuel, sans consequence) que
+# rater une IP a 80% de confiance d'abus.
+IP_REPUTATION_RED_THRESHOLD = 75
+IP_REPUTATION_ORANGE_THRESHOLD = 25
+
+
+def _compute_reputation_level(abuse_score, usage_type, is_vpn_heuristic):
     """Convertit un score d'abus AbuseIPDB (0=aucun signalement, 100=confiance d'abus
-    maximale) en note de reputation 1 a 5 etoiles (5 = la plus fiable). Sans score
-    disponible (pas de cle configuree), retombe sur l'heuristique VPN/proxy/Tor + type
-    d'usage heuristique existante. Une IP d'hebergeur/datacenter ou detectee VPN/proxy
-    plafonne a 3 etoiles meme avec un score d'abus bas : le type d'infrastructure est en
-    soi un signal en contexte d'investigation de compromission, independamment des
-    signalements deja recus."""
+    maximale) en niveau vert/orange/rouge. Sans score disponible (pas de cle configuree),
+    retombe sur l'heuristique VPN/proxy/Tor + type d'usage heuristique existante. Une IP
+    d'hebergeur/datacenter ou detectee VPN/proxy est remontee au moins a l'orange meme
+    avec un score d'abus bas : le type d'infrastructure est en soi un signal en contexte
+    d'investigation de compromission, independamment des signalements deja recus."""
     non_residential = (usage_type or '').strip().lower() in IP_NON_RESIDENTIAL_USAGE_TYPES
 
     if abuse_score is None:
         # Pas de cle AbuseIPDB : estimation grossiere a partir du seul heuristique existant.
-        return (2, 'estimation') if (is_vpn_heuristic or non_residential) else (3, 'estimation')
+        return ('orange', 'estimation') if (is_vpn_heuristic or non_residential) else ('green', 'estimation')
 
-    if abuse_score >= 80:
-        stars = 1
-    elif abuse_score >= 50:
-        stars = 2
-    elif abuse_score >= 20:
-        stars = 3
-    elif abuse_score >= 1:
-        stars = 4
+    if abuse_score >= IP_REPUTATION_RED_THRESHOLD:
+        level = 'red'
+    elif abuse_score >= IP_REPUTATION_ORANGE_THRESHOLD:
+        level = 'orange'
     else:
-        stars = 5
+        level = 'green'
 
-    if (non_residential or is_vpn_heuristic) and stars > 3:
-        stars = 3
-    return (stars, 'abuseipdb')
+    if (non_residential or is_vpn_heuristic) and level == 'green':
+        level = 'orange'
+    return (level, 'abuseipdb')
 
 
 def _fetch_abuseipdb(ip, api_key):
@@ -723,10 +734,11 @@ def _fetch_abuseipdb(ip, api_key):
 
 def get_ip_reputation(ip):
     """Geolocalisation (get_ip_info, cache permanent) + reputation (score d'abus, type
-    d'usage — cache rafraichi tous les IP_REPUTATION_CACHE_DAYS jours) d'une IP. Utilise
-    AbuseIPDB si une cle est configuree (voir /config), sinon repli sur l'heuristique
-    VPN/proxy/Tor deja existante (champ is_vpn). Retourne un dict pret a afficher (geo +
-    reputation + note 1-5 etoiles), ou None si l'IP est vide/invalide."""
+    d'usage — servie depuis la base locale pendant IP_REPUTATION_CACHE_HOURS avant tout
+    nouvel appel a l'API) d'une IP. Utilise AbuseIPDB si une cle est configuree (voir
+    /config), sinon repli sur l'heuristique VPN/proxy/Tor deja existante (champ is_vpn).
+    Retourne un dict pret a afficher (geo + reputation + niveau vert/orange/rouge), ou None
+    si l'IP est vide/invalide."""
     ip = (ip or '').strip()
     if not ip:
         return None
@@ -741,8 +753,10 @@ def get_ip_reputation(ip):
     checked_at = info.get('reputation_checked_at')
     if checked_at:
         checked_dt = _parse_iso(checked_at)
-        if checked_dt and (datetime.now(timezone.utc).replace(tzinfo=None) - checked_dt).days < IP_REPUTATION_CACHE_DAYS:
-            needs_refresh = False
+        if checked_dt:
+            age_hours = (datetime.now(timezone.utc).replace(tzinfo=None) - checked_dt).total_seconds() / 3600
+            if age_hours < IP_REPUTATION_CACHE_HOURS:
+                needs_refresh = False
 
     if needs_refresh:
         api_key = get_config('abuseipdb_api_key', '').strip()
@@ -791,13 +805,16 @@ def get_ip_reputation(ip):
         conn.close()
         info = dict(row) if row else {**info, **update_fields}
 
-    stars, basis = _compute_reputation_stars(info.get('abuse_score'), info.get('usage_type'), bool(info.get('is_vpn')))
-    info['reputation_stars'] = stars
+    level, basis = _compute_reputation_level(info.get('abuse_score'), info.get('usage_type'), bool(info.get('is_vpn')))
+    info['reputation_level'] = level
     info['reputation_basis'] = basis
     return info
 
 
-STAR_COLOR_BY_RATING = {5: 'success', 4: 'success', 3: 'warning', 2: 'danger', 1: 'danger'}
+REPUTATION_LEVEL_COLOR = {'green': '#198754', 'orange': '#fd7e14', 'red': '#dc3545'}
+REPUTATION_LEVEL_LABELS = {
+    'green': 'Faible risque', 'orange': 'Risque modéré', 'red': 'Risque élevé',
+}
 REPUTATION_BASIS_LABELS = {
     'abuseipdb': 'AbuseIPDB',
     'abuseipdb_error': "AbuseIPDB (échec de la requête — dernière donnée connue)",
@@ -806,8 +823,8 @@ REPUTATION_BASIS_LABELS = {
 
 
 def render_ip_badge(ip):
-    """Fonction globale Jinja ({{ ip_badge(x) }}) : affiche une IP suivie d'une note de
-    reputation 1-5 etoiles cliquable, qui ouvre la modale de detail partagee (voir le
+    """Fonction globale Jinja ({{ ip_badge(x) }}) : affiche une IP suivie d'une pastille de
+    reputation verte/orange/rouge cliquable, qui ouvre la modale de detail partagee (voir le
     gestionnaire JS dans base.html) sans requete AJAX supplementaire — toutes les donnees
     sont deja embarquees dans l'attribut data-ip-info au moment du rendu de la page."""
     ip = (ip or '').strip()
@@ -823,16 +840,14 @@ def render_ip_badge(ip):
     if not info:
         return Markup(f'<code>{escape(ip)}</code>')
 
-    stars = info.get('reputation_stars') or 3
-    color = STAR_COLOR_BY_RATING.get(stars, 'secondary')
-    star_html = ''.join(
-        '<i class="bi bi-star-fill"></i>' if i < stars else '<i class="bi bi-star"></i>'
-        for i in range(5)
-    )
+    level = info.get('reputation_level') or 'orange'
+    color = REPUTATION_LEVEL_COLOR.get(level, '#6c757d')
+    label = REPUTATION_LEVEL_LABELS.get(level, level)
 
     payload = {
         'ip': ip,
-        'stars': stars,
+        'level': level,
+        'level_label': label,
         'basis_label': REPUTATION_BASIS_LABELS.get(info.get('reputation_basis'), info.get('reputation_basis') or ''),
         'country': info.get('country') or '',
         'city': info.get('city') or '',
@@ -852,18 +867,19 @@ def render_ip_badge(ip):
 
     return Markup(
         f'<span class="ip-badge text-nowrap"><code>{escape(ip)}</code> '
-        f'<a href="#" class="ip-rep-badge text-{color}" data-bs-toggle="modal" data-bs-target="#ipInfoModal" '
-        f'data-ip-info="{data_attr}" title="Réputation IP — cliquer pour le détail">{star_html}</a></span>'
+        f'<a href="#" class="ip-rep-badge" data-bs-toggle="modal" data-bs-target="#ipInfoModal" '
+        f'data-ip-info="{data_attr}" title="{escape(label)} — cliquer pour le détail">'
+        f'<span class="ip-rep-dot" style="background-color:{color};"></span></a></span>'
     )
 
 
 app.jinja_env.globals['ip_badge'] = render_ip_badge
 
 
-def render_ip_stars_plain(ip):
-    """Variante texte brut (pas de HTML/JS) de la note de reputation d'une IP, pour les
-    contextes ou une modale n'a pas de sens (export/impression). Renvoie une chaine du
-    style '★★★☆☆' (sur 5), ou une chaine vide si l'IP est vide."""
+def render_ip_reputation_label(ip):
+    """Variante texte brut (pas de HTML/JS) de la reputation d'une IP, pour les contextes
+    ou une modale/pastille n'a pas de sens (export/impression). Renvoie un libelle du style
+    'Faible risque', ou une chaine vide si l'IP est vide."""
     ip = (ip or '').strip()
     if not ip:
         return ''
@@ -871,11 +887,11 @@ def render_ip_stars_plain(ip):
         info = get_ip_reputation(ip)
     except Exception:
         info = None
-    stars = (info or {}).get('reputation_stars') or 0
-    return '★' * stars + '☆' * (5 - stars)
+    level = (info or {}).get('reputation_level')
+    return REPUTATION_LEVEL_LABELS.get(level, '')
 
 
-app.jinja_env.globals['ip_stars_plain'] = render_ip_stars_plain
+app.jinja_env.globals['ip_reputation_label'] = render_ip_reputation_label
 
 
 def check_spf_dkim_dmarc(domain):
