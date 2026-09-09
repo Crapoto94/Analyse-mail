@@ -41,7 +41,7 @@
         {% else %}
         <div class="alert alert-secondary mb-0">
             <i class="bi bi-info-circle"></i> Nécessite la configuration Microsoft Graph.
-            <a href="{{ url_for('config') }}">Configurer maintenant</a>.
+            {% if session.get('role') == 'admin' %}<a href="{{ url_for('config') }}">Configurer maintenant</a>.{% else %}Demandez à un administrateur de la renseigner.{% endif %}
         </div>
         {% endif %}
     </div>

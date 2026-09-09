@@ -149,8 +149,8 @@
                             {% else %}<span class="text-muted">-</span>{% endif %}
                         </td>
                         <td>
-                            {% if m.last_scan_verdict == 'compromise_likely' %}<span class="text-danger small"><i class="bi bi-exclamation-octagon-fill"></i> Compromission probable</span>
-                            {% elif m.last_scan_verdict == 'signals_to_check' %}<span class="text-warning small"><i class="bi bi-exclamation-triangle-fill"></i> À vérifier</span>
+                            {% if m.last_scan_verdict == 'compromise_likely' %}<span class="text-danger small" {% if m.last_scan_findings_summary %}title="{{ m.last_scan_findings_summary }}"{% endif %}><i class="bi bi-exclamation-octagon-fill"></i> Compromission probable</span>
+                            {% elif m.last_scan_verdict == 'signals_to_check' %}<span class="text-warning small" {% if m.last_scan_findings_summary %}title="{{ m.last_scan_findings_summary }}"{% endif %}><i class="bi bi-exclamation-triangle-fill"></i> À vérifier</span>
                             {% elif m.last_scan_verdict == 'no_strong_signal' %}<span class="text-success small"><i class="bi bi-check-circle-fill"></i> RAS</span>
                             {% else %}<span class="text-muted small">-</span>{% endif %}
                             {% set m_err = m.last_error|friendly_graph_error %}

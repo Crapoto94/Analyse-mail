@@ -423,11 +423,18 @@ def init_db():
         last_scan_score INTEGER,
         last_scan_verdict TEXT,
         last_scan_findings_count INTEGER,
+        last_scan_findings_summary TEXT,
         last_error TEXT,
         created_by TEXT,
         source_pattern_id INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+
+    # Migration: ajouter la colonne last_scan_findings_summary si elle n'existe pas
+    try:
+        c.execute('ALTER TABLE monitored_mailboxes ADD COLUMN last_scan_findings_summary TEXT')
+    except Exception:
+        pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS monitoring_patterns (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2563,10 +2570,17 @@ def run_monitoring_scan(mailbox_row):
         result = quick_scan_mailbox(email, days=MONITORING_SCAN_WINDOW_DAYS)
         partial_note = ('Scan partiel : ' + ' / '.join(result['errors'])) if result.get('errors') else None
 
+        findings = result['findings']
+        max_shown = 8
+        findings_summary = ' | '.join(f"[{f['severity'].upper()}] {f['title']}" for f in findings[:max_shown]) or None
+        if findings_summary and len(findings) > max_shown:
+            findings_summary += f' | (+{len(findings) - max_shown} autre(s))'
+
         conn.execute('''UPDATE monitored_mailboxes SET
-            last_scan_at=?, last_scan_score=?, last_scan_verdict=?, last_scan_findings_count=?, last_error=?
+            last_scan_at=?, last_scan_score=?, last_scan_verdict=?, last_scan_findings_count=?,
+            last_scan_findings_summary=?, last_error=?
             WHERE id=?''',
-            (now_iso, result['score'], result['verdict'], len(result['findings']), partial_note, mailbox_row['id']))
+            (now_iso, result['score'], result['verdict'], len(findings), findings_summary, partial_note, mailbox_row['id']))
         conn.commit()
 
         level = 'WARNING' if (result['score'] >= 6 or partial_note) else 'INFO'
@@ -3399,6 +3413,7 @@ def compare_boites():
     return render_template('compare.html', comparisons=comparisons)
 
 @app.route('/config', methods=['GET', 'POST'])
+@admin_required
 def config():
     if request.method == 'POST':
         if 'custom_message' in request.form:
@@ -3447,6 +3462,7 @@ def config():
         microsoft_redirect_uri=url_for('microsoft_callback', _external=True))
 
 @app.route('/api/test-graph')
+@admin_required
 def test_api_graph():
     try:
         get_graph_token(force_refresh=True)
@@ -3457,6 +3473,7 @@ def test_api_graph():
         return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/test-ville')
+@admin_required
 def test_api_ville():
     import urllib.request
     token = get_config('api_ville_token', '')
@@ -3493,6 +3510,7 @@ def test_api_ville():
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
 
 @app.route('/api/test-send')
+@admin_required
 def test_send_email():
     import urllib.request
     token = get_config('api_ville_token', '')
@@ -3542,6 +3560,7 @@ def test_send_email():
         return jsonify({'success': False, 'error': str(e), 'url': api_url.rstrip('/') + '/api/v1/mail/send'})
 
 @app.route('/api/test-send-custom', methods=['POST'])
+@admin_required
 def test_send_custom():
     import urllib.request
     

@@ -153,10 +153,12 @@
                     <button type="submit" class="btn btn-sm btn-dark">
                         <i class="bi bi-cloud-download"></i> Récupérer
                     </button>
-                    {% else %}
+                    {% elif session.get('role') == 'admin' %}
                     <a href="{{ url_for('config') }}" class="btn btn-sm btn-outline-dark">
                         <i class="bi bi-gear"></i> À configurer
                     </a>
+                    {% else %}
+                    <span class="btn btn-sm btn-outline-dark disabled">Non configuré</span>
                     {% endif %}
                 </form>
                 <small class="text-muted d-block mt-1">Connexions, audit et règles de messagerie de <strong>{{ boite.user_email }}</strong> directement via l'API.</small>
