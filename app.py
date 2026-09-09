@@ -2250,7 +2250,9 @@ def _call_openai_compatible_chat(api_url, api_key, model, prompt, timeout, provi
         'model': model,
         'messages': [{'role': 'user', 'content': prompt}],
         'temperature': 0.3,
-        'max_tokens': 2000,
+        # 2000 coupait parfois la reponse avant la fin (ex: section recommandations
+        # manquante) sur une analyse structuree en 4 parties — marge portee a 4000.
+        'max_tokens': 4000,
     }).encode('utf-8')
 
     req = urllib.request.Request(
@@ -2281,7 +2283,13 @@ def _call_openai_compatible_chat(api_url, api_key, model, prompt, timeout, provi
     choices = data.get('choices') or []
     if not choices:
         raise RuntimeError(f'Réponse {provider_label} vide (aucun choix retourné)')
-    return choices[0]['message']['content']
+    choice = choices[0]
+    content = choice['message']['content']
+    if choice.get('finish_reason') == 'length':
+        content += ("\n\n---\n⚠️ **Réponse tronquée** : la limite de longueur de réponse a été atteinte "
+                     "avant la fin (une section, probablement les recommandations, peut manquer). "
+                     "Relancez l'analyse si besoin.")
+    return content
 
 
 def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
@@ -3772,6 +3780,27 @@ def config():
         nvidia_model=get_config('nvidia_model', ''),
         nvidia_default_model=NVIDIA_DEFAULT_MODEL,
         groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE)
+
+@app.route('/api/diag/proxy-headers')
+@admin_required
+def diag_proxy_headers():
+    """Diagnostic pour les problemes de reverse proxy (ex: AADSTS50011 avec une URI de
+    redirection en http:// alors que l'acces se fait en https://) : affiche exactement ce
+    que Flask/ProxyFix voient de la requete en cours, pour distinguer "l'en-tete
+    X-Forwarded-Proto n'arrive pas du tout" (probleme cote reverse proxy) de "l'en-tete
+    arrive mais le schema calcule reste http" (ProxyFix absent/mal configure, ou code non
+    a jour dans le conteneur deploye — la simple existence de cette route en est deja un
+    indice, une version anterieure du code n'aurait pas cette route)."""
+    return jsonify({
+        'computed_scheme (request.scheme)': request.scheme,
+        'computed_redirect_uri_example': url_for('microsoft_callback', _external=True),
+        'wsgi.url_scheme': request.environ.get('wsgi.url_scheme'),
+        'header_Host': request.headers.get('Host'),
+        'header_X-Forwarded-Proto': request.headers.get('X-Forwarded-Proto'),
+        'header_X-Forwarded-Host': request.headers.get('X-Forwarded-Host'),
+        'header_X-Forwarded-For': request.headers.get('X-Forwarded-For'),
+        'remote_addr': request.remote_addr,
+    })
 
 @app.route('/api/test-graph')
 @admin_required

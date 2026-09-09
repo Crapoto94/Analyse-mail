@@ -4,6 +4,20 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
+<style>
+.ai-analysis-md h1, .ai-analysis-md h2, .ai-analysis-md h3 { font-size: 1.1rem; font-weight: 600; margin-top: 1rem; margin-bottom: 0.5rem; }
+.ai-analysis-md h1:first-child, .ai-analysis-md h2:first-child, .ai-analysis-md h3:first-child { margin-top: 0; }
+.ai-analysis-md p { margin-bottom: 0.75rem; }
+.ai-analysis-md ul, .ai-analysis-md ol { margin-bottom: 0.75rem; padding-left: 1.5rem; }
+.ai-analysis-md table { width: 100%; margin-bottom: 1rem; border-collapse: collapse; font-size: 0.9rem; }
+.ai-analysis-md table th, .ai-analysis-md table td { border: 1px solid #dee2e6; padding: 0.4rem 0.6rem; }
+.ai-analysis-md table th { background-color: #f8f9fa; }
+.ai-analysis-md code { background-color: #f1f1f1; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.9em; }
+.ai-analysis-md pre { background-color: #f8f9fa; padding: 0.75rem; border-radius: 4px; overflow-x: auto; }
+.ai-analysis-md blockquote { border-left: 3px solid #ffc107; padding-left: 0.75rem; color: #6c757d; }
+</style>
 
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h1><i class="bi bi-envelope-exclamation"></i> {{ boite.user_email }}</h1>
@@ -89,7 +103,20 @@
             Générée le {{ boite.ai_analysis_at|paris }} via <strong>{{ boite.ai_analysis_provider or 'Groq' }}</strong>, modèle <code>{{ boite.ai_analysis_model }}</code>.
             <span class="text-warning"><i class="bi bi-exclamation-triangle"></i> Analyse générée par une IA à partir des données déjà collectées — à vérifier avant toute décision.</span>
         </p>
-        <div style="white-space: pre-wrap;">{{ boite.ai_analysis }}</div>
+        <div id="ai-analysis-content" class="ai-analysis-md"></div>
+        <script>
+        (function() {
+            var raw = {{ boite.ai_analysis|tojson }};
+            var el = document.getElementById('ai-analysis-content');
+            if (window.marked && window.DOMPurify) {
+                el.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+            } else {
+                // Repli si les librairies CDN n'ont pas pu charger : au moins garder la mise en forme du texte brut
+                el.style.whiteSpace = 'pre-wrap';
+                el.textContent = raw;
+            }
+        })();
+        </script>
         {% elif ai_configured %}
         <p class="text-muted mb-0">
             <i class="bi bi-info-circle"></i> Aucune analyse IA n'a encore été générée pour cette boîte. L'IA recevra les
