@@ -148,7 +148,12 @@ function showGlobalLoadingFatalError(err) {
         <a class="navbar-brand" href="{{ url_for('index') }}">
             <i class="bi bi-shield-exclamation"></i> Analyse Compromission
         </a>
-        <div class="navbar-nav ms-auto">
+        {% if session.get('user_id') %}
+        <form method="GET" action="{{ url_for('global_search') }}" class="d-none d-md-flex ms-auto me-3" style="max-width:320px;">
+            <input type="text" name="q" class="form-control form-control-sm" placeholder="Rechercher email, IP..." value="{{ request.args.get('q', '') }}">
+        </form>
+        {% endif %}
+        <div class="navbar-nav {% if not session.get('user_id') %}ms-auto{% endif %}">
             {% if session.get('user_id') %}
             <div class="nav-item dropdown">
                 <a class="nav-link text-white dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
@@ -166,6 +171,7 @@ function showGlobalLoadingFatalError(err) {
                     <li><a class="dropdown-item" href="{{ url_for('list_trusted_ips') }}"><i class="bi bi-patch-check"></i> IPs de confiance</a></li>
                     <li><hr class="dropdown-divider"></li>
                     {% endif %}
+                    <li><a class="dropdown-item d-md-none" href="{{ url_for('global_search') }}"><i class="bi bi-search"></i> Recherche</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('change_password') }}"><i class="bi bi-shield-lock"></i> Changer mon mot de passe</a></li>
                     <li>
                         <form method="POST" action="{{ url_for('logout') }}">

@@ -2045,6 +2045,59 @@ def index():
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     return render_template('index.html', boites=boites, stats=stats, graph_configured=graph_configured)
 
+
+@app.route('/search')
+def global_search():
+    """Recherche transverse (email, IP, sujet, application...) a travers TOUTES les boites
+    d'incident, sans avoir a ouvrir chacune une par une — utile par exemple pour savoir si
+    une IP ou un destinataire donne apparait ailleurs que sur la boite en cours
+    d'investigation. Requetes LIKE simples (pas d'index plein texte) : largement suffisant
+    au volume de donnees d'une investigation de securite, mais chaque categorie est
+    plafonnee pour rester rapide meme sur une base volumineuse."""
+    q = (request.args.get('q') or '').strip()
+    results = {'boites': [], 'messages': [], 'signins': [], 'audit': [], 'monitored': []}
+    if not q or len(q) < 2:
+        return render_template('search_results.html', q=q, results=results, too_short=bool(q))
+
+    like = f'%{q}%'
+    conn = get_db()
+
+    results['boites'] = conn.execute('''
+        SELECT id, user_email, date_compromission, date_decouverte, created_at
+        FROM boites_compromises
+        WHERE user_email LIKE ? OR notes LIKE ?
+        ORDER BY created_at DESC LIMIT 50''', (like, like)).fetchall()
+
+    results['messages'] = conn.execute('''
+        SELECT m.id, m.boite_id, b.user_email AS boite_email, m.received, m.sender_address,
+               m.recipient_address, m.subject, m.from_ip
+        FROM messages m JOIN boites_compromises b ON b.id = m.boite_id
+        WHERE m.recipient_address LIKE ? OR m.sender_address LIKE ? OR m.subject LIKE ? OR m.from_ip LIKE ?
+        ORDER BY m.received DESC LIMIT 50''', (like, like, like, like)).fetchall()
+
+    results['signins'] = conn.execute('''
+        SELECT s.id, s.boite_id, b.user_email AS boite_email, s.date_utc, s.user_upn,
+               s.ip_address, s.application, s.status
+        FROM signin_logs s JOIN boites_compromises b ON b.id = s.boite_id
+        WHERE s.user_upn LIKE ? OR s.ip_address LIKE ? OR s.application LIKE ?
+        ORDER BY s.date_utc DESC LIMIT 50''', (like, like, like)).fetchall()
+
+    results['audit'] = conn.execute('''
+        SELECT a.id, a.boite_id, b.user_email AS boite_email, a.date_utc, a.activite,
+               a.actor_upn, a.target_upn, a.ip_address
+        FROM audit_logs a JOIN boites_compromises b ON b.id = a.boite_id
+        WHERE a.actor_upn LIKE ? OR a.target_upn LIKE ? OR a.ip_address LIKE ? OR a.activite LIKE ?
+        ORDER BY a.date_utc DESC LIMIT 50''', (like, like, like, like)).fetchall()
+
+    results['monitored'] = conn.execute('''
+        SELECT id, user_email, is_active, last_scan_score, last_scan_verdict
+        FROM monitored_mailboxes WHERE user_email LIKE ? ORDER BY user_email LIMIT 50''', (like,)).fetchall()
+
+    conn.close()
+    total = sum(len(v) for v in results.values())
+    return render_template('search_results.html', q=q, results=results, total=total, too_short=False)
+
+
 @app.route('/boite/add', methods=['GET', 'POST'])
 def add_boite():
     if request.method == 'POST':

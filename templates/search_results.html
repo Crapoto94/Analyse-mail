@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}Recherche{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-search"></i> Recherche</h1>
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Accueil
+    </a>
+</div>
+
+<form method="GET" action="{{ url_for('global_search') }}" class="mb-4">
+    <div class="input-group">
+        <input type="text" class="form-control form-control-lg" name="q" value="{{ q }}"
+               placeholder="Email, IP, sujet, application..." autofocus>
+        <button class="btn btn-primary" type="submit"><i class="bi bi-search"></i> Rechercher</button>
+    </div>
+    <div class="form-text">Recherche à travers toutes les boîtes d'incident : emails, IPs, sujets de messages, applications, activités du journal d'audit...</div>
+</form>
+
+{% if too_short %}
+<div class="alert alert-warning">Saisissez au moins 2 caractères.</div>
+{% elif q %}
+<p class="text-muted">{{ total }} résultat(s) pour « {{ q }} »</p>
+
+{% if results.boites %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-folder2-open"></i> Incidents ({{ results.boites|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm">
+                <thead><tr><th>Boîte</th><th>Date compromission</th><th>Date découverte</th><th></th></tr></thead>
+                <tbody>
+                    {% for b in results.boites %}
+                    <tr>
+                        <td>{{ b.user_email }}</td>
+                        <td><small class="text-muted">{{ b.date_compromission or '—' }}</small></td>
+                        <td><small class="text-muted">{{ b.date_decouverte or '—' }}</small></td>
+                        <td><a href="{{ url_for('view_boite', bid=b.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if results.monitored %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-eye"></i> Boîtes surveillées ({{ results.monitored|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm">
+                <thead><tr><th>Boîte</th><th>Statut</th><th>Dernier score</th><th></th></tr></thead>
+                <tbody>
+                    {% for m in results.monitored %}
+                    <tr>
+                        <td>{{ m.user_email }}</td>
+                        <td>{% if m.is_active %}<span class="badge bg-success">Active</span>{% else %}<span class="badge bg-secondary">Inactive</span>{% endif %}</td>
+                        <td><small class="text-muted">{{ m.last_scan_score if m.last_scan_score is not none else '—' }}{% if m.last_scan_score is not none %}/10{% endif %}</small></td>
+                        <td><a href="{{ url_for('view_monitoring') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if results.messages %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-envelope"></i> Messages ({{ results.messages|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
+            <table class="table table-hover table-sm">
+                <thead><tr><th>Boîte</th><th>Date</th><th>De</th><th>Vers</th><th>Sujet</th><th>IP</th></tr></thead>
+                <tbody>
+                    {% for m in results.messages %}
+                    <tr>
+                        <td><a href="{{ url_for('view_boite', bid=m.boite_id) }}">{{ m.boite_email }}</a></td>
+                        <td><small class="text-muted">{{ m.received|paris if m.received else '' }}</small></td>
+                        <td><small>{{ m.sender_address }}</small></td>
+                        <td><small>{{ m.recipient_address }}</small></td>
+                        <td><small>{{ m.subject }}</small></td>
+                        <td><small>{{ ip_badge(m.from_ip) }}</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if results.signins %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-box-arrow-in-right"></i> Connexions ({{ results.signins|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
+            <table class="table table-hover table-sm">
+                <thead><tr><th>Boîte</th><th>Date</th><th>Utilisateur</th><th>IP</th><th>Application</th><th>Statut</th></tr></thead>
+                <tbody>
+                    {% for s in results.signins %}
+                    <tr>
+                        <td><a href="{{ url_for('view_boite', bid=s.boite_id) }}">{{ s.boite_email }}</a></td>
+                        <td><small class="text-muted">{{ s.date_utc|paris if s.date_utc else '' }}</small></td>
+                        <td><small>{{ s.user_upn }}</small></td>
+                        <td><small>{{ ip_badge(s.ip_address) }}</small></td>
+                        <td><small>{{ s.application }}</small></td>
+                        <td><span class="badge bg-{% if s.status == 'Success' %}success{% else %}danger{% endif %}">{{ s.status }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if results.audit %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-journal-text"></i> Journal d'audit ({{ results.audit|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
+            <table class="table table-hover table-sm">
+                <thead><tr><th>Boîte</th><th>Date</th><th>Activité</th><th>Acteur</th><th>Cible</th><th>IP</th></tr></thead>
+                <tbody>
+                    {% for a in results.audit %}
+                    <tr>
+                        <td><a href="{{ url_for('view_boite', bid=a.boite_id) }}">{{ a.boite_email }}</a></td>
+                        <td><small class="text-muted">{{ a.date_utc|paris if a.date_utc else '' }}</small></td>
+                        <td><small>{{ a.activite }}</small></td>
+                        <td><small>{{ a.actor_upn }}</small></td>
+                        <td><small>{{ a.target_upn }}</small></td>
+                        <td><small>{{ ip_badge(a.ip_address) }}</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if total == 0 %}
+<div class="alert alert-info"><i class="bi bi-info-circle"></i> Aucun résultat.</div>
+{% endif %}
+{% endif %}
+{% endblock %}
