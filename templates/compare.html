@@ -3,9 +3,14 @@
 {% block content %}
 <h1 class="mb-4"><i class="bi bi-arrow-left-right"></i> Comparaison des boîtes compromises</h1>
 
-<a href="{{ url_for('index') }}" class="btn btn-secondary mb-3">
-    <i class="bi bi-arrow-left"></i> Retour
-</a>
+<div class="d-flex gap-2 mb-3">
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Retour
+    </a>
+    <a href="{{ url_for('cross_timeline') }}" class="btn btn-outline-primary">
+        <i class="bi bi-diagram-3"></i> Timeline croisée (connexions/audit)
+    </a>
+</div>
 
 {% if comparisons %}
     {% for comp in comparisons %}

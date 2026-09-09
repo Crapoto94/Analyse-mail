@@ -1441,6 +1441,111 @@ def build_unified_timeline(boite_id):
     return build_timeline_events(signins, audits)
 
 
+def build_cross_timeline(boite_ids):
+    """Fusionne les timelines de plusieurs boites en une seule, chaque evenement etant
+    tague avec son origine (boite_id/boite_label), pour reperer une activite correlee
+    entre comptes (meme IP, meme cible de transfert, enchainement rapide d'un compte
+    a l'autre...). Retourne (events, boites) ou boites = {id: sqlite3.Row}."""
+    if not boite_ids:
+        return [], {}
+    conn = get_db()
+    placeholders = ','.join('?' * len(boite_ids))
+    boites = {b['id']: b for b in conn.execute(
+        f'SELECT * FROM boites_compromises WHERE id IN ({placeholders})', boite_ids).fetchall()}
+    conn.close()
+
+    all_events = []
+    for bid in boite_ids:
+        boite = boites.get(bid)
+        label = boite['user_email'] if boite else f'Boîte #{bid}'
+        for e in build_unified_timeline(bid):
+            e['boite_id'] = bid
+            e['boite_label'] = label
+            all_events.append(e)
+    all_events.sort(key=lambda e: e['timestamp'] or '')
+    return all_events, boites
+
+
+def analyze_cross_boite_signals(events, boites, boite_ids):
+    """Detecte des correlations ENTRE plusieurs boites, en plus de l'analyse individuelle
+    de chacune : adresse IP reussie partagee entre comptes, meme cible de transfert
+    externe configuree sur plusieurs boites, connexions quasi simultanees depuis la
+    meme IP sur des comptes differents (mouvement lateral potentiel)."""
+    findings = []
+
+    # 1) IP partagee entre plusieurs boites pour des connexions reussies
+    ip_to_boites = {}
+    for e in events:
+        if e['type'] == 'signin' and e['success'] and e.get('ip'):
+            ip_to_boites.setdefault(e['ip'], set()).add(e['boite_id'])
+    for ip, bids in ip_to_boites.items():
+        if len(bids) > 1:
+            labels = sorted(boites[b]['user_email'] for b in bids if b in boites)
+            findings.append({
+                'severity': 'high',
+                'title': 'Adresse IP partagée entre plusieurs boîtes',
+                'description': (f"L'IP {ip} a servi à des connexions réussies sur {len(bids)} boîtes différentes : "
+                                 f"{', '.join(labels)}. Signal fort d'une source d'attaque commune "
+                                 f"(à défaut d'un poste ou VPN d'entreprise partagé légitime, à vérifier)."),
+                'events': [],
+            })
+
+    # 2) Connexions quasi simultanees (< 30 min) depuis la meme IP sur des comptes differents
+    #    = mouvement lateral potentiel (identifiants multiples compromis depuis la meme source)
+    by_ip = {}
+    for e in events:
+        if e['type'] == 'signin' and e['success'] and e.get('ip') and e['dt']:
+            by_ip.setdefault(e['ip'], []).append(e)
+    seen_pairs = set()
+    for ip, ip_events in by_ip.items():
+        ip_events.sort(key=lambda e: e['dt'])
+        for i in range(len(ip_events) - 1):
+            a, b = ip_events[i], ip_events[i + 1]
+            if a['boite_id'] == b['boite_id']:
+                continue
+            delta = (b['dt'] - a['dt']).total_seconds()
+            if 0 <= delta <= 1800:
+                pair_key = (ip, min(a['boite_id'], b['boite_id']), max(a['boite_id'], b['boite_id']))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                findings.append({
+                    'severity': 'critical',
+                    'title': 'Bascule rapide entre comptes depuis la même IP',
+                    'description': (f"Connexion réussie sur {a['boite_label']} à {a['timestamp']}, puis sur "
+                                     f"{b['boite_label']} à {b['timestamp']} ({int(delta // 60)} min d'écart) — toutes deux "
+                                     f"depuis {ip}. Évoque un mouvement latéral avec plusieurs comptes compromis depuis la même source."),
+                    'events': [],
+                })
+
+    # 3) Meme cible de transfert externe configuree sur plusieurs boites (regles suspectes)
+    conn = get_db()
+    placeholders = ','.join('?' * len(boite_ids))
+    rules = conn.execute(
+        f"SELECT * FROM mailbox_rules WHERE boite_id IN ({placeholders}) AND is_suspicious='true'", boite_ids).fetchall()
+    conn.close()
+    target_to_boites = {}
+    for r in rules:
+        for t in (r['forwards_to'] or '').split(','):
+            t = t.strip()
+            if t:
+                target_to_boites.setdefault(t, set()).add(r['boite_id'])
+    for target, bids in target_to_boites.items():
+        if len(bids) > 1:
+            labels = sorted(boites[b]['user_email'] for b in bids if b in boites)
+            findings.append({
+                'severity': 'critical',
+                'title': 'Même adresse de transfert utilisée par plusieurs boîtes',
+                'description': (f"Une règle de transfert vers {target} est configurée sur {len(bids)} boîtes : "
+                                 f"{', '.join(labels)}. Schéma typique d'une exfiltration coordonnée par un même attaquant."),
+                'events': [],
+            })
+
+    severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+    findings.sort(key=lambda f: severity_order.get(f['severity'], 9))
+    return findings
+
+
 def compute_risk_score(findings):
     """Convertit la liste de findings (issus de analyze_compromise_events) en un score
     de risque de compromission sur 10, a partir de la severite de chaque signal.
@@ -1770,6 +1875,34 @@ def view_timeline(bid):
 
     analysis = analyze_compromise(bid)
     return render_template('timeline.html', boite=boite, **analysis)
+
+
+# Palette de couleurs stable pour distinguer les boites sur la timeline croisee
+CROSS_TIMELINE_COLORS = ['#0d6efd', '#dc3545', '#198754', '#fd7e14', '#6f42c1', '#20c997', '#d63384', '#0dcaf0']
+
+
+@app.route('/timeline/cross', methods=['GET', 'POST'])
+def cross_timeline():
+    conn = get_db()
+    all_boites = conn.execute('SELECT id, user_email FROM boites_compromises ORDER BY user_email').fetchall()
+    conn.close()
+
+    if request.method == 'POST':
+        selected_ids = sorted(set(int(i) for i in request.form.getlist('boite_ids') if i.isdigit()))
+    else:
+        ids_param = request.args.get('ids', '')
+        selected_ids = sorted(set(int(i) for i in ids_param.split(',') if i.strip().isdigit()))
+
+    events, findings, boites, colors = None, None, None, {}
+    if len(selected_ids) >= 2:
+        events, boites = build_cross_timeline(selected_ids)
+        findings = analyze_cross_boite_signals(events, boites, selected_ids)
+        colors = {bid: CROSS_TIMELINE_COLORS[i % len(CROSS_TIMELINE_COLORS)] for i, bid in enumerate(selected_ids)}
+    elif request.method == 'POST':
+        flash('Sélectionnez au moins 2 boîtes pour croiser leurs timelines')
+
+    return render_template('cross_timeline.html', all_boites=all_boites, selected_ids=selected_ids,
+                         events=events, findings=findings, boites=boites, colors=colors)
 
 
 @app.route('/boite/<int:bid>/signins')

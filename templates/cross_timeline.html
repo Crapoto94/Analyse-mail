@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}Timeline croisée{% endblock %}
+{% block content %}
+<style>
+    .tl { position: relative; margin-left: 10px; padding-left: 30px; border-left: 3px solid #dee2e6; }
+    .tl-item { position: relative; margin-bottom: 1.1rem; }
+    .tl-item::before {
+        content: ''; position: absolute; left: -37px; top: 4px; width: 14px; height: 14px;
+        border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 2px #adb5bd; background: #adb5bd;
+    }
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-diagram-3"></i> Timeline croisée (plusieurs boîtes)</h1>
+    <a href="{{ url_for('compare_boites') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Comparaison
+    </a>
+</div>
+
+<p class="text-muted">
+    Fusionne les connexions et le journal d'audit de plusieurs boîtes sur une seule chronologie, pour repérer une
+    activité corrélée entre comptes : même adresse IP utilisée sur plusieurs boîtes, bascule rapide d'un compte à
+    l'autre, même destination de transfert configurée sur plusieurs boîtes...
+</p>
+
+<div class="card mb-4">
+    <div class="card-header">Sélectionner les boîtes à croiser</div>
+    <div class="card-body">
+        {% if not all_boites %}
+        <div class="alert alert-info mb-0">Aucune boîte enregistrée.</div>
+        {% else %}
+        <form method="POST">
+            <div class="row mb-3">
+                {% for b in all_boites %}
+                <div class="col-md-4 col-lg-3 mb-2">
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" name="boite_ids" value="{{ b.id }}" id="b{{ b.id }}"
+                               {% if b.id in selected_ids %}checked{% endif %}>
+                        <label class="form-check-label" for="b{{ b.id }}">{{ b.user_email }}</label>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            <button type="submit" class="btn btn-primary">
+                <i class="bi bi-diagram-3"></i> Croiser les timelines
+            </button>
+        </form>
+        {% endif %}
+    </div>
+</div>
+
+{% if events is not none %}
+    {% if findings %}
+    <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-search"></i> Corrélations détectées entre boîtes ({{ findings|length }})</div>
+        <div class="card-body">
+            {% for f in findings %}
+            <div class="alert mb-2 {% if f.severity == 'critical' %}alert-danger{% elif f.severity == 'high' %}alert-warning{% else %}alert-secondary{% endif %}">
+                <strong>
+                    {% if f.severity == 'critical' %}<span class="badge bg-danger">CRITIQUE</span>
+                    {% elif f.severity == 'high' %}<span class="badge bg-warning text-dark">ÉLEVÉ</span>
+                    {% else %}<span class="badge bg-secondary">À VÉRIFIER</span>{% endif %}
+                    {{ f.title }}
+                </strong>
+                <div class="small mt-1">{{ f.description }}</div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% else %}
+    <div class="alert alert-success">
+        <i class="bi bi-check-circle"></i> Aucune corrélation évidente détectée entre ces boîtes (IP partagée, transfert commun...).
+    </div>
+    {% endif %}
+
+    <div class="card mb-4">
+        <div class="card-header">Légende</div>
+        <div class="card-body d-flex gap-3 flex-wrap">
+            {% for bid in selected_ids %}
+            {% if boites.get(bid) %}
+            <span><span style="display:inline-block; width:12px; height:12px; border-radius:50%; background:{{ colors[bid] }};"></span> {{ boites[bid].user_email }}</span>
+            {% endif %}
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span>Chronologie fusionnée ({{ events|length }} événements)</span>
+            <div class="input-group input-group-sm w-50">
+                <input type="text" id="filter-cross" class="form-control" placeholder="Filtrer par boîte, IP, activité..." onkeyup="filterCross()">
+                <span class="input-group-text" id="cross-match-count">0</span>
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="tl" id="cross-list">
+                {% for e in events %}
+                <div class="tl-item" style="border-left:none;">
+                    <div class="d-flex justify-content-between">
+                        <div>
+                            <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:{{ colors[e.boite_id] }};"></span>
+                            <strong>{{ e.boite_label }}</strong>
+                            {% if e.type == 'signin' %}
+                            <i class="bi bi-shield-lock text-{% if e.success %}success{% else %}danger{% endif %}"></i>
+                            {% else %}
+                            <i class="bi bi-journal-text text-warning"></i>
+                            {% endif %}
+                            {{ e.title }}
+                        </div>
+                        <small class="text-muted text-nowrap ms-2">{{ e.timestamp|paris }}</small>
+                    </div>
+                    <div class="small text-muted">{{ e.detail }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function filterCross() {
+        var filter = document.getElementById('filter-cross').value.toLowerCase().trim();
+        var items = document.querySelectorAll('#cross-list .tl-item');
+        var matchCount = 0;
+        items.forEach(function(item) {
+            var text = item.textContent.toLowerCase();
+            if (filter === '' || text.indexOf(filter) > -1) { item.style.display = ''; matchCount++; }
+            else { item.style.display = 'none'; }
+        });
+        document.getElementById('cross-match-count').textContent = matchCount + ' / ' + items.length;
+    }
+    </script>
+{% endif %}
+{% endblock %}
