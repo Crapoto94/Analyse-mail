@@ -296,6 +296,41 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                 </form>
             </div>
         </div>
+
+        <div class="card mt-4">
+            <div class="card-header bg-dark text-white">
+                <h4 class="mb-0"><i class="bi bi-shield-check"></i> Réputation des IPs</h4>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Chaque adresse IP affichée dans l'application (connexions, messages, journal d'audit...) est
+                    accompagnée d'une note de réputation de 1 à 5 étoiles, cliquable pour voir le détail (score
+                    d'abus, type d'usage — résidentiel, hébergeur/datacenter, mobile... — FAI, signalements...).
+                    Ces données viennent de <a href="https://www.abuseipdb.com/" target="_blank">AbuseIPDB</a>
+                    (clé gratuite sur <a href="https://www.abuseipdb.com/account/api" target="_blank">abuseipdb.com/account/api</a>,
+                    1000 requêtes/jour). <strong>Sans clé configurée</strong>, une estimation grossière est utilisée à la
+                    place (basée uniquement sur la détection heuristique VPN/proxy/Tor déjà utilisée ailleurs dans
+                    l'application) — nettement moins fiable, mais un affichage reste toujours proposé.
+                </p>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="abuseipdb_api_key" class="form-label">Clé API AbuseIPDB</label>
+                        <input type="password" class="form-control" id="abuseipdb_api_key" name="abuseipdb_api_key"
+                               placeholder="{% if abuseipdb_api_key_set %}•••••••• (laisser vide pour conserver la clé actuelle){% else %}Saisir la clé API...{% endif %}">
+                        {% if abuseipdb_api_key_set %}
+                        <div class="form-text text-success"><i class="bi bi-check-circle"></i> Une clé est déjà enregistrée.</div>
+                        {% endif %}
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary mb-3" onclick="testAbuseIpdb()">
+                        <i class="bi bi-plug"></i> Tester la connexion
+                    </button>
+                    <div id="test-result-abuseipdb" class="mb-3" style="display:none;"></div>
+                    <button type="submit" class="btn btn-dark">
+                        <i class="bi bi-check-lg"></i> Enregistrer
+                    </button>
+                </form>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -390,6 +425,25 @@ function testNvidiaApi() {
     resultDiv.innerHTML = '<div class="alert alert-info">Test en cours... (peut prendre quelques secondes)</div>';
 
     fetch('{{ url_for("test_api_nvidia") }}')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            } else {
+                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            }
+        })
+        .catch(error => {
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
+        });
+}
+
+function testAbuseIpdb() {
+    const resultDiv = document.getElementById('test-result-abuseipdb');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
+
+    fetch('{{ url_for("test_abuseipdb") }}')
         .then(response => response.json())
         .then(data => {
             if (data.success) {

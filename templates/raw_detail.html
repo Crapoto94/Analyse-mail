@@ -3,6 +3,7 @@
 {% block content %}
 <h2>{{ title }}</h2>
 {% if subtitle %}<p class="text-muted">{{ subtitle }}</p>{% endif %}
+{% if row.ip_address %}<p>IP : {{ ip_badge(row.ip_address) }}</p>{% endif %}
 
 <div class="card">
     <div class="card-header">Toutes les colonnes importées</div>

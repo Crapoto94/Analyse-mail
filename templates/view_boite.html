@@ -366,7 +366,7 @@
                 <tbody>
                     {% for ip in ips %}
                     <tr>
-                        <td><code>{{ ip.from_ip }}</code></td>
+                        <td>{{ ip_badge(ip.from_ip) }}</td>
                         <td><span class="badge bg-primary">{{ ip.cnt }}</span></td>
                     </tr>
                     {% endfor %}
@@ -382,7 +382,7 @@
             <div class="col-md-6 col-lg-4 mb-3">
                 <div class="card h-100">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <code class="mb-0">{{ info.ip }}</code>
+                        {{ ip_badge(info.ip) }}
                         {% if info.is_vpn %}
                         <span class="badge bg-warning">VPN/Proxy</span>
                         {% endif %}
@@ -736,7 +736,7 @@
                                 {{ msg.status }}
                             </span>
                         </td>
-                        <td><code><small>{{ msg.from_ip }}</small></code></td>
+                        <td><small>{{ ip_badge(msg.from_ip) }}</small></td>
                         <td><small>{{ (msg.size / 1024)|round(1) }} KB</small></td>
                         <td><small>{% if msg.attachments %}{{ msg.attachments }}{% else %}-{% endif %}</small></td>
                         <td><small>{% if msg.urls %}<a href="{{ msg.urls }}" target="_blank">{{ msg.urls[:50] }}{% if msg.urls|length > 50 %}...{% endif %}</a>{% else %}-{% endif %}</small></td>

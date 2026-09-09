@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response, session, g
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
+from markupsafe import Markup, escape
 import json
 
 app = Flask(__name__)
@@ -585,6 +586,19 @@ def init_db():
         c.execute('ALTER TABLE ip_info ADD COLUMN hostname TEXT')
     except:
         pass  # La colonne existe déjà
+
+    # Migration : reputation de l'IP (score d'abus, type d'usage — residentiel, hebergeur,
+    # datacenter...) via AbuseIPDB (cle optionnelle, voir /config), avec repli heuristique
+    # si aucune cle n'est configuree. Mise en cache comme le reste de ip_info, mais avec sa
+    # propre date de rafraichissement (reputation_checked_at) car ces donnees evoluent dans
+    # le temps, contrairement a la geolocalisation.
+    for _col in ('abuse_score INTEGER', 'usage_type TEXT', 'ip_domain TEXT', 'total_reports INTEGER',
+                 'is_whitelisted BOOLEAN', 'last_reported_at TEXT', 'reputation_source TEXT',
+                 'reputation_checked_at TEXT'):
+        try:
+            c.execute(f'ALTER TABLE ip_info ADD COLUMN {_col}')
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
@@ -637,9 +651,232 @@ def get_ip_info(ip):
             return dict(row) if row else None
     except Exception as e:
         print("Erreur IP info pour " + ip + ": " + str(e))
-    
+
     conn.close()
     return None
+
+
+# Duree de fraicheur du cache de reputation (en jours) : contrairement a la geolocalisation
+# (get_ip_info, mise en cache indefiniment — une IP ne change pas de pays), la reputation
+# d'une IP evolue dans le temps (nouveaux signalements d'abus...), d'ou un rafraichissement
+# periodique plutot qu'un cache permanent.
+IP_REPUTATION_CACHE_DAYS = 7
+
+# Types d'usage AbuseIPDB consideres comme non residentiels (hebergement/datacenter,
+# infrastructure...), un signal utile en investigation meme quand le score d'abus est bas :
+# un compte compromis se connectant depuis un datacenter/VPN est plus suspect qu'un simple
+# particulier, independamment des signalements d'abus deja recus par cette IP precise.
+IP_NON_RESIDENTIAL_USAGE_TYPES = {
+    'data center/web hosting/transit', 'commercial', 'content delivery network',
+    'hébergeur/datacenter (estimation heuristique)',
+}
+
+
+def _compute_reputation_stars(abuse_score, usage_type, is_vpn_heuristic):
+    """Convertit un score d'abus AbuseIPDB (0=aucun signalement, 100=confiance d'abus
+    maximale) en note de reputation 1 a 5 etoiles (5 = la plus fiable). Sans score
+    disponible (pas de cle configuree), retombe sur l'heuristique VPN/proxy/Tor + type
+    d'usage heuristique existante. Une IP d'hebergeur/datacenter ou detectee VPN/proxy
+    plafonne a 3 etoiles meme avec un score d'abus bas : le type d'infrastructure est en
+    soi un signal en contexte d'investigation de compromission, independamment des
+    signalements deja recus."""
+    non_residential = (usage_type or '').strip().lower() in IP_NON_RESIDENTIAL_USAGE_TYPES
+
+    if abuse_score is None:
+        # Pas de cle AbuseIPDB : estimation grossiere a partir du seul heuristique existant.
+        return (2, 'estimation') if (is_vpn_heuristic or non_residential) else (3, 'estimation')
+
+    if abuse_score >= 80:
+        stars = 1
+    elif abuse_score >= 50:
+        stars = 2
+    elif abuse_score >= 20:
+        stars = 3
+    elif abuse_score >= 1:
+        stars = 4
+    else:
+        stars = 5
+
+    if (non_residential or is_vpn_heuristic) and stars > 3:
+        stars = 3
+    return (stars, 'abuseipdb')
+
+
+def _fetch_abuseipdb(ip, api_key):
+    """Interroge AbuseIPDB (https://api.abuseipdb.com) pour le score de confiance d'abus et
+    le type d'usage (residentiel, hebergeur, mobile...) d'une IP. Retourne le dict 'data' de
+    la reponse. Leve une exception en cas d'echec (cle invalide, quota depasse, timeout...)."""
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    url = 'https://api.abuseipdb.com/api/v2/check?' + urllib.parse.urlencode({
+        'ipAddress': ip, 'maxAgeInDays': '90'})
+    req = urllib.request.Request(url, headers={
+        'Key': api_key, 'Accept': 'application/json', 'User-Agent': 'Analyse-Compromis/1.0'})
+    with urllib.request.urlopen(req, timeout=8) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+    if 'data' not in payload:
+        raise RuntimeError(payload.get('errors', [{}])[0].get('detail', 'Réponse AbuseIPDB invalide'))
+    return payload['data']
+
+
+def get_ip_reputation(ip):
+    """Geolocalisation (get_ip_info, cache permanent) + reputation (score d'abus, type
+    d'usage — cache rafraichi tous les IP_REPUTATION_CACHE_DAYS jours) d'une IP. Utilise
+    AbuseIPDB si une cle est configuree (voir /config), sinon repli sur l'heuristique
+    VPN/proxy/Tor deja existante (champ is_vpn). Retourne un dict pret a afficher (geo +
+    reputation + note 1-5 etoiles), ou None si l'IP est vide/invalide."""
+    ip = (ip or '').strip()
+    if not ip:
+        return None
+
+    info = get_ip_info(ip)
+    if info is None:
+        # Geolocalisation indisponible (IP privee, service en panne...) : reputation seule,
+        # sans le reste (pays, ville...).
+        info = {'ip': ip}
+
+    needs_refresh = True
+    checked_at = info.get('reputation_checked_at')
+    if checked_at:
+        checked_dt = _parse_iso(checked_at)
+        if checked_dt and (datetime.now(timezone.utc).replace(tzinfo=None) - checked_dt).days < IP_REPUTATION_CACHE_DAYS:
+            needs_refresh = False
+
+    if needs_refresh:
+        api_key = get_config('abuseipdb_api_key', '').strip()
+        now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        update_fields = {'reputation_checked_at': now_iso}
+        if api_key:
+            try:
+                data = _fetch_abuseipdb(ip, api_key)
+                update_fields.update({
+                    'abuse_score': data.get('abuseConfidenceScore'),
+                    'usage_type': data.get('usageType') or '',
+                    'ip_domain': data.get('domain') or '',
+                    'total_reports': data.get('totalReports'),
+                    'is_whitelisted': bool(data.get('isWhitelisted')),
+                    'last_reported_at': data.get('lastReportedAt') or '',
+                    'reputation_source': 'abuseipdb',
+                })
+                if data.get('isTor'):
+                    update_fields['is_vpn'] = True
+            except Exception as e:
+                print(f"Erreur reputation AbuseIPDB pour {ip}: {e}")
+                update_fields['reputation_source'] = 'abuseipdb_error'
+        else:
+            update_fields['reputation_source'] = 'heuristic'
+            # Sans cle AbuseIPDB, meilleur effort pour distinguer un hebergeur/datacenter
+            # d'une IP residentielle : les FAI grand public n'apparaissent pas dans cette
+            # liste, les principaux hebergeurs/cloud oui — a defaut de vraie donnee, un
+            # simple mot-cle sur l'ISP/l'organisation reste plus utile qu'une absence totale
+            # d'indication de "residentiel ou pas".
+            isp_org = ((info.get('isp') or '') + ' ' + (info.get('org') or '')).lower()
+            hosting_keywords = ['amazon', 'aws', 'google', 'microsoft', 'azure', 'ovh', 'hetzner',
+                                 'digitalocean', 'digital ocean', 'linode', 'akamai', 'vultr', 'oracle cloud',
+                                 'alibaba', 'contabo', 'scaleway', 'cloudflare', 'hosting', 'datacenter',
+                                 'data center', 'server', 'colo']
+            if any(kw in isp_org for kw in hosting_keywords):
+                update_fields['usage_type'] = 'Hébergeur/Datacenter (estimation heuristique)'
+
+        conn = get_db()
+        # S'assurer qu'une ligne existe (cas ou get_ip_info a echoue mais qu'on veut quand
+        # meme conserver la reputation) avant de mettre a jour.
+        conn.execute('INSERT OR IGNORE INTO ip_info (ip) VALUES (?)', (ip,))
+        set_clause = ', '.join(f'{k}=?' for k in update_fields)
+        conn.execute(f'UPDATE ip_info SET {set_clause} WHERE ip=?', (*update_fields.values(), ip))
+        conn.commit()
+        row = conn.execute('SELECT * FROM ip_info WHERE ip=?', (ip,)).fetchone()
+        conn.close()
+        info = dict(row) if row else {**info, **update_fields}
+
+    stars, basis = _compute_reputation_stars(info.get('abuse_score'), info.get('usage_type'), bool(info.get('is_vpn')))
+    info['reputation_stars'] = stars
+    info['reputation_basis'] = basis
+    return info
+
+
+STAR_COLOR_BY_RATING = {5: 'success', 4: 'success', 3: 'warning', 2: 'danger', 1: 'danger'}
+REPUTATION_BASIS_LABELS = {
+    'abuseipdb': 'AbuseIPDB',
+    'abuseipdb_error': "AbuseIPDB (échec de la requête — dernière donnée connue)",
+    'estimation': "Estimation heuristique (aucune clé AbuseIPDB configurée)",
+}
+
+
+def render_ip_badge(ip):
+    """Fonction globale Jinja ({{ ip_badge(x) }}) : affiche une IP suivie d'une note de
+    reputation 1-5 etoiles cliquable, qui ouvre la modale de detail partagee (voir le
+    gestionnaire JS dans base.html) sans requete AJAX supplementaire — toutes les donnees
+    sont deja embarquees dans l'attribut data-ip-info au moment du rendu de la page."""
+    ip = (ip or '').strip()
+    if not ip:
+        return Markup('')
+
+    try:
+        info = get_ip_reputation(ip)
+    except Exception as e:
+        print(f"Erreur ip_badge pour {ip}: {e}")
+        info = None
+
+    if not info:
+        return Markup(f'<code>{escape(ip)}</code>')
+
+    stars = info.get('reputation_stars') or 3
+    color = STAR_COLOR_BY_RATING.get(stars, 'secondary')
+    star_html = ''.join(
+        '<i class="bi bi-star-fill"></i>' if i < stars else '<i class="bi bi-star"></i>'
+        for i in range(5)
+    )
+
+    payload = {
+        'ip': ip,
+        'stars': stars,
+        'basis_label': REPUTATION_BASIS_LABELS.get(info.get('reputation_basis'), info.get('reputation_basis') or ''),
+        'country': info.get('country') or '',
+        'city': info.get('city') or '',
+        'isp': info.get('isp') or '',
+        'org': info.get('org') or '',
+        'asn': info.get('as_name') or '',
+        'hostname': info.get('hostname') or '',
+        'usage_type': info.get('usage_type') or '',
+        'domain': info.get('ip_domain') or '',
+        'abuse_score': info.get('abuse_score'),
+        'total_reports': info.get('total_reports'),
+        'is_whitelisted': bool(info.get('is_whitelisted')),
+        'last_reported_at': info.get('last_reported_at') or '',
+        'is_vpn': bool(info.get('is_vpn')),
+    }
+    data_attr = escape(json.dumps(payload, ensure_ascii=False))
+
+    return Markup(
+        f'<span class="ip-badge text-nowrap"><code>{escape(ip)}</code> '
+        f'<a href="#" class="ip-rep-badge text-{color}" data-bs-toggle="modal" data-bs-target="#ipInfoModal" '
+        f'data-ip-info="{data_attr}" title="Réputation IP — cliquer pour le détail">{star_html}</a></span>'
+    )
+
+
+app.jinja_env.globals['ip_badge'] = render_ip_badge
+
+
+def render_ip_stars_plain(ip):
+    """Variante texte brut (pas de HTML/JS) de la note de reputation d'une IP, pour les
+    contextes ou une modale n'a pas de sens (export/impression). Renvoie une chaine du
+    style '★★★☆☆' (sur 5), ou une chaine vide si l'IP est vide."""
+    ip = (ip or '').strip()
+    if not ip:
+        return ''
+    try:
+        info = get_ip_reputation(ip)
+    except Exception:
+        info = None
+    stars = (info or {}).get('reputation_stars') or 0
+    return '★' * stars + '☆' * (5 - stars)
+
+
+app.jinja_env.globals['ip_stars_plain'] = render_ip_stars_plain
+
 
 def check_spf_dkim_dmarc(domain):
     import dns.resolver
@@ -4117,6 +4354,11 @@ def config():
         elif 'teams_webhook_url' in request.form:
             set_config('teams_webhook_url', request.form.get('teams_webhook_url', '').strip())
             flash('Configuration Teams enregistrée avec succès')
+        elif 'abuseipdb_api_key' in request.form:
+            new_key = request.form.get('abuseipdb_api_key', '')
+            if new_key:
+                set_config('abuseipdb_api_key', new_key.strip())
+            flash("Configuration de réputation IP enregistrée avec succès")
         return redirect(url_for('config'))
 
     return render_template('config.html',
@@ -4145,7 +4387,8 @@ def config():
         nvidia_default_model=NVIDIA_DEFAULT_MODEL,
         groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE,
         teams_webhook_url=get_config('teams_webhook_url', ''),
-        teams_alert_score_threshold=TEAMS_ALERT_SCORE_THRESHOLD)
+        teams_alert_score_threshold=TEAMS_ALERT_SCORE_THRESHOLD,
+        abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')))
 
 @app.route('/api/diag/proxy-headers')
 @admin_required
@@ -4214,6 +4457,21 @@ def test_teams_webhook():
     if ok:
         return jsonify({'success': True, 'message': 'Message de test envoyé — vérifiez le canal Teams configuré'})
     return jsonify({'success': False, 'message': "Échec de l'envoi — voir les logs (catégorie TEAMS) pour le détail"})
+
+@app.route('/api/test-abuseipdb')
+@admin_required
+def test_abuseipdb():
+    api_key = get_config('abuseipdb_api_key', '').strip()
+    if not api_key:
+        return jsonify({'success': False, 'message': 'Clé AbuseIPDB non configurée'})
+    try:
+        # 1.1.1.1 (Cloudflare) : IP stable et publique, pratique pour un test de connexion.
+        data = _fetch_abuseipdb('1.1.1.1', api_key)
+        return jsonify({'success': True, 'message': (
+            f"Connexion à AbuseIPDB réussie — score d'abus pour 1.1.1.1 : "
+            f"{data.get('abuseConfidenceScore')}/100 ({data.get('usageType') or 'type inconnu'})")})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/test-ville')
 @admin_required

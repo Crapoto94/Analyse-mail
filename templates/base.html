@@ -23,6 +23,8 @@
             justify-content: center;
         }
         #global-loading-overlay.active { display: flex; }
+        .ip-rep-badge { text-decoration: none; font-size: 0.75em; letter-spacing: -1px; cursor: pointer; }
+        .ip-rep-badge:hover { opacity: 0.75; }
     </style>
 </head>
 <body>
@@ -187,6 +189,90 @@ function showGlobalLoadingFatalError(err) {
         {% endwith %}
         {% block content %}{% endblock %}
     </div>
+
+    <!-- Modale partagee de detail IP (reputation), remplie en JS depuis l'attribut
+         data-ip-info d'un badge ip_badge() au clic — voir render_ip_badge côté
+         Python et le script ci-dessous. Une seule instance par page, quel que soit le
+         nombre d'IP affichées. -->
+    <div class="modal fade" id="ipInfoModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-geo-alt"></i> <code id="ipInfoIp"></code></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3" id="ipInfoStars" style="font-size:1.3em;"></div>
+                    <table class="table table-sm">
+                        <tbody>
+                            <tr><th class="text-muted" style="width:45%;">Localisation</th><td id="ipInfoLocation">—</td></tr>
+                            <tr><th class="text-muted">FAI / Opérateur</th><td id="ipInfoIsp">—</td></tr>
+                            <tr><th class="text-muted">Organisation</th><td id="ipInfoOrg">—</td></tr>
+                            <tr><th class="text-muted">AS (réseau)</th><td id="ipInfoAsn">—</td></tr>
+                            <tr><th class="text-muted">Type d'usage</th><td id="ipInfoUsageType">—</td></tr>
+                            <tr><th class="text-muted">Domaine associé</th><td id="ipInfoDomain">—</td></tr>
+                            <tr><th class="text-muted">Nom d'hôte (rDNS)</th><td id="ipInfoHostname">—</td></tr>
+                            <tr><th class="text-muted">VPN / Proxy / Tor</th><td id="ipInfoVpn">—</td></tr>
+                            <tr><th class="text-muted">Score d'abus</th><td id="ipInfoAbuseScore">—</td></tr>
+                            <tr><th class="text-muted">Signalements</th><td id="ipInfoReports">—</td></tr>
+                            <tr><th class="text-muted">Dernier signalement</th><td id="ipInfoLastReported">—</td></tr>
+                            <tr><th class="text-muted">Liste blanche</th><td id="ipInfoWhitelisted">—</td></tr>
+                        </tbody>
+                    </table>
+                    <p class="text-muted small mb-0" id="ipInfoBasis"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    (function() {
+        var modalEl = document.getElementById('ipInfoModal');
+        if (!modalEl) return;
+
+        function setText(id, value) {
+            document.getElementById(id).textContent = (value === null || value === undefined || value === '') ? '—' : value;
+        }
+
+        document.addEventListener('click', function(e) {
+            var el = e.target.closest('.ip-rep-badge');
+            if (!el) return;
+            e.preventDefault();
+            var info;
+            try {
+                info = JSON.parse(el.getAttribute('data-ip-info'));
+            } catch (err) {
+                return;
+            }
+
+            document.getElementById('ipInfoIp').textContent = info.ip || '';
+
+            var starsColor = info.stars >= 4 ? 'text-success' : (info.stars >= 3 ? 'text-warning' : 'text-danger');
+            var starsHtml = '';
+            for (var i = 0; i < 5; i++) {
+                starsHtml += '<i class="bi ' + (i < info.stars ? 'bi-star-fill' : 'bi-star') + '"></i>';
+            }
+            document.getElementById('ipInfoStars').innerHTML = '<span class="' + starsColor + '">' + starsHtml + '</span> <span class="text-muted" style="font-size:0.6em;">(' + info.stars + '/5)</span>';
+
+            var location = [info.city, info.country].filter(Boolean).join(', ');
+            setText('ipInfoLocation', location);
+            setText('ipInfoIsp', info.isp);
+            setText('ipInfoOrg', info.org);
+            setText('ipInfoAsn', info.asn);
+            setText('ipInfoUsageType', info.usage_type);
+            setText('ipInfoDomain', info.domain);
+            setText('ipInfoHostname', info.hostname);
+            setText('ipInfoVpn', info.is_vpn ? 'Oui (détecté)' : 'Non détecté');
+            setText('ipInfoAbuseScore', info.abuse_score !== null && info.abuse_score !== undefined ? info.abuse_score + ' / 100' : null);
+            setText('ipInfoReports', info.total_reports !== null && info.total_reports !== undefined ? info.total_reports : null);
+            setText('ipInfoLastReported', info.last_reported_at);
+            setText('ipInfoWhitelisted', info.is_whitelisted ? 'Oui' : 'Non');
+            document.getElementById('ipInfoBasis').textContent = info.basis_label || '';
+
+            bootstrap.Modal.getOrCreateInstance(modalEl).show();
+        });
+    })();
+    </script>
 </body>
 </html>

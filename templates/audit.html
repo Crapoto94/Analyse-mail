@@ -70,7 +70,7 @@
                     <td><span class="badge bg-{% if e.resultat == 'Success' %}success{% else %}danger{% endif %}">{{ e.resultat }}</span></td>
                     <td><small>{{ e.actor_display_name or e.actor_upn }}</small></td>
                     <td><small>{{ e.target_upn or e.target_display_name }}</small></td>
-                    <td><code><small>{{ e.ip_address }}</small></code></td>
+                    <td><small>{{ ip_badge(e.ip_address) }}</small></td>
                     <td><a href="{{ url_for('view_audit_detail', event_id=e.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
                 </tr>
                 {% endfor %}
@@ -163,7 +163,7 @@
                         <td><span class="badge bg-{% if e.resultat == 'Success' %}success{% else %}danger{% endif %}">{{ e.resultat }}</span></td>
                         <td><small>{{ e.actor_display_name or e.actor_upn }}</small></td>
                         <td><small>{{ e.target_upn or e.target_display_name }}</small></td>
-                        <td><code><small>{{ e.ip_address }}</small></code></td>
+                        <td><small>{{ ip_badge(e.ip_address) }}</small></td>
                         <td><small>{{ (e.modifications_summary or '')[:80] }}{% if e.modifications_summary and e.modifications_summary|length > 80 %}...{% endif %}</small></td>
                         <td><a href="{{ url_for('view_audit_detail', event_id=e.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-eye"></i></a></td>
                     </tr>

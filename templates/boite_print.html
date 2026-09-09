@@ -62,13 +62,15 @@
     {% if ip_info_list %}
     <h2>Géolocalisation des IPs</h2>
     <table>
-        <tr><th>IP</th><th>Pays</th><th>Ville</th><th>ISP</th><th>VPN</th></tr>
+        <tr><th>IP</th><th>Réputation</th><th>Pays</th><th>Ville</th><th>ISP</th><th>Type d'usage</th><th>VPN</th></tr>
         {% for info in ip_info_list %}
         <tr>
             <td>{{ info.ip }}</td>
+            <td>{{ ip_stars_plain(info.ip) }}</td>
             <td>{{ info.country }}</td>
             <td>{{ info.city }}</td>
             <td>{{ info.isp }}</td>
+            <td>{{ info.usage_type or '' }}</td>
             <td>{% if info.is_vpn %}Oui{% else %}Non{% endif %}</td>
         </tr>
         {% endfor %}
@@ -77,7 +79,7 @@
 
     <h2>Messages ({{ messages|length }})</h2>
     <table>
-        <tr><th>Date/Heure</th><th>Destinataire</th><th>Sujet</th><th>Statut</th><th>IP Source</th></tr>
+        <tr><th>Date/Heure</th><th>Destinataire</th><th>Sujet</th><th>Statut</th><th>IP Source</th><th>Réputation</th></tr>
         {% for msg in messages[:100] %}
         <tr>
             <td>{{ msg.received|paris }}</td>
@@ -85,6 +87,7 @@
             <td>{{ msg.subject }}</td>
             <td><span class="badge {% if msg.status == 'Delivered' %}bg-success{% elif msg.status == 'Failed' %}bg-danger{% else %}bg-warning{% endif %}">{{ msg.status }}</span></td>
             <td>{{ msg.from_ip }}</td>
+            <td>{{ ip_stars_plain(msg.from_ip) }}</td>
         </tr>
         {% endfor %}
     </table>

@@ -84,7 +84,7 @@
                 <tbody>
                 {% for s in flagged_rows[:100] %}
                 <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
-                    <td><code><small>{{ s.ip_address }}</small></code></td><td><small>{{ s.location }}</small></td>
+                    <td><small>{{ ip_badge(s.ip_address) }}</small></td><td><small>{{ s.location }}</small></td>
                     <td><small>{{ s.application }}</small></td></tr>
                 {% endfor %}
                 </tbody>
@@ -100,7 +100,7 @@
                 <tbody>
                 {% for s in foreign_success[:100] %}
                 <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
-                    <td><code><small>{{ s.ip_address }}</small></code></td><td><span class="badge bg-warning text-dark">{{ s.country }}</span></td>
+                    <td><small>{{ ip_badge(s.ip_address) }}</small></td><td><span class="badge bg-warning text-dark">{{ s.country }}</span></td>
                     <td><small>{{ s.application }}</small></td><td><small>{{ s|mfa_status }}</small></td></tr>
                 {% endfor %}
                 </tbody>
@@ -116,7 +116,7 @@
                 <tbody>
                 {% for s in failed_rows[:100] %}
                 <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
-                    <td><code><small>{{ s.ip_address }}</small></code></td><td><small>{{ s.location }}</small></td>
+                    <td><small>{{ ip_badge(s.ip_address) }}</small></td><td><small>{{ s.location }}</small></td>
                     <td><small>{{ s.error_code }}</small></td><td><small>{{ s.failure_reason }}</small></td></tr>
                 {% endfor %}
                 </tbody>
@@ -197,7 +197,7 @@
             <div class="col-md-6 col-lg-4 mb-3">
                 <div class="card h-100">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <code class="mb-0">{{ info.ip }}</code>
+                        {{ ip_badge(info.ip) }}
                         {% if info.is_vpn %}<span class="badge bg-warning">VPN/Proxy</span>{% endif %}
                     </div>
                     <div class="card-body">
@@ -236,7 +236,7 @@
                     <tr>
                         <td><small>{{ s.date_utc|paris }}</small></td>
                         <td><small>{{ s.user_upn or s.user_display_name }}</small></td>
-                        <td><code><small>{{ s.ip_address }}</small></code></td>
+                        <td><small>{{ ip_badge(s.ip_address) }}</small></td>
                         <td><small>{{ s.location }}</small></td>
                         <td><small>{{ s.application }}</small></td>
                         <td>
