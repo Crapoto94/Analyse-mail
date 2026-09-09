@@ -2135,8 +2135,9 @@ def analyze_compromise(boite_id):
 # ============================================================================
 
 GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-GROQ_DEFAULT_MODEL = 'llama-3.3-70b-versatile'
+GROQ_DEFAULT_MODEL = 'openai/gpt-oss-20b'
 GROQ_AVAILABLE_MODELS = [
+    'openai/gpt-oss-20b',
     'llama-3.3-70b-versatile',
     'llama-3.1-8b-instant',
     'meta-llama/llama-4-maverick-17b-128e-instruct',
@@ -2236,7 +2237,15 @@ def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
 
     req = urllib.request.Request(
         GROQ_API_URL, data=payload, method='POST',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'})
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            # Groq est derriere Cloudflare, qui bloque (HTTP 403 "error code: 1010") le
+            # User-Agent par defaut d'urllib ("Python-urllib/x.y"), detecte comme un bot.
+            # Un User-Agent de navigateur/outil classique passe la verification.
+            'User-Agent': 'Mozilla/5.0 (compatible; Analyse-Compromis/1.0)',
+        })
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
