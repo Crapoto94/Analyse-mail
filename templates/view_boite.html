@@ -62,9 +62,17 @@
 <div class="card mb-4 border-success" id="ai-analysis">
     <div class="card-header bg-success text-white d-flex justify-content-between align-items-center flex-wrap gap-2">
         <span><i class="bi bi-robot"></i> Analyse IA</span>
-        {% if groq_configured %}
+        {% if ai_configured %}
         <form class="m-0"
-              onsubmit="event.preventDefault(); runBackgroundJob('{{ url_for('ai_analyze_start', bid=boite.id) }}', new FormData(this), ['ai'], 'Analyse IA en cours…');">
+              onsubmit="event.preventDefault(); runBackgroundJob('{{ url_for('ai_analyze_start', bid=boite.id) }}', new FormData(this), ['ai'], 'Analyse IA en cours…',
+                  function(redirect) {
+                      // Le job redirige vers cette meme page (ancre #ai-analysis) : une simple
+                      // affectation de window.location.href ne recharge pas la page (juste un
+                      // saut d'ancre), donc le resultat fraichement enregistre ne s'afficherait
+                      // pas sans rechargement force.
+                      window.location.hash = 'ai-analysis';
+                      window.location.reload();
+                  });">
             <button type="submit" class="btn btn-sm btn-light">
                 <i class="bi bi-stars"></i> {% if boite.ai_analysis %}Relancer l'analyse IA{% else %}Lancer l'analyse IA{% endif %}
             </button>
@@ -78,11 +86,11 @@
     <div class="card-body">
         {% if boite.ai_analysis %}
         <p class="text-muted small mb-2">
-            Générée le {{ boite.ai_analysis_at|paris }} avec le modèle <code>{{ boite.ai_analysis_model }}</code>.
+            Générée le {{ boite.ai_analysis_at|paris }} via <strong>{{ boite.ai_analysis_provider or 'Groq' }}</strong>, modèle <code>{{ boite.ai_analysis_model }}</code>.
             <span class="text-warning"><i class="bi bi-exclamation-triangle"></i> Analyse générée par une IA à partir des données déjà collectées — à vérifier avant toute décision.</span>
         </p>
         <div style="white-space: pre-wrap;">{{ boite.ai_analysis }}</div>
-        {% elif groq_configured %}
+        {% elif ai_configured %}
         <p class="text-muted mb-0">
             <i class="bi bi-info-circle"></i> Aucune analyse IA n'a encore été générée pour cette boîte. L'IA recevra les
             connexions, le journal d'audit et les signaux déjà détectés par l'analyse heuristique ci-dessus, et
@@ -90,7 +98,7 @@
         </p>
         {% else %}
         <p class="text-muted mb-0">
-            <i class="bi bi-info-circle"></i> Nécessite la configuration d'une clé API Groq.
+            <i class="bi bi-info-circle"></i> Nécessite la configuration d'un fournisseur IA (Groq ou NVIDIA).
             {% if session.get('role') == 'admin' %}<a href="{{ url_for('config') }}">Configurer maintenant</a>.{% else %}Demandez à un administrateur de la renseigner.{% endif %}
         </p>
         {% endif %}

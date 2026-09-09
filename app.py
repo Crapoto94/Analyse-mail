@@ -312,6 +312,10 @@ def init_db():
         c.execute('ALTER TABLE boites_compromises ADD COLUMN ai_analysis_model TEXT')
     except:
         pass
+    try:
+        c.execute('ALTER TABLE boites_compromises ADD COLUMN ai_analysis_provider TEXT')
+    except:
+        pass
     c.execute('''CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -1533,7 +1537,7 @@ def view_boite(bid):
         nb_rules = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
         nb_suspicious_rules = conn.execute("SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (bid,)).fetchone()['c']
         graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
-        groq_configured = bool(get_config('groq_api_key', ''))
+        ai_configured = bool(get_config('groq_api_key', '')) or bool(get_config('nvidia_api_key', ''))
         risk_analysis = analyze_compromise(bid)
         risk_score = risk_analysis['score']
         risk_verdict = risk_analysis['verdict']
@@ -1624,7 +1628,7 @@ def view_boite(bid):
                          sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc,
                          nb_signins=nb_signins, nb_audit=nb_audit,
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
-                         graph_configured=graph_configured, groq_configured=groq_configured,
+                         graph_configured=graph_configured, ai_configured=ai_configured,
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count)
 
 def _timeline_query(conn, table, bid):
@@ -2127,10 +2131,12 @@ def analyze_compromise(boite_id):
 
 
 # ============================================================================
-# Analyse IA (Groq) : envoie un resume structure des journaux d'une boite (evenements +
-# signaux deja detectes par l'analyse heuristique) a un modele de langage via l'API Groq
-# (compatible OpenAI), et demande une explication du scenario le plus probable ainsi que
-# des recommandations. Le prompt est entierement parametrable en configuration (admin) ;
+# Analyse IA : envoie un resume structure des journaux d'une boite (evenements + signaux
+# deja detectes par l'analyse heuristique) a un modele de langage, et demande une
+# explication du scenario le plus probable ainsi que des recommandations. Le prompt est
+# entierement parametrable en configuration (admin). Deux fournisseurs compatibles
+# OpenAI sont supportes : Groq (prioritaire) et NVIDIA (repli automatique si Groq
+# echoue ou n'est pas configure — cle manquante, quota/limite de debit depasse, panne...).
 # GROQ_DEFAULT_PROMPT_TEMPLATE n'est utilise que si l'admin n'a rien personnalise.
 # ============================================================================
 
@@ -2143,6 +2149,12 @@ GROQ_AVAILABLE_MODELS = [
     'meta-llama/llama-4-maverick-17b-128e-instruct',
     'meta-llama/llama-4-scout-17b-16e-instruct',
 ]
+
+# NVIDIA NIM (build.nvidia.com) : API OpenAI-compatible donnant acces a un tres grand
+# catalogue de modeles (100+, en evolution constante) — pas de liste figee ici, l'admin
+# saisit librement l'identifiant du modele de son choix (ex: meta/llama-3.1-70b-instruct).
+NVIDIA_API_URL = 'https://integrate.api.nvidia.com/v1/chat/completions'
+NVIDIA_DEFAULT_MODEL = 'meta/llama-3.1-70b-instruct'
 
 GROQ_DEFAULT_PROMPT_TEMPLATE = """Tu es un analyste en cybersécurité spécialisé dans la réponse à incident sur Microsoft 365 / Entra ID (Azure AD).
 
@@ -2160,10 +2172,19 @@ En te basant uniquement sur ces éléments, réponds en français et de façon s
 3. Ton niveau de confiance dans ce scénario et les éléments qui manquent pour en être sûr.
 4. Des recommandations concrètes et priorisées pour l'équipe sécurité."""
 
-# Nombre maximum d'evenements inclus dans le prompt (les plus recents) : au-dela, le
-# prompt devient trop volumineux (cout/latence de l'API, risque de depassement du
-# contexte du modele) sans apporter d'information supplementaire utile a l'analyse.
-GROQ_MAX_EVENTS_IN_PROMPT = 200
+# Nombre maximum d'evenements inclus dans le prompt (les plus recents), et longueur max
+# du detail de chaque evenement / de la description de chaque signal : au-dela, le
+# prompt devient trop volumineux et declenche des erreurs cote fournisseur IA (requete
+# trop grosse, ou quota de tokens/minute depasse — frequent sur les offres gratuites),
+# sans apporter d'information supplementaire utile a l'analyse.
+AI_MAX_EVENTS_IN_PROMPT = 60
+AI_MAX_EVENT_DETAIL_CHARS = 160
+AI_MAX_FINDING_DESC_CHARS = 300
+
+
+def _truncate(text, max_chars):
+    text = text or ''
+    return text if len(text) <= max_chars else text[:max_chars].rstrip() + '…'
 
 
 def _render_ai_prompt(template, values):
@@ -2179,8 +2200,9 @@ def _render_ai_prompt(template, values):
 
 def build_ai_analysis_prompt(bid):
     """Construit le prompt d'analyse IA pour une boite : reutilise l'analyse heuristique
-    deja existante (evenements + signaux) plutot que d'exporter les journaux bruts, pour
-    donner au modele un contexte deja structure et de taille maitrisee."""
+    deja existante (evenements + signaux) plutot que d'exporter les journaux bruts, et
+    tronque le tout (nombre d'evenements, longueur des textes) pour rester dans les
+    limites de taille/debit des API gratuites tout en gardant un contexte utile."""
     conn = get_db()
     boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
     conn.close()
@@ -2192,19 +2214,20 @@ def build_ai_analysis_prompt(bid):
     events = analysis['events']
 
     findings_text = '\n'.join(
-        f"- [{f['severity'].upper()}] {f['title']} — {f['description']}" for f in findings
+        f"- [{f['severity'].upper()}] {f['title']} — {_truncate(f['description'], AI_MAX_FINDING_DESC_CHARS)}"
+        for f in findings
     ) or "Aucun signal détecté par l'analyse automatique."
 
-    shown_events = events[-GROQ_MAX_EVENTS_IN_PROMPT:]
+    shown_events = events[-AI_MAX_EVENTS_IN_PROMPT:]
     events_lines = []
     for e in shown_events:
         status = 'succès' if e['success'] else 'échec'
         events_lines.append(
-            f"- {e['timestamp']} [{e['type']}] ({status}) {e['title']} — {e['detail']} "
+            f"- {e['timestamp']} [{e['type']}] ({status}) {e['title']} — {_truncate(e['detail'], AI_MAX_EVENT_DETAIL_CHARS)} "
             f"(IP: {e['ip'] or 'N/A'}, pays: {e.get('country') or 'N/A'})")
     events_text = '\n'.join(events_lines) or 'Aucun événement.'
-    if len(events) > GROQ_MAX_EVENTS_IN_PROMPT:
-        events_text += f"\n(+{len(events) - GROQ_MAX_EVENTS_IN_PROMPT} événement(s) plus ancien(s) non affiché(s) pour limiter la taille de l'analyse)"
+    if len(events) > AI_MAX_EVENTS_IN_PROMPT:
+        events_text += f"\n(+{len(events) - AI_MAX_EVENTS_IN_PROMPT} événement(s) plus ancien(s) non affiché(s) pour limiter la taille de l'analyse)"
 
     template = get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE
     return _render_ai_prompt(template, {
@@ -2216,17 +2239,12 @@ def build_ai_analysis_prompt(bid):
     }), analysis
 
 
-def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
-    """Appelle l'API de completion de chat Groq (compatible OpenAI) et retourne le texte
-    de la reponse. Utilise urllib (comme les autres appels API du projet) plutot qu'une
-    dependance supplementaire."""
+def _call_openai_compatible_chat(api_url, api_key, model, prompt, timeout, provider_label):
+    """Appelle une API de completion de chat compatible OpenAI (Groq, NVIDIA NIM...) et
+    retourne le texte de la reponse. Utilise urllib (comme les autres appels API du
+    projet) plutot qu'une dependance supplementaire."""
     import urllib.request
     import urllib.error
-
-    api_key = api_key or get_config('groq_api_key', '')
-    model = model or get_config('groq_model', '') or GROQ_DEFAULT_MODEL
-    if not api_key:
-        raise RuntimeError("Clé API Groq non configurée")
 
     payload = json.dumps({
         'model': model,
@@ -2236,14 +2254,14 @@ def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
     }).encode('utf-8')
 
     req = urllib.request.Request(
-        GROQ_API_URL, data=payload, method='POST',
+        api_url, data=payload, method='POST',
         headers={
             'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            # Groq est derriere Cloudflare, qui bloque (HTTP 403 "error code: 1010") le
-            # User-Agent par defaut d'urllib ("Python-urllib/x.y"), detecte comme un bot.
-            # Un User-Agent de navigateur/outil classique passe la verification.
+            # Certains fournisseurs (dont Groq, derriere Cloudflare) bloquent le
+            # User-Agent par defaut d'urllib ("Python-urllib/x.y"), detecte comme un bot
+            # (HTTP 403 "error code: 1010"). Un User-Agent classique passe la verification.
             'User-Agent': 'Mozilla/5.0 (compatible; Analyse-Compromis/1.0)',
         })
 
@@ -2256,21 +2274,64 @@ def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
             msg = json.loads(body).get('error', {}).get('message', body)
         except Exception:
             msg = body
-        raise RuntimeError(f'Erreur API Groq (HTTP {e.code}) : {msg}')
+        raise RuntimeError(f'Erreur API {provider_label} (HTTP {e.code}) : {msg}')
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Erreur réseau vers l'API Groq : {e.reason}")
+        raise RuntimeError(f"Erreur réseau vers l'API {provider_label} : {e.reason}")
 
     choices = data.get('choices') or []
     if not choices:
-        raise RuntimeError('Réponse Groq vide (aucun choix retourné)')
+        raise RuntimeError(f'Réponse {provider_label} vide (aucun choix retourné)')
     return choices[0]['message']['content']
 
 
+def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
+    api_key = api_key or get_config('groq_api_key', '')
+    model = model or get_config('groq_model', '') or GROQ_DEFAULT_MODEL
+    if not api_key:
+        raise RuntimeError("Clé API Groq non configurée")
+    return _call_openai_compatible_chat(GROQ_API_URL, api_key, model, prompt, timeout, 'Groq')
+
+
+def call_nvidia_chat(prompt, api_key=None, model=None, timeout=60):
+    api_key = api_key or get_config('nvidia_api_key', '')
+    model = model or get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL
+    if not api_key:
+        raise RuntimeError("Clé API NVIDIA non configurée")
+    if not model:
+        raise RuntimeError("Modèle NVIDIA non configuré")
+    return _call_openai_compatible_chat(NVIDIA_API_URL, api_key, model, prompt, timeout, 'NVIDIA')
+
+
 def run_ai_analysis(bid):
-    """Construit le prompt pour la boite, interroge Groq, et retourne le texte de
-    l'analyse. Ne persiste rien : c'est a l'appelant de sauvegarder le resultat."""
+    """Construit le prompt pour la boite et interroge l'IA : essaie Groq en priorite
+    (si configure), et bascule automatiquement sur NVIDIA (si configure) en cas d'echec
+    Groq (cle manquante, quota/limite de debit depasse, panne...) — pas besoin que
+    l'admin choisisse a l'avance, la disponibilite est verifiee a chaque analyse.
+    Retourne (texte, fournisseur, modele). Ne persiste rien : c'est a l'appelant de
+    sauvegarder le resultat."""
     prompt, _analysis = build_ai_analysis_prompt(bid)
-    return call_groq_chat(prompt)
+
+    groq_key = get_config('groq_api_key', '')
+    nvidia_key = get_config('nvidia_api_key', '')
+    if not groq_key and not nvidia_key:
+        raise RuntimeError('Aucun fournisseur IA configuré (Groq ou NVIDIA)')
+
+    errors = []
+    if groq_key:
+        model = get_config('groq_model', '') or GROQ_DEFAULT_MODEL
+        try:
+            return call_groq_chat(prompt, api_key=groq_key, model=model), 'Groq', model
+        except Exception as e:
+            errors.append(f'Groq : {e}')
+
+    if nvidia_key:
+        model = get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL
+        try:
+            return call_nvidia_chat(prompt, api_key=nvidia_key, model=model), 'NVIDIA', model
+        except Exception as e:
+            errors.append(f'NVIDIA : {e}')
+
+    raise RuntimeError(' / '.join(errors))
 
 
 def quick_scan_mailbox(user_upn, days=7, on_step=None):
@@ -3089,31 +3150,31 @@ def graph_fetch_start(bid):
 
 @app.route('/boite/<int:bid>/ai-analyze/start', methods=['POST'])
 def ai_analyze_start(bid):
-    """Lance l'analyse IA (Groq) d'une boite en tache de fond (appel reseau potentiellement
-    long) et retourne un identifiant de job suivi via /jobs/<job_id>/poll, meme principe que
-    le scan rapide et l'import Microsoft Graph."""
+    """Lance l'analyse IA d'une boite en tache de fond (appel reseau potentiellement long,
+    Groq puis repli NVIDIA si besoin — voir run_ai_analysis) et retourne un identifiant de
+    job suivi via /jobs/<job_id>/poll, meme principe que le scan rapide et l'import Graph."""
     conn = get_db()
     boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
     conn.close()
     if not boite:
         return jsonify({'error': 'Boîte non trouvée'}), 404
-    if not get_config('groq_api_key', ''):
-        return jsonify({'error': "Clé API Groq non configurée — demandez à un administrateur de la renseigner dans Configuration."}), 400
+    if not get_config('groq_api_key', '') and not get_config('nvidia_api_key', ''):
+        return jsonify({'error': "Aucun fournisseur IA configuré (Groq ou NVIDIA) — demandez à un administrateur de le renseigner dans Configuration."}), 400
 
     job_id = _job_create(['ai'])
 
     def worker():
         _job_step(job_id, 'ai', 'running')
         try:
-            result_text = run_ai_analysis(bid)
+            result_text, provider, model = run_ai_analysis(bid)
             now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            model = get_config('groq_model', '') or GROQ_DEFAULT_MODEL
             conn2 = get_db()
-            conn2.execute('UPDATE boites_compromises SET ai_analysis=?, ai_analysis_at=?, ai_analysis_model=? WHERE id=?',
-                          (result_text, now_iso, model, bid))
+            conn2.execute('''UPDATE boites_compromises SET
+                ai_analysis=?, ai_analysis_at=?, ai_analysis_model=?, ai_analysis_provider=? WHERE id=?''',
+                          (result_text, now_iso, model, provider, bid))
             conn2.commit()
             conn2.close()
-            add_log('INFO', 'IA', f"Analyse IA effectuée pour {boite['user_email']}", f'Modèle : {model}', bid)
+            add_log('INFO', 'IA', f"Analyse IA effectuée pour {boite['user_email']}", f'Fournisseur : {provider}, modèle : {model}', bid)
             _job_step(job_id, 'ai', 'done')
             _job_finish(job_id, redirect=f'/boite/{bid}#ai-analysis')
         except Exception as e:
@@ -3672,16 +3733,20 @@ def config():
                 set_config('graph_client_secret', new_secret.strip())
             _graph_token_cache['token'] = None
             flash('Configuration Microsoft Graph enregistrée avec succès')
-        elif 'groq_api_key' in request.form or 'groq_model' in request.form or 'groq_prompt_template' in request.form:
-            # Ne pas ecraser la cle existante si le champ est laisse vide (meme logique
-            # que pour le secret Graph : evite d'effacer accidentellement une cle deja
-            # enregistree lors d'une simple mise a jour du modele/prompt).
-            new_key = request.form.get('groq_api_key', '')
-            if new_key:
-                set_config('groq_api_key', new_key.strip())
+        elif 'groq_api_key' in request.form or 'nvidia_api_key' in request.form:
+            # Ne pas ecraser les cles existantes si les champs sont laisses vides (meme
+            # logique que pour le secret Graph : evite d'effacer accidentellement une cle
+            # deja enregistree lors d'une simple mise a jour du modele/prompt).
+            new_groq_key = request.form.get('groq_api_key', '')
+            if new_groq_key:
+                set_config('groq_api_key', new_groq_key.strip())
             set_config('groq_model', request.form.get('groq_model', '').strip())
+            new_nvidia_key = request.form.get('nvidia_api_key', '')
+            if new_nvidia_key:
+                set_config('nvidia_api_key', new_nvidia_key.strip())
+            set_config('nvidia_model', request.form.get('nvidia_model', '').strip())
             set_config('groq_prompt_template', request.form.get('groq_prompt_template', '').strip())
-            flash('Configuration IA (Groq) enregistrée avec succès')
+            flash('Configuration IA enregistrée avec succès')
         return redirect(url_for('config'))
 
     return render_template('config.html',
@@ -3703,6 +3768,9 @@ def config():
         groq_api_key_set=bool(get_config('groq_api_key', '')),
         groq_model=get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
         groq_available_models=GROQ_AVAILABLE_MODELS,
+        nvidia_api_key_set=bool(get_config('nvidia_api_key', '')),
+        nvidia_model=get_config('nvidia_model', ''),
+        nvidia_default_model=NVIDIA_DEFAULT_MODEL,
         groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE)
 
 @app.route('/api/test-graph')
@@ -3722,6 +3790,15 @@ def test_api_groq():
     try:
         reply = call_groq_chat("Réponds uniquement par : OK")
         return jsonify({'success': True, 'message': f"Connexion à l'API Groq réussie — réponse du modèle : {reply.strip()[:200]}"})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/test-nvidia')
+@admin_required
+def test_api_nvidia():
+    try:
+        reply = call_nvidia_chat("Réponds uniquement par : OK")
+        return jsonify({'success': True, 'message': f"Connexion à l'API NVIDIA réussie — réponse du modèle : {reply.strip()[:200]}"})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 
