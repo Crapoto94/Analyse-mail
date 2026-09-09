@@ -425,6 +425,19 @@ def init_db():
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
 
+    # Actions de remediation deja realisees par la DSI sur une boite (ex: mot de passe
+    # reinitialise, MFA renforce...) : saisies manuellement, elles sont a la fois
+    # affichees sur la fiche de la boite ET injectees dans le prompt d'analyse IA pour
+    # que le modele ne re-recommande pas des actions deja effectuees.
+    c.execute('''CREATE TABLE IF NOT EXISTS dsi_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        boite_id INTEGER NOT NULL,
+        action_text TEXT NOT NULL,
+        created_by TEXT,
+        created_at TEXT,
+        FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
@@ -1551,7 +1564,10 @@ def view_boite(bid):
         nb_rules = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
         nb_suspicious_rules = conn.execute("SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (bid,)).fetchone()['c']
         graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
-        ai_configured = bool(get_config('groq_api_key', '')) or bool(get_config('nvidia_api_key', ''))
+        groq_ai_configured = bool(get_config('groq_api_key', ''))
+        nvidia_ai_configured = bool(get_config('nvidia_api_key', ''))
+        ai_configured = groq_ai_configured or nvidia_ai_configured
+        dsi_actions = conn.execute('SELECT * FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)).fetchall()
         risk_analysis = analyze_compromise(bid)
         risk_score = risk_analysis['score']
         risk_verdict = risk_analysis['verdict']
@@ -1643,6 +1659,8 @@ def view_boite(bid):
                          nb_signins=nb_signins, nb_audit=nb_audit,
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
                          graph_configured=graph_configured, ai_configured=ai_configured,
+                         groq_ai_configured=groq_ai_configured, nvidia_ai_configured=nvidia_ai_configured,
+                         dsi_actions=dsi_actions,
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count)
 
 def _timeline_query(conn, table, bid):
@@ -2180,11 +2198,14 @@ Signaux détectés automatiquement :
 Chronologie des événements (connexions et audit, du plus ancien au plus récent) :
 {{events}}
 
-En te basant uniquement sur ces éléments, réponds en français et de façon structurée :
+Actions de remédiation déjà réalisées par la DSI sur cette boîte :
+{{dsi_actions}}
+
+En te basant uniquement sur ces éléments, et en tenant compte de ce que la DSI a déjà fait (ne redemande pas une action déjà réalisée ci-dessus — évalue plutôt si elle est suffisante au vu des signaux observés), réponds en français et de façon structurée :
 1. Ce que tu observes concrètement dans ces journaux.
 2. Le scénario le plus probable (la boîte est-elle réellement compromise ? Si oui, comment et depuis quand ? Sinon, pourquoi ces signaux sont probablement bénins ?).
 3. Ton niveau de confiance dans ce scénario et les éléments qui manquent pour en être sûr.
-4. Des recommandations concrètes et priorisées pour l'équipe sécurité."""
+4. Des recommandations concrètes et priorisées pour l'équipe sécurité, qui complètent (et ne répètent pas) les actions déjà réalisées par la DSI."""
 
 # Nombre maximum d'evenements inclus dans le prompt (les plus recents), et longueur max
 # du detail de chaque evenement / de la description de chaque signal : au-dela, le
@@ -2219,6 +2240,9 @@ def build_ai_analysis_prompt(bid):
     limites de taille/debit des API gratuites tout en gardant un contexte utile."""
     conn = get_db()
     boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    dsi_action_rows = conn.execute(
+        'SELECT action_text, created_by, created_at FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)
+    ).fetchall()
     conn.close()
     if not boite:
         raise ValueError('Boîte non trouvée')
@@ -2243,6 +2267,14 @@ def build_ai_analysis_prompt(bid):
     if len(events) > AI_MAX_EVENTS_IN_PROMPT:
         events_text += f"\n(+{len(events) - AI_MAX_EVENTS_IN_PROMPT} événement(s) plus ancien(s) non affiché(s) pour limiter la taille de l'analyse)"
 
+    # Actions deja realisees par la DSI (saisies manuellement sur la fiche de la boite) :
+    # transmises a l'IA pour qu'elle ne re-recommande pas des actions deja effectuees et
+    # qu'elle puisse evaluer si la remediation est suffisante au vu des signaux observes.
+    dsi_actions_text = '\n'.join(
+        f"- {_truncate(a['action_text'], 300)}" + (f" (par {a['created_by']}, {a['created_at']})" if a['created_by'] else '')
+        for a in dsi_action_rows
+    ) or "Aucune action de remédiation n'a encore été enregistrée par la DSI pour cette boîte."
+
     template = get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE
     return _render_ai_prompt(template, {
         'email': boite['user_email'],
@@ -2250,6 +2282,7 @@ def build_ai_analysis_prompt(bid):
         'verdict': analysis['verdict'],
         'findings': findings_text,
         'events': events_text,
+        'dsi_actions': dsi_actions_text,
     }), analysis
 
 
@@ -2324,13 +2357,13 @@ def call_nvidia_chat(prompt, api_key=None, model=None, timeout=60):
     return _call_openai_compatible_chat(NVIDIA_API_URL, api_key, model, prompt, timeout, 'NVIDIA')
 
 
-def run_ai_analysis(bid):
-    """Construit le prompt pour la boite et interroge l'IA : essaie Groq en priorite
-    (si configure), et bascule automatiquement sur NVIDIA (si configure) en cas d'echec
-    Groq (cle manquante, quota/limite de debit depasse, panne...) — pas besoin que
-    l'admin choisisse a l'avance, la disponibilite est verifiee a chaque analyse.
-    Retourne (texte, fournisseur, modele). Ne persiste rien : c'est a l'appelant de
-    sauvegarder le resultat."""
+def run_ai_analysis(bid, preferred_provider=None):
+    """Construit le prompt pour la boite et interroge l'IA : essaie d'abord le
+    fournisseur choisi par l'utilisateur (`preferred_provider`, 'groq' ou 'nvidia' —
+    Groq par defaut si non precise), et bascule automatiquement sur l'autre fournisseur
+    (si configure) en cas d'echec (cle manquante, quota/limite de debit depasse,
+    panne...). Retourne (texte, fournisseur, modele). Ne persiste rien : c'est a
+    l'appelant de sauvegarder le resultat."""
     prompt, _analysis = build_ai_analysis_prompt(bid)
 
     groq_key = get_config('groq_api_key', '')
@@ -2338,20 +2371,22 @@ def run_ai_analysis(bid):
     if not groq_key and not nvidia_key:
         raise RuntimeError('Aucun fournisseur IA configuré (Groq ou NVIDIA)')
 
-    errors = []
-    if groq_key:
-        model = get_config('groq_model', '') or GROQ_DEFAULT_MODEL
-        try:
-            return call_groq_chat(prompt, api_key=groq_key, model=model), 'Groq', model
-        except Exception as e:
-            errors.append(f'Groq : {e}')
+    order = ['nvidia', 'groq'] if preferred_provider == 'nvidia' else ['groq', 'nvidia']
 
-    if nvidia_key:
-        model = get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL
-        try:
-            return call_nvidia_chat(prompt, api_key=nvidia_key, model=model), 'NVIDIA', model
-        except Exception as e:
-            errors.append(f'NVIDIA : {e}')
+    errors = []
+    for provider in order:
+        if provider == 'groq' and groq_key:
+            model = get_config('groq_model', '') or GROQ_DEFAULT_MODEL
+            try:
+                return call_groq_chat(prompt, api_key=groq_key, model=model), 'Groq', model
+            except Exception as e:
+                errors.append(f'Groq : {e}')
+        elif provider == 'nvidia' and nvidia_key:
+            model = get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL
+            try:
+                return call_nvidia_chat(prompt, api_key=nvidia_key, model=model), 'NVIDIA', model
+            except Exception as e:
+                errors.append(f'NVIDIA : {e}')
 
     raise RuntimeError(' / '.join(errors))
 
@@ -3183,12 +3218,16 @@ def ai_analyze_start(bid):
     if not get_config('groq_api_key', '') and not get_config('nvidia_api_key', ''):
         return jsonify({'error': "Aucun fournisseur IA configuré (Groq ou NVIDIA) — demandez à un administrateur de le renseigner dans Configuration."}), 400
 
+    # Fournisseur choisi dans le formulaire (le champ 'request' n'est plus accessible une
+    # fois dans le thread de fond, on le lit donc avant de le lancer).
+    preferred_provider = request.form.get('provider', 'groq').strip().lower()
+
     job_id = _job_create(['ai'])
 
     def worker():
         _job_step(job_id, 'ai', 'running')
         try:
-            result_text, provider, model = run_ai_analysis(bid)
+            result_text, provider, model = run_ai_analysis(bid, preferred_provider=preferred_provider)
             now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             conn2 = get_db()
             conn2.execute('''UPDATE boites_compromises SET
@@ -3572,6 +3611,7 @@ def delete_boite(bid):
     conn.execute('DELETE FROM messages WHERE boite_id=?', (bid,))
     conn.execute('DELETE FROM signin_logs WHERE boite_id=?', (bid,))
     conn.execute('DELETE FROM audit_logs WHERE boite_id=?', (bid,))
+    conn.execute('DELETE FROM dsi_actions WHERE boite_id=?', (bid,))
     conn.execute('DELETE FROM boites_compromises WHERE id=?', (bid,))
     conn.commit()
     conn.close()
@@ -3579,7 +3619,39 @@ def delete_boite(bid):
     return redirect(url_for('index'))
 
 
+@app.route('/boite/<int:bid>/dsi-actions/add', methods=['POST'])
+def add_dsi_action(bid):
+    """Enregistre une action de remediation deja realisee par la DSI sur cette boite
+    (ex: mot de passe reinitialise). Visible sur la fiche de la boite, et injectee dans
+    le prompt d'analyse IA (voir build_ai_analysis_prompt) pour que l'IA en tienne compte
+    plutot que de re-recommander des actions deja effectuees."""
+    conn = get_db()
+    boite = conn.execute('SELECT id FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    if not boite:
+        conn.close()
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+    action_text = request.form.get('action_text', '').strip()
+    if action_text:
+        now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        conn.execute('INSERT INTO dsi_actions (boite_id, action_text, created_by, created_at) VALUES (?, ?, ?, ?)',
+                     (bid, action_text, session.get('username', ''), now_iso))
+        conn.commit()
+    conn.close()
+    return redirect(url_for('view_boite', bid=bid) + '#dsi-actions')
+
+
+@app.route('/boite/<int:bid>/dsi-actions/<int:action_id>/delete', methods=['POST'])
+def delete_dsi_action(bid, action_id):
+    conn = get_db()
+    conn.execute('DELETE FROM dsi_actions WHERE id=? AND boite_id=?', (action_id, bid))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('view_boite', bid=bid) + '#dsi-actions')
+
+
 @app.route('/boite/<int:bid>/messages/clear', methods=['POST'])
+@admin_required
 def clear_messages(bid):
     conn = get_db()
     boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
@@ -3630,7 +3702,7 @@ def clear_audit(bid):
     return redirect(url_for('view_boite', bid=bid))
 
 @app.route('/logs')
-@login_required
+@admin_required
 def view_logs():
     conn = get_db()
     page = request.args.get('page', 1, type=int)
@@ -3683,7 +3755,7 @@ def view_logs():
                            level_filter=level_filter, category_filter=category_filter, search=search)
 
 @app.route('/logs/clear', methods=['POST'])
-@login_required
+@admin_required
 def clear_logs():
     conn = get_db()
     conn.execute('DELETE FROM logs')
@@ -3693,7 +3765,7 @@ def clear_logs():
     return redirect(url_for('view_logs'))
 
 @app.route('/log/<int:log_id>')
-@login_required
+@admin_required
 def view_log_detail(log_id):
     conn = get_db()
     log = conn.execute('SELECT * FROM logs WHERE id=?', (log_id,)).fetchone()
@@ -4187,6 +4259,7 @@ def export_boite_pdf(bid):
 
 
 @app.route('/boite/<int:bid>/export')
+@admin_required
 def export_messages(bid):
     import io
     conn = get_db()

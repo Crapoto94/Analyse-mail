@@ -77,7 +77,7 @@
     <div class="card-header bg-success text-white d-flex justify-content-between align-items-center flex-wrap gap-2">
         <span><i class="bi bi-robot"></i> Analyse IA</span>
         {% if ai_configured %}
-        <form class="m-0"
+        <form class="m-0 d-flex align-items-center gap-2"
               onsubmit="event.preventDefault(); runBackgroundJob('{{ url_for('ai_analyze_start', bid=boite.id) }}', new FormData(this), ['ai'], 'Analyse IA en cours…',
                   function(redirect) {
                       // Le job redirige vers cette meme page (ancre #ai-analysis) : une simple
@@ -87,6 +87,16 @@
                       window.location.hash = 'ai-analysis';
                       window.location.reload();
                   });">
+            {% if groq_ai_configured and nvidia_ai_configured %}
+            <select name="provider" class="form-select form-select-sm w-auto" title="Fournisseur IA (l'autre est utilisé en repli automatique en cas d'échec)">
+                <option value="groq" selected>Groq</option>
+                <option value="nvidia">NVIDIA</option>
+            </select>
+            {% elif nvidia_ai_configured %}
+            <input type="hidden" name="provider" value="nvidia">
+            {% else %}
+            <input type="hidden" name="provider" value="groq">
+            {% endif %}
             <button type="submit" class="btn btn-sm btn-light">
                 <i class="bi bi-stars"></i> {% if boite.ai_analysis %}Relancer l'analyse IA{% else %}Lancer l'analyse IA{% endif %}
             </button>
@@ -120,8 +130,8 @@
         {% elif ai_configured %}
         <p class="text-muted mb-0">
             <i class="bi bi-info-circle"></i> Aucune analyse IA n'a encore été générée pour cette boîte. L'IA recevra les
-            connexions, le journal d'audit et les signaux déjà détectés par l'analyse heuristique ci-dessus, et
-            proposera un scénario probable ainsi que des recommandations.
+            connexions, le journal d'audit, les signaux déjà détectés par l'analyse heuristique ci-dessus et les actions
+            DSI déjà enregistrées ci-dessous, et proposera un scénario probable ainsi que des recommandations qui en tiennent compte.
         </p>
         {% else %}
         <p class="text-muted mb-0">
@@ -132,6 +142,45 @@
     </div>
 </div>
 
+<div class="card mb-4" id="dsi-actions">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-clipboard-check"></i> Actions DSI ({{ dsi_actions|length }})</span>
+        <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#dsi-action-form">
+            <i class="bi bi-plus-lg"></i>
+        </button>
+    </div>
+    <div class="collapse" id="dsi-action-form">
+        <div class="card-body border-bottom bg-light">
+            <form method="POST" action="{{ url_for('add_dsi_action', bid=boite.id) }}" class="d-flex gap-2">
+                <input type="text" name="action_text" class="form-control form-control-sm" placeholder="Ex : mot de passe réinitialisé le 09/09, MFA renforcé..." required maxlength="500">
+                <button type="submit" class="btn btn-sm btn-primary text-nowrap">
+                    <i class="bi bi-check-lg"></i> Ajouter
+                </button>
+            </form>
+        </div>
+    </div>
+    <div class="card-body">
+        {% if dsi_actions %}
+        <ul class="list-group list-group-flush">
+            {% for a in dsi_actions %}
+            <li class="list-group-item d-flex justify-content-between align-items-start gap-2">
+                <div>
+                    {{ a.action_text }}
+                    <br><small class="text-muted">{{ a.created_at|paris if a.created_at else '' }}{% if a.created_by %} — {{ a.created_by }}{% endif %}</small>
+                </div>
+                <form method="POST" action="{{ url_for('delete_dsi_action', bid=boite.id, action_id=a.id) }}" onsubmit="return confirm('Supprimer cette action ?')">
+                    <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                </form>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-muted mb-0"><i class="bi bi-info-circle"></i> Aucune action enregistrée. Utilisez le bouton "+" pour documenter les actions déjà réalisées (reset de mot de passe, MFA renforcé...) — elles seront prises en compte par l'analyse IA ci-dessus.</p>
+        {% endif %}
+    </div>
+</div>
+
+{% if session.get('role') == 'admin' %}
 <div class="row mb-4">
     <div class="col-md-4">
         <div class="card stat-card">
@@ -158,6 +207,7 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 <div class="row mb-4">
     <div class="col-md-6">
@@ -256,6 +306,7 @@
     </div>
 </div>
 
+{% if session.get('role') == 'admin' %}
 {% if statuts %}
 <div class="card mb-4">
     <div class="card-header">Statuts des messages</div>
@@ -669,6 +720,7 @@
         {% endif %}
     </div>
 </div>
+{% endif %}
 
 <script>
 function filterMessages() {

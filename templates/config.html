@@ -247,8 +247,9 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                         <div class="form-text">
                             Variables disponibles, remplacées automatiquement : <code>{{ '{{email}}' }}</code>,
                             <code>{{ '{{score}}' }}</code>, <code>{{ '{{verdict}}' }}</code>,
-                            <code>{{ '{{findings}}' }}</code> (signaux détectés automatiquement) et
-                            <code>{{ '{{events}}' }}</code> (chronologie des connexions/audit).
+                            <code>{{ '{{findings}}' }}</code> (signaux détectés automatiquement),
+                            <code>{{ '{{events}}' }}</code> (chronologie des connexions/audit) et
+                            <code>{{ '{{dsi_actions}}' }}</code> (actions de remédiation déjà saisies sur la fiche de la boîte).
                         </div>
                     </div>
                     <button type="submit" class="btn btn-success">
