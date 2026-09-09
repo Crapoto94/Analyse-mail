@@ -435,8 +435,8 @@ def init_db():
     )''')
 
     # Connexions de TOUT le tenant (pas limitees aux boites deja suivies) : alimentee par
-    # refresh_tenant_signins(), rafraichie automatiquement toutes les TENANT_SIGNINS_REFRESH_MINUTES
-    # minutes par le planificateur de surveillance — voir /connexions.
+    # refresh_tenant_signins(), rafraichie automatiquement toutes les N minutes (reglable,
+    # voir get_tenant_signins_refresh_minutes) par le planificateur de surveillance — voir /connexions.
     c.execute('''CREATE TABLE IF NOT EXISTS tenant_signins (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT UNIQUE,
@@ -3736,9 +3736,87 @@ def _monitoring_scan_due(row, now):
 # duree de conservation des lignes recuperees, au-dela de laquelle elles sont purgees pour
 # eviter une croissance illimitee de la table (ce flux n'est pas rattache a une boite
 # precise, contrairement a signin_logs — c'est un instantane glissant, pas un historique
-# d'investigation).
-TENANT_SIGNINS_REFRESH_MINUTES = 5
-TENANT_SIGNINS_RETENTION_HOURS = 48
+# d'investigation). Valeurs par defaut, reglables par un administrateur depuis la page
+# /connexions — voir get_tenant_signins_refresh_minutes/get_tenant_signins_retention_hours.
+TENANT_SIGNINS_REFRESH_MINUTES_DEFAULT = 5
+TENANT_SIGNINS_RETENTION_HOURS_DEFAULT = 48
+
+
+def get_tenant_signins_refresh_minutes():
+    raw = get_config('tenant_signins_refresh_minutes', '').strip()
+    try:
+        value = int(raw)
+        if 1 <= value <= 1440:
+            return value
+    except ValueError:
+        pass
+    return TENANT_SIGNINS_REFRESH_MINUTES_DEFAULT
+
+
+def get_tenant_signins_retention_hours():
+    raw = get_config('tenant_signins_retention_hours', '').strip()
+    try:
+        value = int(raw)
+        if 1 <= value <= 24 * 30:
+            return value
+    except ValueError:
+        pass
+    return TENANT_SIGNINS_RETENTION_HOURS_DEFAULT
+
+
+# Pays de reference ("chez nous") pour le score de confiance des connexions — par defaut la
+# France, reglable depuis /connexions. Une connexion depuis ce pays n'est pas penalisee sur
+# le critere geographique ; le reste du monde est note par palier de proximite.
+HOME_COUNTRY_CODE_DEFAULT = 'FR'
+
+# Pays d'Europe (UE/EEE + Royaume-Uni + Suisse + Norvege/Islande/Liechtenstein), code
+# ISO 3166-1 alpha-2 : une connexion depuis l'un de ces pays (hors pays de reference) est
+# consideree moyennement proche geographiquement — ni "chez nous", ni "loin".
+EUROPE_COUNTRY_CODES = {
+    'FR', 'DE', 'BE', 'NL', 'LU', 'IT', 'ES', 'PT', 'IE', 'AT', 'DK', 'SE', 'FI', 'PL',
+    'CZ', 'SK', 'HU', 'RO', 'BG', 'GR', 'HR', 'SI', 'EE', 'LV', 'LT', 'CY', 'MT',
+    'GB', 'CH', 'NO', 'IS', 'LI',
+}
+
+
+def get_home_country_code():
+    raw = get_config('home_country_code', '').strip().upper()
+    return raw if len(raw) == 2 else HOME_COUNTRY_CODE_DEFAULT
+
+
+def compute_connection_trust_score(ip_payload, country_code):
+    """Score de confiance 0-100 pour une connexion, combinant trois signaux :
+    1. IP de confiance declaree (Ville...) : 100%, point final — c'est une IP connue.
+    2. Proximite geographique du pays de connexion par rapport au pays de reference
+       (voir get_home_country_code) : pays de reference > reste de l'Europe > ailleurs.
+    3. Reputation de l'IP (VPN/proxy/Tor detecte, score d'abus AbuseIPDB) : penalise le
+       score de base determine par la geographie.
+    `ip_payload` est le dict retourne par ip_reputation_payload (peut etre None si la
+    reputation n'a pas pu etre determinee — dans ce cas, seule la geographie compte)."""
+    if ip_payload and ip_payload.get('is_trusted'):
+        return 100
+
+    cc = (country_code or '').strip().upper()
+    home = get_home_country_code()
+    if cc and cc == home:
+        score = 90
+    elif cc in EUROPE_COUNTRY_CODES:
+        score = 60
+    elif cc:
+        score = 30
+    else:
+        score = 50  # pays inconnu/non renseigne : ni penalise a fond, ni traite comme fiable
+
+    if ip_payload:
+        if ip_payload.get('is_vpn'):
+            score -= 25
+        level = ip_payload.get('level')
+        if level == 'orange':
+            score -= 10
+        elif level == 'red':
+            score -= 40
+
+    return max(0, min(100, score))
 
 
 def refresh_tenant_signins():
@@ -3746,7 +3824,7 @@ def refresh_tenant_signins():
     confondus) depuis le dernier passage, en un seul appel Microsoft Graph pagine (pas de
     filtre par utilisateur) — a la difference du scan par boite qui doit interroger chaque
     utilisateur individuellement. Deduplique par request_id (identifiant Graph de
-    l'evenement), purge les lignes plus vieilles que TENANT_SIGNINS_RETENTION_HOURS."""
+    l'evenement), purge les lignes plus vieilles que get_tenant_signins_retention_hours() heures."""
     from datetime import timedelta
 
     now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -3777,7 +3855,7 @@ def refresh_tenant_signins():
              m['application'], m['client_app'], m['mfa_result'], m['flagged'], fetched_at))
     new_rows = conn.total_changes - before
 
-    cutoff = (now_dt - timedelta(hours=TENANT_SIGNINS_RETENTION_HOURS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    cutoff = (now_dt - timedelta(hours=get_tenant_signins_retention_hours())).strftime('%Y-%m-%dT%H:%M:%SZ')
     conn.execute('DELETE FROM tenant_signins WHERE date_utc < ?', (cutoff,))
     conn.commit()
     conn.close()
@@ -3795,7 +3873,7 @@ def monitoring_scheduler_tick():
        ecoule (ex: 'adm-*') pour ajouter les nouvelles boites correspondantes ;
     2. scanne toutes les boites surveillees actives dont l'intervalle est ecoule ;
     3. rafraichit le flux de connexions tenant (voir /connexions) toutes les
-       TENANT_SIGNINS_REFRESH_MINUTES minutes.
+       get_tenant_signins_refresh_minutes() minutes.
     Ne fait rien si la configuration Microsoft Graph est incomplete."""
     if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
         return
@@ -3806,7 +3884,7 @@ def monitoring_scheduler_tick():
     if last_signins_refresh:
         last = _parse_iso(last_signins_refresh)
         if last:
-            signins_due = (now - last).total_seconds() / 60 >= TENANT_SIGNINS_REFRESH_MINUTES
+            signins_due = (now - last).total_seconds() / 60 >= get_tenant_signins_refresh_minutes()
     if signins_due:
         try:
             refresh_tenant_signins()
@@ -3870,19 +3948,59 @@ def view_monitoring():
 @admin_required
 def view_tenant_signins():
     """Monitoring des connexions de tout le tenant (reussies et echouees), sans se limiter
-    aux boites deja suivies — alimente automatiquement toutes les TENANT_SIGNINS_REFRESH_MINUTES
-    minutes par le planificateur (voir refresh_tenant_signins/monitoring_scheduler_tick)."""
+    aux boites deja suivies — alimente automatiquement toutes les get_tenant_signins_refresh_minutes()
+    minutes par le planificateur (voir refresh_tenant_signins/monitoring_scheduler_tick).
+    Chaque connexion est accompagnee d'un score de confiance 0-100 (voir
+    compute_connection_trust_score) combinant IP de confiance, geographie et reputation."""
     conn = get_db()
     rows = conn.execute('SELECT * FROM tenant_signins ORDER BY date_utc DESC LIMIT 1000').fetchall()
     nb_total = conn.execute('SELECT COUNT(*) as c FROM tenant_signins').fetchone()['c']
     nb_failed = conn.execute("SELECT COUNT(*) as c FROM tenant_signins WHERE status != 'Success'").fetchone()['c']
     conn.close()
+
+    rows_with_trust = []
+    for r in rows:
+        try:
+            ip_payload = ip_reputation_payload(r['ip_address'])
+        except Exception:
+            ip_payload = None
+        trust = compute_connection_trust_score(ip_payload, r['country'])
+        rows_with_trust.append({'row': r, 'trust': trust})
+
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     last_refresh = get_config('tenant_signins_last_fetch_at', '')
-    return render_template('tenant_signins.html', rows=rows, nb_total=nb_total, nb_failed=nb_failed,
+    return render_template('tenant_signins.html', rows=rows_with_trust, nb_total=nb_total, nb_failed=nb_failed,
                             graph_configured=graph_configured, last_refresh=last_refresh,
-                            refresh_minutes=TENANT_SIGNINS_REFRESH_MINUTES,
-                            retention_hours=TENANT_SIGNINS_RETENTION_HOURS)
+                            refresh_minutes=get_tenant_signins_refresh_minutes(),
+                            retention_hours=get_tenant_signins_retention_hours(),
+                            home_country_code=get_home_country_code())
+
+
+@app.route('/connexions/settings', methods=['POST'])
+@admin_required
+def update_tenant_signins_settings():
+    def _save_int(field, config_key, lo, hi):
+        raw = request.form.get(field, '').strip()
+        try:
+            value = int(raw)
+            if lo <= value <= hi:
+                set_config(config_key, str(value))
+                return True
+        except ValueError:
+            pass
+        return False
+
+    ok = True
+    ok &= _save_int('refresh_minutes', 'tenant_signins_refresh_minutes', 1, 1440)
+    ok &= _save_int('retention_hours', 'tenant_signins_retention_hours', 1, 24 * 30)
+    home_country = request.form.get('home_country_code', '').strip().upper()
+    if len(home_country) == 2:
+        set_config('home_country_code', home_country)
+    elif home_country:
+        ok = False
+
+    flash('Paramètres enregistrés' if ok else 'Paramètres enregistrés (certaines valeurs invalides ont été ignorées)')
+    return redirect(url_for('view_tenant_signins'))
 
 
 @app.route('/connexions/refresh', methods=['POST'])

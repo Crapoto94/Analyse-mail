@@ -9,6 +9,9 @@
                 <i class="bi bi-arrow-clockwise"></i> Rafraîchir maintenant
             </button>
         </form>
+        <button type="button" class="btn btn-outline-secondary" data-bs-toggle="collapse" data-bs-target="#signins-settings">
+            <i class="bi bi-gear"></i> Paramètres
+        </button>
         <a href="{{ url_for('view_monitoring') }}" class="btn btn-secondary">
             <i class="bi bi-arrow-left"></i> Surveillance
         </a>
@@ -22,12 +25,41 @@
 </div>
 {% endif %}
 
+<div class="collapse mb-4" id="signins-settings">
+    <div class="card">
+        <div class="card-header">Paramètres</div>
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('update_tenant_signins_settings') }}" class="row g-3 align-items-end">
+                <div class="col-md-3">
+                    <label class="form-label small mb-1">Rafraîchissement automatique (minutes)</label>
+                    <input type="number" class="form-control" name="refresh_minutes" value="{{ refresh_minutes }}" min="1" max="1440">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small mb-1">Conservation (heures glissantes)</label>
+                    <input type="number" class="form-control" name="retention_hours" value="{{ retention_hours }}" min="1" max="720">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small mb-1">Pays de référence (score de confiance)</label>
+                    <input type="text" class="form-control" name="home_country_code" value="{{ home_country_code }}" maxlength="2" style="text-transform:uppercase;" placeholder="FR">
+                    <div class="form-text">Code ISO 2 lettres (ex: FR).</div>
+                </div>
+                <div class="col-md-3 d-grid">
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> Enregistrer</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <p class="text-muted small">
     Connexions <strong>réussies et échouées, tous utilisateurs confondus</strong> — pas seulement les boîtes déjà
     suivies — récupérées en un seul appel Microsoft Graph par passage (pas d'interrogation boîte par boîte).
     Rafraîchi automatiquement toutes les <strong>{{ refresh_minutes }} minutes</strong>, conservé
     <strong>{{ retention_hours }}h</strong> glissantes.
     {% if last_refresh %}Dernier rafraîchissement : <strong>{{ last_refresh|paris }}</strong>.{% endif %}
+    Score de confiance : 100 % pour une IP de confiance déclarée, sinon calculé selon le pays de connexion
+    (référence <strong>{{ home_country_code }}</strong> > Europe > ailleurs) et la réputation de l'IP (VPN/proxy/Tor,
+    signalements).
 </p>
 
 <div class="row mb-4">
@@ -62,10 +94,11 @@
         <div class="table-responsive" style="max-height:650px; overflow-y:auto;">
             <table class="table table-hover table-sm" id="signins-table">
                 <thead>
-                    <tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Localisation</th><th>Application</th><th>MFA</th><th>Statut</th><th>Détail échec</th></tr>
+                    <tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Localisation</th><th>Application</th><th>MFA</th><th>Statut</th><th>Détail échec</th><th>Confiance</th></tr>
                 </thead>
                 <tbody>
-                    {% for r in rows %}
+                    {% for item in rows %}
+                    {% set r = item.row %}
                     <tr data-status="{{ r.status }}">
                         <td><small>{{ r.date_utc|paris }}</small></td>
                         <td><small>{{ r.user_display_name or r.user_upn }}</small></td>
@@ -75,9 +108,14 @@
                         <td><small>{{ r.mfa_result or '—' }}</small></td>
                         <td><span class="badge bg-{% if r.status == 'Success' %}success{% else %}danger{% endif %}">{{ 'Réussie' if r.status == 'Success' else 'Échec' }}</span></td>
                         <td><small>{{ r.failure_reason or '' }}</small></td>
+                        <td>
+                            <span class="badge bg-{% if item.trust >= 80 %}success{% elif item.trust >= 50 %}warning text-dark{% else %}danger{% endif %}">
+                                {{ item.trust }}%
+                            </span>
+                        </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="8" class="text-muted text-center py-3">Aucune connexion récupérée pour le moment.</td></tr>
+                    <tr><td colspan="9" class="text-muted text-center py-3">Aucune connexion récupérée pour le moment.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
