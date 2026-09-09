@@ -166,6 +166,54 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                 <div id="test-result-graph" class="mt-3" style="display:none;"></div>
             </div>
         </div>
+
+        <div class="card mt-4">
+            <div class="card-header bg-success text-white">
+                <h4 class="mb-0"><i class="bi bi-robot"></i> Analyse IA (Groq)</h4>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Permet d'utiliser un bouton <strong>« Analyse IA »</strong> sur chaque boîte pour demander à un
+                    modèle de langage d'expliquer le scénario le plus probable à partir des connexions et du journal
+                    d'audit déjà collectés, avec des recommandations. Clé disponible sur
+                    <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a> (gratuit).
+                </p>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="groq_api_key" class="form-label">Clé API Groq</label>
+                        <input type="password" class="form-control" id="groq_api_key" name="groq_api_key" placeholder="{% if groq_api_key_set %}•••••••• (laisser vide pour conserver la clé actuelle){% else %}Saisir la clé API (gsk_...)...{% endif %}">
+                        {% if groq_api_key_set %}
+                        <div class="form-text text-success"><i class="bi bi-check-circle"></i> Une clé est déjà enregistrée.</div>
+                        {% endif %}
+                    </div>
+                    <div class="mb-3">
+                        <label for="groq_model" class="form-label">Modèle</label>
+                        <select class="form-select" id="groq_model" name="groq_model">
+                            {% for m in groq_available_models %}
+                            <option value="{{ m }}" {% if m == groq_model %}selected{% endif %}>{{ m }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="groq_prompt_template" class="form-label">Prompt d'analyse</label>
+                        <textarea class="form-control" id="groq_prompt_template" name="groq_prompt_template" rows="12" style="font-family: monospace; font-size: 0.85em;">{{ groq_prompt_template }}</textarea>
+                        <div class="form-text">
+                            Variables disponibles, remplacées automatiquement : <code>{{ '{{email}}' }}</code>,
+                            <code>{{ '{{score}}' }}</code>, <code>{{ '{{verdict}}' }}</code>,
+                            <code>{{ '{{findings}}' }}</code> (signaux détectés automatiquement) et
+                            <code>{{ '{{events}}' }}</code> (chronologie des connexions/audit).
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-success">
+                        <i class="bi bi-check-lg"></i> Enregistrer
+                    </button>
+                    <button type="button" class="btn btn-outline-success" onclick="testGroqApi()">
+                        <i class="bi bi-plug"></i> Tester la connexion
+                    </button>
+                </form>
+                <div id="test-result-groq" class="mt-3" style="display:none;"></div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -222,6 +270,25 @@ function testGraphApi() {
     resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
 
     fetch('{{ url_for("test_api_graph") }}')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            } else {
+                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            }
+        })
+        .catch(error => {
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
+        });
+}
+
+function testGroqApi() {
+    const resultDiv = document.getElementById('test-result-groq');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours... (peut prendre quelques secondes)</div>';
+
+    fetch('{{ url_for("test_api_groq") }}')
         .then(response => response.json())
         .then(data => {
             if (data.success) {

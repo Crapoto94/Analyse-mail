@@ -298,6 +298,20 @@ def init_db():
         c.execute('ALTER TABLE messages ADD COLUMN urls TEXT')
     except:
         pass
+    # Migration : resultat de la derniere analyse IA (Groq) sur la boite, mis en cache
+    # pour ne pas avoir a rappeler l'API a chaque affichage de la fiche.
+    try:
+        c.execute('ALTER TABLE boites_compromises ADD COLUMN ai_analysis TEXT')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE boites_compromises ADD COLUMN ai_analysis_at TEXT')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE boites_compromises ADD COLUMN ai_analysis_model TEXT')
+    except:
+        pass
     c.execute('''CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -1519,6 +1533,7 @@ def view_boite(bid):
         nb_rules = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
         nb_suspicious_rules = conn.execute("SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (bid,)).fetchone()['c']
         graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+        groq_configured = bool(get_config('groq_api_key', ''))
         risk_analysis = analyze_compromise(bid)
         risk_score = risk_analysis['score']
         risk_verdict = risk_analysis['verdict']
@@ -1609,7 +1624,7 @@ def view_boite(bid):
                          sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc,
                          nb_signins=nb_signins, nb_audit=nb_audit,
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
-                         graph_configured=graph_configured,
+                         graph_configured=graph_configured, groq_configured=groq_configured,
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count)
 
 def _timeline_query(conn, table, bid):
@@ -2109,6 +2124,144 @@ def analyze_compromise(boite_id):
     conn.close()
     owner_domain = (boite_row['user_email'].split('@')[-1] if boite_row and '@' in (boite_row['user_email'] or '') else '')
     return analyze_compromise_events(events, suspicious_rules=suspicious_rules, owner_domain=owner_domain)
+
+
+# ============================================================================
+# Analyse IA (Groq) : envoie un resume structure des journaux d'une boite (evenements +
+# signaux deja detectes par l'analyse heuristique) a un modele de langage via l'API Groq
+# (compatible OpenAI), et demande une explication du scenario le plus probable ainsi que
+# des recommandations. Le prompt est entierement parametrable en configuration (admin) ;
+# GROQ_DEFAULT_PROMPT_TEMPLATE n'est utilise que si l'admin n'a rien personnalise.
+# ============================================================================
+
+GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
+GROQ_DEFAULT_MODEL = 'llama-3.3-70b-versatile'
+GROQ_AVAILABLE_MODELS = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'meta-llama/llama-4-maverick-17b-128e-instruct',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+]
+
+GROQ_DEFAULT_PROMPT_TEMPLATE = """Tu es un analyste en cybersécurité spécialisé dans la réponse à incident sur Microsoft 365 / Entra ID (Azure AD).
+
+Voici les journaux collectés pour la boîte {{email}}, ainsi que le résultat d'une analyse heuristique automatique (score de risque {{score}}/10, verdict : {{verdict}}).
+
+Signaux détectés automatiquement :
+{{findings}}
+
+Chronologie des événements (connexions et audit, du plus ancien au plus récent) :
+{{events}}
+
+En te basant uniquement sur ces éléments, réponds en français et de façon structurée :
+1. Ce que tu observes concrètement dans ces journaux.
+2. Le scénario le plus probable (la boîte est-elle réellement compromise ? Si oui, comment et depuis quand ? Sinon, pourquoi ces signaux sont probablement bénins ?).
+3. Ton niveau de confiance dans ce scénario et les éléments qui manquent pour en être sûr.
+4. Des recommandations concrètes et priorisées pour l'équipe sécurité."""
+
+# Nombre maximum d'evenements inclus dans le prompt (les plus recents) : au-dela, le
+# prompt devient trop volumineux (cout/latence de l'API, risque de depassement du
+# contexte du modele) sans apporter d'information supplementaire utile a l'analyse.
+GROQ_MAX_EVENTS_IN_PROMPT = 200
+
+
+def _render_ai_prompt(template, values):
+    """Remplace les paires {{cle}} dans le gabarit par leur valeur. Volontairement pas
+    de str.format() : le gabarit est du texte libre parametre par l'admin et peut tres
+    bien contenir des accolades simples (extraits de logs, JSON...) qui feraient planter
+    .format() avec une KeyError/IndexError."""
+    out = template
+    for key, val in values.items():
+        out = out.replace('{{' + key + '}}', str(val))
+    return out
+
+
+def build_ai_analysis_prompt(bid):
+    """Construit le prompt d'analyse IA pour une boite : reutilise l'analyse heuristique
+    deja existante (evenements + signaux) plutot que d'exporter les journaux bruts, pour
+    donner au modele un contexte deja structure et de taille maitrisee."""
+    conn = get_db()
+    boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    conn.close()
+    if not boite:
+        raise ValueError('Boîte non trouvée')
+
+    analysis = analyze_compromise(bid)
+    findings = analysis['findings']
+    events = analysis['events']
+
+    findings_text = '\n'.join(
+        f"- [{f['severity'].upper()}] {f['title']} — {f['description']}" for f in findings
+    ) or "Aucun signal détecté par l'analyse automatique."
+
+    shown_events = events[-GROQ_MAX_EVENTS_IN_PROMPT:]
+    events_lines = []
+    for e in shown_events:
+        status = 'succès' if e['success'] else 'échec'
+        events_lines.append(
+            f"- {e['timestamp']} [{e['type']}] ({status}) {e['title']} — {e['detail']} "
+            f"(IP: {e['ip'] or 'N/A'}, pays: {e.get('country') or 'N/A'})")
+    events_text = '\n'.join(events_lines) or 'Aucun événement.'
+    if len(events) > GROQ_MAX_EVENTS_IN_PROMPT:
+        events_text += f"\n(+{len(events) - GROQ_MAX_EVENTS_IN_PROMPT} événement(s) plus ancien(s) non affiché(s) pour limiter la taille de l'analyse)"
+
+    template = get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE
+    return _render_ai_prompt(template, {
+        'email': boite['user_email'],
+        'score': analysis['score'],
+        'verdict': analysis['verdict'],
+        'findings': findings_text,
+        'events': events_text,
+    }), analysis
+
+
+def call_groq_chat(prompt, api_key=None, model=None, timeout=60):
+    """Appelle l'API de completion de chat Groq (compatible OpenAI) et retourne le texte
+    de la reponse. Utilise urllib (comme les autres appels API du projet) plutot qu'une
+    dependance supplementaire."""
+    import urllib.request
+    import urllib.error
+
+    api_key = api_key or get_config('groq_api_key', '')
+    model = model or get_config('groq_model', '') or GROQ_DEFAULT_MODEL
+    if not api_key:
+        raise RuntimeError("Clé API Groq non configurée")
+
+    payload = json.dumps({
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.3,
+        'max_tokens': 2000,
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        GROQ_API_URL, data=payload, method='POST',
+        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'})
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        try:
+            msg = json.loads(body).get('error', {}).get('message', body)
+        except Exception:
+            msg = body
+        raise RuntimeError(f'Erreur API Groq (HTTP {e.code}) : {msg}')
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Erreur réseau vers l'API Groq : {e.reason}")
+
+    choices = data.get('choices') or []
+    if not choices:
+        raise RuntimeError('Réponse Groq vide (aucun choix retourné)')
+    return choices[0]['message']['content']
+
+
+def run_ai_analysis(bid):
+    """Construit le prompt pour la boite, interroge Groq, et retourne le texte de
+    l'analyse. Ne persiste rien : c'est a l'appelant de sauvegarder le resultat."""
+    prompt, _analysis = build_ai_analysis_prompt(bid)
+    return call_groq_chat(prompt)
 
 
 def quick_scan_mailbox(user_upn, days=7, on_step=None):
@@ -2925,6 +3078,44 @@ def graph_fetch_start(bid):
     return jsonify({'job_id': job_id})
 
 
+@app.route('/boite/<int:bid>/ai-analyze/start', methods=['POST'])
+def ai_analyze_start(bid):
+    """Lance l'analyse IA (Groq) d'une boite en tache de fond (appel reseau potentiellement
+    long) et retourne un identifiant de job suivi via /jobs/<job_id>/poll, meme principe que
+    le scan rapide et l'import Microsoft Graph."""
+    conn = get_db()
+    boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    conn.close()
+    if not boite:
+        return jsonify({'error': 'Boîte non trouvée'}), 404
+    if not get_config('groq_api_key', ''):
+        return jsonify({'error': "Clé API Groq non configurée — demandez à un administrateur de la renseigner dans Configuration."}), 400
+
+    job_id = _job_create(['ai'])
+
+    def worker():
+        _job_step(job_id, 'ai', 'running')
+        try:
+            result_text = run_ai_analysis(bid)
+            now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            model = get_config('groq_model', '') or GROQ_DEFAULT_MODEL
+            conn2 = get_db()
+            conn2.execute('UPDATE boites_compromises SET ai_analysis=?, ai_analysis_at=?, ai_analysis_model=? WHERE id=?',
+                          (result_text, now_iso, model, bid))
+            conn2.commit()
+            conn2.close()
+            add_log('INFO', 'IA', f"Analyse IA effectuée pour {boite['user_email']}", f'Modèle : {model}', bid)
+            _job_step(job_id, 'ai', 'done')
+            _job_finish(job_id, redirect=f'/boite/{bid}#ai-analysis')
+        except Exception as e:
+            add_log('ERROR', 'IA', f"Échec de l'analyse IA pour {boite['user_email']}", str(e), bid)
+            _job_step(job_id, 'ai', 'error')
+            _job_finish(job_id, error=f"Erreur lors de l'analyse IA : {e}")
+
+    threading.Thread(target=worker, daemon=True, name=f'ai-analyze-{job_id[:8]}').start()
+    return jsonify({'job_id': job_id})
+
+
 @app.route('/boite/<int:bid>/rules')
 def view_rules(bid):
     conn = get_db()
@@ -3472,6 +3663,16 @@ def config():
                 set_config('graph_client_secret', new_secret.strip())
             _graph_token_cache['token'] = None
             flash('Configuration Microsoft Graph enregistrée avec succès')
+        elif 'groq_api_key' in request.form or 'groq_model' in request.form or 'groq_prompt_template' in request.form:
+            # Ne pas ecraser la cle existante si le champ est laisse vide (meme logique
+            # que pour le secret Graph : evite d'effacer accidentellement une cle deja
+            # enregistree lors d'une simple mise a jour du modele/prompt).
+            new_key = request.form.get('groq_api_key', '')
+            if new_key:
+                set_config('groq_api_key', new_key.strip())
+            set_config('groq_model', request.form.get('groq_model', '').strip())
+            set_config('groq_prompt_template', request.form.get('groq_prompt_template', '').strip())
+            flash('Configuration IA (Groq) enregistrée avec succès')
         return redirect(url_for('config'))
 
     return render_template('config.html',
@@ -3489,7 +3690,11 @@ def config():
         graph_tenant_id=get_config('graph_tenant_id', ''),
         graph_client_id=get_config('graph_client_id', ''),
         graph_client_secret_set=bool(get_config('graph_client_secret', '')),
-        microsoft_redirect_uri=url_for('microsoft_callback', _external=True))
+        microsoft_redirect_uri=url_for('microsoft_callback', _external=True),
+        groq_api_key_set=bool(get_config('groq_api_key', '')),
+        groq_model=get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
+        groq_available_models=GROQ_AVAILABLE_MODELS,
+        groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE)
 
 @app.route('/api/test-graph')
 @admin_required
@@ -3499,6 +3704,15 @@ def test_api_graph():
         orgs = graph_get_all('/organization')
         org_name = orgs[0].get('displayName') if orgs else 'N/A'
         return jsonify({'success': True, 'message': f"Connexion Microsoft Graph réussie (tenant : {org_name})"})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/test-groq')
+@admin_required
+def test_api_groq():
+    try:
+        reply = call_groq_chat("Réponds uniquement par : OK")
+        return jsonify({'success': True, 'message': f"Connexion à l'API Groq réussie — réponse du modèle : {reply.strip()[:200]}"})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 
