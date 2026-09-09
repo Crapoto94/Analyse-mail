@@ -50,7 +50,7 @@
         <tbody>
             {% for log in logs %}
             <tr class="{% if log.level=='ERROR' %}table-danger{% elif log.level=='WARNING' %}table-warning{% endif %} clickable-row" onclick="window.location='{{ url_for('view_log_detail', log_id=log.id) }}'" style="cursor: pointer;">
-                <td><small>{{ log.timestamp }}</small></td>
+                <td><small>{{ log.timestamp|paris }}</small></td>
                 <td><span class="badge {% if log.level=='ERROR' %}bg-danger{% elif log.level=='WARNING' %}bg-warning{% else %}bg-info{% endif %}">{{ log.level }}</span></td>
                 <td>{{ log.category }}</td>
                 <td>{{ log.message }}</td>

@@ -78,7 +78,7 @@
                 <thead><tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Emplacement</th><th>Application</th></tr></thead>
                 <tbody>
                 {% for s in flagged_rows[:100] %}
-                <tr><td><small>{{ s.date_utc }}</small></td><td><small>{{ s.user_upn }}</small></td>
+                <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
                     <td><code><small>{{ s.ip_address }}</small></code></td><td><small>{{ s.location }}</small></td>
                     <td><small>{{ s.application }}</small></td></tr>
                 {% endfor %}
@@ -94,7 +94,7 @@
                 <thead><tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Pays</th><th>Application</th><th>MFA</th></tr></thead>
                 <tbody>
                 {% for s in foreign_success[:100] %}
-                <tr><td><small>{{ s.date_utc }}</small></td><td><small>{{ s.user_upn }}</small></td>
+                <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
                     <td><code><small>{{ s.ip_address }}</small></code></td><td><span class="badge bg-warning text-dark">{{ s.country }}</span></td>
                     <td><small>{{ s.application }}</small></td><td><small>{{ s.mfa_result or '-' }}</small></td></tr>
                 {% endfor %}
@@ -110,7 +110,7 @@
                 <thead><tr><th>Date</th><th>Utilisateur</th><th>IP</th><th>Emplacement</th><th>Code erreur</th><th>Raison</th></tr></thead>
                 <tbody>
                 {% for s in failed_rows[:100] %}
-                <tr><td><small>{{ s.date_utc }}</small></td><td><small>{{ s.user_upn }}</small></td>
+                <tr><td><small>{{ s.date_utc|paris }}</small></td><td><small>{{ s.user_upn }}</small></td>
                     <td><code><small>{{ s.ip_address }}</small></code></td><td><small>{{ s.location }}</small></td>
                     <td><small>{{ s.error_code }}</small></td><td><small>{{ s.failure_reason }}</small></td></tr>
                 {% endfor %}
@@ -177,7 +177,7 @@
 <div class="card mb-4">
     <div class="card-header"><i class="bi bi-graph-up"></i> Timeline des connexions (par tranche de 15 min)</div>
     <div class="card-body">
-        <p class="text-muted small mb-2">Fenêtre : <strong>{{ first_signin or 'N/A' }}</strong> → <strong>{{ last_signin or 'N/A' }}</strong></p>
+        <p class="text-muted small mb-2">Fenêtre : <strong>{{ first_signin|paris if first_signin else 'N/A' }}</strong> → <strong>{{ last_signin|paris if last_signin else 'N/A' }}</strong></p>
         <canvas id="signinTimelineChart" style="max-height:300px;"></canvas>
     </div>
 </div>
@@ -229,13 +229,13 @@
                 <tbody>
                     {% for s in signins %}
                     <tr>
-                        <td><small>{{ s.date_utc }}</small></td>
+                        <td><small>{{ s.date_utc|paris }}</small></td>
                         <td><small>{{ s.user_upn or s.user_display_name }}</small></td>
                         <td><code><small>{{ s.ip_address }}</small></code></td>
                         <td><small>{{ s.location }}</small></td>
                         <td><small>{{ s.application }}</small></td>
                         <td>
-                            <span class="badge bg-{% if s.status and 'ussi' in s.status.lower() %}success{% else %}danger{% endif %}">
+                            <span class="badge bg-{% if s.status and ('ussi' in s.status.lower() or 'success' in s.status.lower()) %}success{% else %}danger{% endif %}">
                                 {{ s.status }}
                             </span>
                             {% if s.flagged and s.flagged.lower() in ('true','vrai','oui','1') %}<span class="badge bg-warning text-dark">Signalé</span>{% endif %}

@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Timeline - {{ boite.user_email }}{% endblock %}
+{% block content %}
+<style>
+    .tl { position: relative; margin-left: 10px; padding-left: 30px; border-left: 3px solid #dee2e6; }
+    .tl-item { position: relative; margin-bottom: 1.1rem; }
+    .tl-item::before {
+        content: ''; position: absolute; left: -37px; top: 4px; width: 14px; height: 14px;
+        border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 2px #adb5bd; background: #adb5bd;
+    }
+    .tl-item.signin.success::before { background: #198754; box-shadow: 0 0 0 2px #198754; }
+    .tl-item.signin.fail::before { background: #dc3545; box-shadow: 0 0 0 2px #dc3545; }
+    .tl-item.audit::before { background: #fd7e14; box-shadow: 0 0 0 2px #fd7e14; }
+    .tl-item.flagged::before { background: #6f42c1; box-shadow: 0 0 0 3px #6f42c1; }
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-clock-history"></i> Timeline complète - {{ boite.user_email }}</h1>
+    <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Retour à la boîte
+    </a>
+</div>
+
+{% if verdict == 'compromise_likely' %}
+<div class="alert alert-danger">
+    <h4 class="alert-heading"><i class="bi bi-exclamation-octagon-fill"></i> Compromission probable</h4>
+    <p class="mb-0">Un ou plusieurs signaux forts (déplacement impossible, action sensible juste après une connexion suspecte,
+        règle de messagerie malveillante...) ont été détectés automatiquement ci-dessous. Traitez ce compte comme compromis :
+        réinitialisation du mot de passe, révocation des sessions, vérification des règles de boîte de réception.</p>
+</div>
+{% elif verdict == 'signals_to_check' %}
+<div class="alert alert-warning">
+    <h4 class="alert-heading"><i class="bi bi-exclamation-triangle-fill"></i> Signaux à vérifier</h4>
+    <p class="mb-0">Des éléments méritent une vérification manuelle (connexion depuis un pays inhabituel, activité sensible...)
+        sans qu'un enchaînement clair de compromission n'ait été détecté automatiquement.</p>
+</div>
+{% else %}
+<div class="alert alert-success">
+    <h4 class="alert-heading"><i class="bi bi-check-circle-fill"></i> Aucun signal fort détecté automatiquement</h4>
+    <p class="mb-0">Aucune anomalie évidente sur les connexions et le journal d'audit importés. Cela ne remplace pas une
+        vérification manuelle, notamment si peu de données ont été importées.</p>
+</div>
+{% endif %}
+
+{% if findings %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-search"></i> Éléments détectés ({{ findings|length }})</div>
+    <div class="card-body">
+        {% for f in findings %}
+        <div class="alert mb-2 {% if f.severity == 'critical' %}alert-danger{% elif f.severity == 'high' %}alert-warning{% elif f.severity == 'medium' %}alert-secondary{% else %}alert-light{% endif %}">
+            <div class="d-flex justify-content-between align-items-start">
+                <strong>
+                    {% if f.severity == 'critical' %}<span class="badge bg-danger">CRITIQUE</span>
+                    {% elif f.severity == 'high' %}<span class="badge bg-warning text-dark">ÉLEVÉ</span>
+                    {% else %}<span class="badge bg-secondary">À VÉRIFIER</span>{% endif %}
+                    {{ f.title }}
+                </strong>
+                {% if f.events %}
+                <a href="#evt-{{ f.events[-1].type }}-{{ f.events[-1].ref_id }}" class="small">Voir dans la timeline ↓</a>
+                {% endif %}
+            </div>
+            <div class="small mt-1">{{ f.description }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+{% if not events %}
+<div class="alert alert-info">
+    Aucune connexion ni événement d'audit importé pour cette boîte. Importez un CSV ou récupérez les données via
+    <a href="{{ url_for('view_boite', bid=boite.id) }}">Microsoft Graph</a> pour construire la timeline.
+</div>
+{% else %}
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Chronologie complète ({{ events|length }} événements)</span>
+        <div class="input-group input-group-sm w-50">
+            <input type="text" id="filter-timeline" class="form-control" placeholder="Filtrer par utilisateur, IP, activité..." onkeyup="filterTimeline()">
+            <span class="input-group-text" id="timeline-match-count">0</span>
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="tl" id="timeline-list">
+            {% for e in events %}
+            <div id="evt-{{ e.type }}-{{ e.ref_id }}"
+                 class="tl-item {% if e.type == 'signin' %}signin {% if e.success %}success{% else %}fail{% endif %}{% else %}audit{% endif %}">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        {% if e.type == 'signin' %}
+                        <i class="bi bi-shield-lock text-{% if e.success %}success{% else %}danger{% endif %}"></i>
+                        {% else %}
+                        <i class="bi bi-journal-text text-warning"></i>
+                        {% endif %}
+                        <strong>{{ e.title }}</strong>
+                        <span class="badge bg-{% if e.type == 'signin' %}purple{% else %}orange{% endif %}" style="background-color:{% if e.type == 'signin' %}#6f42c1{% else %}#fd7e14{% endif %};">{{ 'Connexion' if e.type == 'signin' else 'Audit' }}</span>
+                    </div>
+                    <small class="text-muted text-nowrap ms-2">{{ e.timestamp|paris }}</small>
+                </div>
+                <div class="small text-muted">{{ e.detail }}</div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<script>
+function filterTimeline() {
+    var filter = document.getElementById('filter-timeline').value.toLowerCase().trim();
+    var items = document.querySelectorAll('#timeline-list .tl-item');
+    var matchCount = 0;
+    items.forEach(function(item) {
+        var text = item.textContent.toLowerCase();
+        if (filter === '' || text.indexOf(filter) > -1) {
+            item.style.display = '';
+            matchCount++;
+        } else {
+            item.style.display = 'none';
+        }
+    });
+    document.getElementById('timeline-match-count').textContent = matchCount + ' / ' + items.length;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Surveillance{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-eye"></i> Surveillance des boîtes</h1>
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Accueil
+    </a>
+</div>
+
+<p class="text-muted">
+    Scanne automatiquement (via Microsoft Graph) les boîtes ci-dessous à intervalle régulier pour détecter un
+    risque de compromission, sans créer de dossier d'investigation. Consultez le score et le verdict ci-dessous ;
+    la gestion des alertes (email, etc.) sera ajoutée ultérieurement — pensez à repasser régulièrement sur cette page.
+</p>
+
+{% if not graph_configured %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i> La configuration Microsoft Graph n'est pas complète : les scans automatiques
+    ne s'exécuteront pas tant qu'elle n'est pas renseignée dans <a href="{{ url_for('config') }}">Configuration</a>.
+</div>
+{% endif %}
+
+<div class="card mb-4">
+    <div class="card-header">Ajouter une boîte à surveiller</div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('add_monitored_mailbox') }}" class="row g-2 align-items-end">
+            <div class="col-md-6">
+                <label class="form-label small mb-1">Adresse email</label>
+                <input type="email" class="form-control" name="email" placeholder="utilisateur@ivry94.fr" required>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small mb-1">Intervalle (minutes)</label>
+                <input type="number" class="form-control" name="interval_minutes" value="60" min="5" max="10080" required>
+            </div>
+            <div class="col-md-3 d-grid">
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-plus-circle"></i> Ajouter
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Boîtes surveillées ({{ mailboxes|length }})</div>
+    <div class="card-body">
+        {% if not mailboxes %}
+        <div class="alert alert-info mb-0">Aucune boîte surveillée pour l'instant.</div>
+        {% else %}
+        <div class="table-responsive">
+            <table class="table table-hover table-sm align-middle">
+                <thead>
+                    <tr>
+                        <th>Boîte</th><th>Intervalle</th><th>Statut</th>
+                        <th>Dernier scan</th><th>Score</th><th>Verdict</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for m in mailboxes %}
+                    <tr>
+                        <td>{{ m.user_email }}</td>
+                        <td>
+                            <form method="POST" action="{{ url_for('update_monitored_mailbox', mailbox_id=m.id) }}" class="d-flex gap-1">
+                                <input type="number" name="interval_minutes" value="{{ m.interval_minutes }}" min="5" max="10080" class="form-control form-control-sm" style="width:80px;">
+                                <button type="submit" class="btn btn-sm btn-outline-secondary">min</button>
+                            </form>
+                        </td>
+                        <td>
+                            {% if m.is_active %}<span class="badge bg-success">Active</span>{% else %}<span class="badge bg-secondary">En pause</span>{% endif %}
+                        </td>
+                        <td><small class="text-muted">{{ m.last_scan_at|paris if m.last_scan_at else 'Jamais scannée' }}</small></td>
+                        <td>
+                            {% if m.last_scan_score is not none %}
+                            <span class="badge {% if m.last_scan_score >= 8 %}bg-danger{% elif m.last_scan_score >= 4 %}bg-warning text-dark{% elif m.last_scan_score >= 1 %}bg-secondary{% else %}bg-success{% endif %}">
+                                {{ m.last_scan_score }}/10
+                            </span>
+                            {% else %}<span class="text-muted">-</span>{% endif %}
+                        </td>
+                        <td>
+                            {% if m.last_scan_verdict == 'compromise_likely' %}<span class="text-danger small"><i class="bi bi-exclamation-octagon-fill"></i> Compromission probable</span>
+                            {% elif m.last_scan_verdict == 'signals_to_check' %}<span class="text-warning small"><i class="bi bi-exclamation-triangle-fill"></i> À vérifier</span>
+                            {% elif m.last_scan_verdict == 'no_strong_signal' %}<span class="text-success small"><i class="bi bi-check-circle-fill"></i> RAS</span>
+                            {% else %}<span class="text-muted small">-</span>{% endif %}
+                            {% if m.last_error %}<div class="small text-danger" title="{{ m.last_error }}"><i class="bi bi-exclamation-circle"></i> Erreur au dernier scan</div>{% endif %}
+                        </td>
+                        <td class="text-end text-nowrap">
+                            <form method="POST" action="{{ url_for('scan_now_monitored_mailbox', mailbox_id=m.id) }}" class="d-inline">
+                                <button type="submit" class="btn btn-sm btn-outline-primary" title="Scanner maintenant">
+                                    <i class="bi bi-arrow-repeat"></i>
+                                </button>
+                            </form>
+                            <form method="POST" action="{{ url_for('toggle_monitored_mailbox', mailbox_id=m.id) }}" class="d-inline">
+                                <button type="submit" class="btn btn-sm btn-outline-secondary" title="{% if m.is_active %}Mettre en pause{% else %}Réactiver{% endif %}">
+                                    <i class="bi bi-{% if m.is_active %}pause{% else %}play{% endif %}-fill"></i>
+                                </button>
+                            </form>
+                            <form method="POST" action="{{ url_for('delete_monitored_mailbox', mailbox_id=m.id) }}" class="d-inline"
+                                  onsubmit="return confirm('Retirer {{ m.user_email }} de la surveillance ?')">
+                                <button type="submit" class="btn btn-sm btn-outline-danger" title="Retirer">
+                                    <i class="bi bi-trash"></i>
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

@@ -65,7 +65,7 @@
                 <tbody>
                 {% for e in suspicious_events[:200] %}
                 <tr>
-                    <td><small>{{ e.date_utc }}</small></td>
+                    <td><small>{{ e.date_utc|paris }}</small></td>
                     <td><small><strong>{{ e.activite }}</strong></small></td>
                     <td><span class="badge bg-{% if e.resultat == 'Success' %}success{% else %}danger{% endif %}">{{ e.resultat }}</span></td>
                     <td><small>{{ e.actor_display_name or e.actor_upn }}</small></td>
@@ -135,7 +135,7 @@
 <div class="card mb-4">
     <div class="card-header"><i class="bi bi-graph-up"></i> Timeline des événements (par tranche de 15 min)</div>
     <div class="card-body">
-        <p class="text-muted small mb-2">Fenêtre : <strong>{{ first_event or 'N/A' }}</strong> → <strong>{{ last_event or 'N/A' }}</strong></p>
+        <p class="text-muted small mb-2">Fenêtre : <strong>{{ first_event|paris if first_event else 'N/A' }}</strong> → <strong>{{ last_event|paris if last_event else 'N/A' }}</strong></p>
         <canvas id="auditTimelineChart" style="max-height:300px;"></canvas>
     </div>
 </div>
@@ -158,7 +158,7 @@
                 <tbody>
                     {% for e in events %}
                     <tr>
-                        <td><small>{{ e.date_utc }}</small></td>
+                        <td><small>{{ e.date_utc|paris }}</small></td>
                         <td><small>{{ e.activite }}</small></td>
                         <td><span class="badge bg-{% if e.resultat == 'Success' %}success{% else %}danger{% endif %}">{{ e.resultat }}</span></td>
                         <td><small>{{ e.actor_display_name or e.actor_upn }}</small></td>

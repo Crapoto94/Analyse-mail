@@ -27,7 +27,7 @@
     <div class="stat-card">
         <strong>Date compromission :</strong> {{ boite.date_compromission }} {{ boite.heure_compromission }}<br>
         <strong>Date découverte :</strong> {{ boite.date_decouverte }}<br>
-        <strong>Fenêtre d'attaque :</strong> {{ first_msg }} à {{ last_msg }}
+        <strong>Fenêtre d'attaque :</strong> {{ first_msg|paris if first_msg else '' }} à {{ last_msg|paris if last_msg else '' }}
     </div>
 
     <h2>Statistiques</h2>
@@ -80,7 +80,7 @@
         <tr><th>Date/Heure</th><th>Destinataire</th><th>Sujet</th><th>Statut</th><th>IP Source</th></tr>
         {% for msg in messages[:100] %}
         <tr>
-            <td>{{ msg.received }}</td>
+            <td>{{ msg.received|paris }}</td>
             <td>{{ msg.recipient_address }}</td>
             <td>{{ msg.subject }}</td>
             <td><span class="badge {% if msg.status == 'Delivered' %}bg-success{% elif msg.status == 'Failed' %}bg-danger{% else %}bg-warning{% endif %}">{{ msg.status }}</span></td>

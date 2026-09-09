@@ -4,3 +4,4 @@ waitress==3.0.0
 flask-httpauth==4.0.0
 dnspython==2.6.1
 weasyprint==61.2
+tzdata==2024.1

@@ -9,7 +9,7 @@
             <span class="badge {% if log.level=='ERROR' %}bg-danger{% elif log.level=='WARNING' %}bg-warning{% else %}bg-info{% endif %}">{{ log.level }}</span>
             <strong>{{ log.category }}</strong>
         </div>
-        <small class="text-muted">{{ log.timestamp }}</small>
+        <small class="text-muted">{{ log.timestamp|paris }}</small>
     </div>
     <div class="card-body">
         <h5 class="card-title">{{ log.message }}</h5>

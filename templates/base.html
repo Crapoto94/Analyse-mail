@@ -13,9 +13,40 @@
         status-resolved { color: #6c757d; }
         .status-failed { color: #dc3545; }
         .status-quarantined { color: #fd7e14; }
+        #global-loading-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.55);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+        #global-loading-overlay.active { display: flex; }
     </style>
 </head>
 <body>
+<div id="global-loading-overlay">
+    <div class="bg-white rounded-3 shadow p-4 text-center" style="min-width: 300px; max-width: 90%;">
+        <div class="spinner-border text-primary mb-3" role="status">
+            <span class="visually-hidden">Chargement...</span>
+        </div>
+        <div id="global-loading-message" class="fw-semibold">Traitement en cours, veuillez patienter…</div>
+        <div class="text-muted small mt-1">Cette fenêtre se fermera automatiquement.</div>
+    </div>
+</div>
+<script>
+function showGlobalLoading(message) {
+    var overlay = document.getElementById('global-loading-overlay');
+    var msgEl = document.getElementById('global-loading-message');
+    if (msgEl && message) { msgEl.textContent = message; }
+    if (overlay) { overlay.classList.add('active'); }
+}
+function hideGlobalLoading() {
+    var overlay = document.getElementById('global-loading-overlay');
+    if (overlay) { overlay.classList.remove('active'); }
+}
+</script>
 <nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">
     <div class="container">
         <a class="navbar-brand" href="{{ url_for('index') }}">
@@ -28,9 +59,27 @@
             <a class="nav-link text-white" href="{{ url_for('view_logs') }}">
                 <i class="bi bi-journal-text"></i> Logs
             </a>
+            {% if session.get('role') == 'admin' %}
+            <a class="nav-link text-white" href="{{ url_for('view_monitoring') }}">
+                <i class="bi bi-eye"></i> Surveillance
+            </a>
+            <a class="nav-link text-white" href="{{ url_for('list_users') }}">
+                <i class="bi bi-people"></i> Utilisateurs
+            </a>
+            {% endif %}
             <a class="nav-link text-white" href="{{ url_for('config') }}">
                 <i class="bi bi-gear"></i> Configuration
             </a>
+            {% if session.get('user_id') %}
+            <span class="nav-link text-white-50">
+                <i class="bi bi-person-circle"></i> {{ session.get('username') }}
+            </span>
+            <form method="POST" action="{{ url_for('logout') }}" class="d-inline">
+                <button type="submit" class="btn btn-link nav-link text-white p-0 border-0" style="text-decoration:none;">
+                    <i class="bi bi-box-arrow-right"></i> Déconnexion
+                </button>
+            </form>
+            {% endif %}
         </div>
     </div>
 </nav>

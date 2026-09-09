@@ -8,6 +8,45 @@
     </a>
 </div>
 
+<div class="card mb-4 border-dark">
+    <div class="card-header bg-dark text-white">
+        <i class="bi bi-lightning-charge"></i> Analyse rapide (via Microsoft Graph)
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-3">
+            Vérifiez en quelques secondes si une boîte présente des signaux de compromission (connexions, audit,
+            règles de messagerie), sans créer d'investigation. Rien n'est enregistré tant que vous ne le demandez pas.
+        </p>
+        {% if graph_configured %}
+        <form method="POST" action="{{ url_for('quick_scan') }}" class="row g-2 align-items-end"
+              onsubmit="showGlobalLoading('Scan rapide en cours via Microsoft Graph…'); return true;">
+            <div class="col-md-6">
+                <label class="form-label small mb-1">Adresse email de la boîte à vérifier</label>
+                <input type="email" class="form-control" name="email" placeholder="utilisateur@ivry94.fr" required>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small mb-1">Période</label>
+                <select name="days" class="form-select">
+                    <option value="1">1 jour</option>
+                    <option value="7" selected>7 jours</option>
+                    <option value="30">30 jours</option>
+                </select>
+            </div>
+            <div class="col-md-3 d-grid">
+                <button type="submit" class="btn btn-dark">
+                    <i class="bi bi-search"></i> Analyser
+                </button>
+            </div>
+        </form>
+        {% else %}
+        <div class="alert alert-secondary mb-0">
+            <i class="bi bi-info-circle"></i> Nécessite la configuration Microsoft Graph.
+            <a href="{{ url_for('config') }}">Configurer maintenant</a>.
+        </div>
+        {% endif %}
+    </div>
+</div>
+
 {% if boites %}
     <div class="row">
     {% for boite in boites %}

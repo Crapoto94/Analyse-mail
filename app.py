@@ -3,15 +3,54 @@ import csv
 import sqlite3
 import re
 import unicodedata
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response
+from datetime import datetime, timezone
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response, session
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 import json
 
 app = Flask(__name__)
 app.secret_key = 'analyse-compromis-secret-key'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+
+
+def format_paris_datetime(value, fmt='%d/%m/%Y %H:%M:%S'):
+    """Convertit une date ISO8601 (UTC, telle que fournie par les CSV Microsoft 365 /
+    l'API Graph) en date/heure française (fuseau Europe/Paris, heure d'été gérée
+    automatiquement). Retourne la valeur d'origine si elle est vide ou non reconnue."""
+    if not value:
+        return ''
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return value
+
+    s = str(value).strip()
+    try:
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        if '.' in s:
+            head, _, rest = s.partition('.')
+            tz = ''
+            for sep in ('+', '-'):
+                if sep in rest:
+                    frac, _, tz_part = rest.partition(sep)
+                    tz = sep + tz_part
+                    rest = frac
+                    break
+            rest = (rest[:6] or '0').ljust(6, '0')
+            s = f'{head}.{rest}{tz}'
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo('UTC'))
+        return dt.astimezone(ZoneInfo('Europe/Paris')).strftime(fmt)
+    except Exception:
+        return value
+
+
+app.jinja_env.filters['paris'] = format_paris_datetime
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs('templates', exist_ok=True)
@@ -166,6 +205,35 @@ def init_db():
         raw_json TEXT,
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS monitored_mailboxes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_email TEXT UNIQUE NOT NULL,
+        interval_minutes INTEGER NOT NULL DEFAULT 60,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        last_scan_at TEXT,
+        last_scan_score INTEGER,
+        last_scan_verdict TEXT,
+        last_scan_findings_count INTEGER,
+        last_error TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # Migration : creer un compte admin par defaut si la table users est vide, en reprenant
+    # l'ancien mot de passe HTTP Basic pour ne pas verrouiller l'acces existant.
+    if c.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
+        c.execute('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
+                   ('admin', generate_password_hash('Admin94200!!!2025'), 'admin'))
 
     # Migration: ajouter colonne hostname si elle n'existe pas
     try:
@@ -338,6 +406,7 @@ def add_log(level, category, message, details=None, boite_id=None, recipient=Non
 # d'application suivantes, consentement admin donne :
 #   - AuditLog.Read.All      -> connexions (signIns) et journal d'audit (directoryAudits)
 #   - MailboxSettings.Read   -> regles de messagerie (transfert, suppression...)
+#   - Mail.Read              -> messages envoyes (optionnel, dossier Elements envoyes)
 #   - Directory.Read.All     -> resolution des informations utilisateur (optionnel)
 # Voir la page /config pour la configuration (tenant ID, client ID, client secret).
 # ============================================================================
@@ -429,12 +498,118 @@ def _graph_status_text(status_obj):
     return 'Success' if error_code in (0, None) else 'Failure'
 
 
+def _map_graph_signin(item):
+    """Convertit un objet Graph auditLogs/signIns en dict aligne sur les colonnes de
+    signin_logs. Fonction pure (aucun acces DB) : reutilisee pour l'import persistant
+    et pour le scan rapide ephemere."""
+    status = item.get('status') or {}
+    device = item.get('deviceDetail') or {}
+    location = item.get('location') or {}
+    mfa = item.get('mfaDetail') or {}
+    country = location.get('countryOrRegion', '') or ''
+    location_str = ', '.join(p for p in [location.get('city', ''), location.get('state', ''), country] if p)
+    risky = item.get('riskLevelAggregated') in ('medium', 'high') or item.get('riskState') == 'atRisk'
+    return {
+        'date_utc': item.get('createdDateTime', ''),
+        'request_id': item.get('id', ''),
+        'correlation_id': item.get('correlationId', ''),
+        'user_display_name': item.get('userDisplayName', ''),
+        'user_upn': item.get('userPrincipalName', ''),
+        'ip_address': item.get('ipAddress', ''),
+        'location': location_str,
+        'country': country,
+        'status': _graph_status_text(status),
+        'error_code': str(status.get('errorCode', '') if status.get('errorCode') is not None else ''),
+        'failure_reason': status.get('failureReason', ''),
+        'application': item.get('appDisplayName', ''),
+        'client_app': item.get('clientAppUsed', ''),
+        'device_id': device.get('deviceId', ''),
+        'browser': device.get('browser', ''),
+        'os': device.get('operatingSystem', ''),
+        'is_compliant': str(device.get('isCompliant', '')).lower(),
+        'is_managed': str(device.get('isManaged', '')).lower(),
+        'conditional_access': item.get('conditionalAccessStatus', ''),
+        'mfa_result': item.get('authenticationRequirement', ''),
+        'mfa_method': mfa.get('authMethod', ''),
+        'asn': str(item.get('autonomousSystemNumber', '') or ''),
+        'flagged': 'true' if risky else 'false',
+        'user_agent': '',
+        'raw': item,
+    }
+
+
+def _map_graph_audit(item):
+    """Convertit un objet Graph auditLogs/directoryAudits en dict aligne sur les
+    colonnes de audit_logs. Fonction pure, reutilisee import persistant + scan rapide."""
+    targets = item.get('targetResources') or []
+    target = targets[0] if targets else {}
+    initiated_by = item.get('initiatedBy') or {}
+    actor_user = initiated_by.get('user') or {}
+    actor_app = initiated_by.get('app') or {}
+    mods = target.get('modifiedProperties') or []
+    mods_summary = ' | '.join(
+        f"{m.get('displayName','')}: {m.get('oldValue','')} -> {m.get('newValue','')}"
+        for m in mods if m.get('displayName')
+    )
+    return {
+        'date_utc': item.get('activityDateTime', ''),
+        'correlation_id': item.get('correlationId', ''),
+        'service': item.get('loggedByService', ''),
+        'categorie': item.get('category', ''),
+        'activite': item.get('activityDisplayName', ''),
+        'resultat': 'Success' if item.get('result') == 'success' else 'Failure',
+        'result_reason': item.get('resultReason', ''),
+        'actor_type': 'User' if actor_user else ('Application' if actor_app else ''),
+        'actor_display_name': actor_user.get('displayName') or actor_app.get('displayName', ''),
+        'actor_upn': actor_user.get('userPrincipalName', ''),
+        'ip_address': actor_user.get('ipAddress', ''),
+        'target_type': target.get('type', ''),
+        'target_display_name': target.get('displayName', ''),
+        'target_upn': target.get('userPrincipalName', ''),
+        'modifications_summary': mods_summary,
+        'raw': item,
+    }
+
+
+def _map_graph_rule(item):
+    """Convertit un objet Graph messageRule en dict aligne sur les colonnes de
+    mailbox_rules. Fonction pure, reutilisee import persistant + scan rapide."""
+    actions = item.get('actions') or {}
+    conditions = item.get('conditions') or {}
+    forward_targets = []
+    for field in ('forwardTo', 'redirectTo', 'forwardAsAttachmentTo'):
+        for rec in (actions.get(field) or []):
+            addr = (rec.get('emailAddress') or {}).get('address')
+            if addr:
+                forward_targets.append(addr)
+    actions_parts = [f'{k}: {v}' for k, v in actions.items() if v]
+    conditions_parts = [f'{k}: {v}' for k, v in conditions.items() if v]
+    # Une suppression simple n'est consideree suspecte que si elle cible du courrier lie a la
+    # securite (voir SECURITY_RULE_KEYWORDS) : une regle "delete" banale (notifications de
+    # supervision, mailer-daemon...) est tres frequente et generalement benigne.
+    text_for_keywords = f"{item.get('displayName', '')} {' '.join(conditions_parts)}".lower()
+    looks_security_related = any(kw in text_for_keywords for kw in SECURITY_RULE_KEYWORDS)
+    suspicious = bool(forward_targets) or bool(actions.get('permanentDelete')) or \
+        (bool(actions.get('delete')) and looks_security_related)
+    return {
+        'rule_id': item.get('id', ''),
+        'display_name': item.get('displayName', ''),
+        'is_enabled': str(item.get('isEnabled', '')).lower(),
+        'sequence': item.get('sequence', 0),
+        'conditions_summary': ' | '.join(conditions_parts),
+        'actions_summary': ' | '.join(actions_parts),
+        'forwards_to': ', '.join(forward_targets),
+        'is_suspicious': 'true' if suspicious else 'false',
+        'raw': item,
+    }
+
+
 def fetch_signins_from_graph(boite_id, user_upn, days=30):
     """Recupere les connexions interactives (auditLogs/signIns) d'un utilisateur
     sur les N derniers jours et les insere dans signin_logs (avec deduplication)."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
-    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
     upn_escaped = (user_upn or '').replace("'", "''")
     filter_q = f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}"
     items = graph_get_all('/auditLogs/signIns', params={'$filter': filter_q, '$top': '999'})
@@ -447,23 +622,11 @@ def fetch_signins_from_graph(boite_id, user_upn, days=30):
     count = 0
     duplicates = 0
     for item in items:
-        status = item.get('status') or {}
-        device = item.get('deviceDetail') or {}
-        location = item.get('location') or {}
-        mfa = item.get('mfaDetail') or {}
-
-        request_id = item.get('id', '')
-        date_utc = item.get('createdDateTime', '')
-        user_upn_val = item.get('userPrincipalName', '')
-        ip_address = item.get('ipAddress', '')
-        key = (request_id, date_utc, user_upn_val, ip_address)
+        d = _map_graph_signin(item)
+        key = (d['request_id'], d['date_utc'], d['user_upn'], d['ip_address'])
         if key in existing:
             duplicates += 1
             continue
-
-        country = location.get('countryOrRegion', '') or ''
-        location_str = ', '.join(p for p in [location.get('city', ''), location.get('state', ''), country] if p)
-        risky = item.get('riskLevelAggregated') in ('medium', 'high') or item.get('riskState') == 'atRisk'
 
         conn.execute('''INSERT INTO signin_logs
             (boite_id, date_utc, request_id, correlation_id, user_display_name, user_upn,
@@ -471,16 +634,12 @@ def fetch_signins_from_graph(boite_id, user_upn, days=30):
              client_app, device_id, browser, os, is_compliant, is_managed, conditional_access,
              mfa_result, mfa_method, asn, flagged, user_agent, csv_source, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (boite_id, date_utc, request_id, item.get('correlationId', ''), item.get('userDisplayName', ''),
-             user_upn_val, ip_address, location_str, country, _graph_status_text(status),
-             str(status.get('errorCode', '') if status.get('errorCode') is not None else ''),
-             status.get('failureReason', ''), item.get('appDisplayName', ''),
-             item.get('clientAppUsed', ''), device.get('deviceId', ''), device.get('browser', ''),
-             device.get('operatingSystem', ''), str(device.get('isCompliant', '')).lower(),
-             str(device.get('isManaged', '')).lower(), item.get('conditionalAccessStatus', ''),
-             item.get('authenticationRequirement', ''), mfa.get('authMethod', ''),
-             str(item.get('autonomousSystemNumber', '') or ''), 'true' if risky else 'false',
-             '', 'Microsoft Graph API', json.dumps(item, ensure_ascii=False)))
+            (boite_id, d['date_utc'], d['request_id'], d['correlation_id'], d['user_display_name'],
+             d['user_upn'], d['ip_address'], d['location'], d['country'], d['status'],
+             d['error_code'], d['failure_reason'], d['application'], d['client_app'], d['device_id'],
+             d['browser'], d['os'], d['is_compliant'], d['is_managed'], d['conditional_access'],
+             d['mfa_result'], d['mfa_method'], d['asn'], d['flagged'], d['user_agent'],
+             'Microsoft Graph API', json.dumps(item, ensure_ascii=False)))
         existing.add(key)
         count += 1
     conn.commit()
@@ -493,9 +652,9 @@ def fetch_audit_from_graph(boite_id, user_upn, days=30):
     un utilisateur (cible ou initiateur) sur les N derniers jours, et les insere dans
     audit_logs (avec deduplication). Le filtre serveur ne portant que sur la date, le
     tri par utilisateur est fait cote client sur les cibles/initiateurs de chaque evenement."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
-    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
     items = graph_get_all('/auditLogs/directoryAudits', params={'$filter': f'activityDateTime ge {since}', '$top': '999'})
 
     upn_lower = (user_upn or '').lower()
@@ -515,38 +674,22 @@ def fetch_audit_from_graph(boite_id, user_upn, days=30):
     count = 0
     duplicates = 0
     for item in relevant:
-        targets = item.get('targetResources') or []
-        target = targets[0] if targets else {}
-        initiated_by = item.get('initiatedBy') or {}
-        actor_user = initiated_by.get('user') or {}
-        actor_app = initiated_by.get('app') or {}
-
-        date_utc = item.get('activityDateTime', '')
-        correlation_id = item.get('correlationId', '')
-        activite = item.get('activityDisplayName', '')
-        target_upn = target.get('userPrincipalName', '')
-        key = (date_utc, correlation_id, activite, target_upn)
+        d = _map_graph_audit(item)
+        key = (d['date_utc'], d['correlation_id'], d['activite'], d['target_upn'])
         if key in existing:
             duplicates += 1
             continue
 
-        mods = target.get('modifiedProperties') or []
-        mods_summary = ' | '.join(
-            f"{m.get('displayName','')}: {m.get('oldValue','')} -> {m.get('newValue','')}"
-            for m in mods if m.get('displayName')
-        )
         conn.execute('''INSERT INTO audit_logs
             (boite_id, date_utc, correlation_id, service, categorie, activite, resultat,
              result_reason, actor_type, actor_display_name, actor_upn, ip_address,
              target_type, target_display_name, target_upn, modifications_summary,
              csv_source, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (boite_id, date_utc, correlation_id, item.get('loggedByService', ''), item.get('category', ''),
-             activite, 'Success' if item.get('result') == 'success' else 'Failure', item.get('resultReason', ''),
-             'User' if actor_user else ('Application' if actor_app else ''),
-             actor_user.get('displayName') or actor_app.get('displayName', ''),
-             actor_user.get('userPrincipalName', ''), actor_user.get('ipAddress', ''),
-             target.get('type', ''), target.get('displayName', ''), target_upn, mods_summary,
+            (boite_id, d['date_utc'], d['correlation_id'], d['service'], d['categorie'],
+             d['activite'], d['resultat'], d['result_reason'], d['actor_type'], d['actor_display_name'],
+             d['actor_upn'], d['ip_address'], d['target_type'], d['target_display_name'],
+             d['target_upn'], d['modifications_summary'],
              'Microsoft Graph API', json.dumps(item, ensure_ascii=False)))
         existing.add(key)
         count += 1
@@ -569,48 +712,274 @@ def fetch_inbox_rules_from_graph(boite_id, user_upn):
     conn.execute("DELETE FROM mailbox_rules WHERE boite_id=? AND source=?", (boite_id, 'Microsoft Graph API'))
     count = 0
     for item in items:
-        actions = item.get('actions') or {}
-        conditions = item.get('conditions') or {}
-
-        forward_targets = []
-        for field in ('forwardTo', 'redirectTo', 'forwardAsAttachmentTo'):
-            for rec in (actions.get(field) or []):
-                addr = (rec.get('emailAddress') or {}).get('address')
-                if addr:
-                    forward_targets.append(addr)
-
-        suspicious = bool(forward_targets) or bool(actions.get('delete')) or bool(actions.get('permanentDelete'))
-
-        actions_parts = [f'{k}: {v}' for k, v in actions.items() if v]
-        conditions_parts = [f'{k}: {v}' for k, v in conditions.items() if v]
-
+        d = _map_graph_rule(item)
         conn.execute('''INSERT INTO mailbox_rules
             (boite_id, rule_id, display_name, is_enabled, sequence, conditions_summary,
              actions_summary, forwards_to, is_suspicious, source, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (boite_id, item.get('id', ''), item.get('displayName', ''), str(item.get('isEnabled', '')).lower(),
-             item.get('sequence', 0), ' | '.join(conditions_parts), ' | '.join(actions_parts),
-             ', '.join(forward_targets), 'true' if suspicious else 'false', 'Microsoft Graph API',
-             json.dumps(item, ensure_ascii=False)))
+            (boite_id, d['rule_id'], d['display_name'], d['is_enabled'], d['sequence'],
+             d['conditions_summary'], d['actions_summary'], d['forwards_to'], d['is_suspicious'],
+             'Microsoft Graph API', json.dumps(item, ensure_ascii=False)))
         count += 1
     conn.commit()
     conn.close()
     return count
 
 
+def _extract_ip_from_headers(headers):
+    """Tente d'extraire une IP source depuis les en-tetes internet d'un message
+    (X-Originating-IP / X-Sender-IP en priorite, sinon le premier en-tete Received).
+    Note : a la difference d'un export "Message trace" M365, cette IP n'est pas
+    toujours presente (dependant du chemin de routage et des serveurs traversés)."""
+    import re
+    if not headers:
+        return ''
+    by_name = {}
+    for h in headers:
+        name = (h.get('name') or '').lower()
+        if name not in by_name:
+            by_name[name] = h.get('value', '')
+    for candidate in ('x-originating-ip', 'x-sender-ip', 'x-source-ip'):
+        val = by_name.get(candidate)
+        if val:
+            m = re.search(r'[0-9a-fA-F:.]{7,45}', val)
+            if m:
+                return m.group(0).strip('[]')
+    received = by_name.get('received', '')
+    m = re.search(r'\[?(\d{1,3}(?:\.\d{1,3}){3})\]?', received)
+    return m.group(1) if m else ''
+
+
+def _extract_urls_from_text(text, limit=5):
+    import re
+    if not text:
+        return ''
+    urls = re.findall(r'https?://[^\s"\'<>]+', text)
+    return ', '.join(urls[:limit])
+
+
+def fetch_sent_messages_from_graph(boite_id, user_upn, days=30):
+    """Recupere les messages envoyes (dossier "Elements envoyes") d'une boite via
+    Microsoft Graph sur les N derniers jours, et les insere dans la table messages
+    (une ligne par destinataire To/Cc/Cci, comme pour un import CSV de message trace),
+    avec deduplication. Contrairement au message trace M365, l'IP source du client
+    n'est pas garantie par Graph : elle est recherchee au mieux dans les en-tetes
+    internet du message (X-Originating-IP ou a defaut le premier Received)."""
+    from datetime import datetime, timedelta, timezone
+    import urllib.parse
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    encoded_upn = urllib.parse.quote(user_upn or '')
+    select = ('id,subject,sender,from,toRecipients,ccRecipients,bccRecipients,sentDateTime,'
+              'hasAttachments,internetMessageId,internetMessageHeaders,bodyPreview')
+    items = graph_get_all(
+        f'/users/{encoded_upn}/mailFolders/SentItems/messages',
+        params={'$filter': f'sentDateTime ge {since}', '$select': select, '$top': '999'}
+    )
+
+    conn = get_db()
+    existing = set(
+        (r['message_id'], r['recipient_address'], r['received'])
+        for r in conn.execute('SELECT message_id, recipient_address, received FROM messages WHERE boite_id=?', (boite_id,)).fetchall()
+    )
+    count = 0
+    duplicates = 0
+    for item in items:
+        message_id = item.get('internetMessageId') or item.get('id', '')
+        received = item.get('sentDateTime', '')
+        sender = (item.get('sender') or {}).get('emailAddress') or (item.get('from') or {}).get('emailAddress') or {}
+        sender_address = sender.get('address', '')
+        subject = item.get('subject', '') or ''
+        from_ip = _extract_ip_from_headers(item.get('internetMessageHeaders'))
+        urls = _extract_urls_from_text(item.get('bodyPreview', ''))
+        attachments = 'Oui' if item.get('hasAttachments') else None
+
+        recipients = []
+        for field in ('toRecipients', 'ccRecipients', 'bccRecipients'):
+            for rec in (item.get(field) or []):
+                addr = (rec.get('emailAddress') or {}).get('address')
+                if addr:
+                    recipients.append(addr)
+        if not recipients:
+            recipients = ['']
+
+        for recipient_address in recipients:
+            key = (message_id, recipient_address, received)
+            if key in existing:
+                duplicates += 1
+                continue
+            conn.execute('''INSERT INTO messages
+                (boite_id, message_id, received, sender_address, recipient_address,
+                 subject, status, to_ip, from_ip, size, message_trace_id, csv_source,
+                 attachments, urls)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (boite_id, message_id, received, sender_address, recipient_address,
+                 subject, 'Envoyé', '', from_ip, 0, item.get('id', ''), 'Microsoft Graph API',
+                 attachments, urls or None))
+            existing.add(key)
+            count += 1
+    conn.commit()
+    conn.close()
+    return count, duplicates
+
+
 from functools import wraps
 
+# Routes accessibles sans etre connecte (endpoints Flask, pas les URLs).
+PUBLIC_ENDPOINTS = {'login', 'static'}
+
+
+@app.before_request
+def require_login():
+    """Impose une connexion pour toute l'application, sauf la page de connexion elle-meme
+    et les fichiers statiques. Remplace l'ancienne authentification HTTP Basic globale."""
+    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+        return
+    if not session.get('user_id'):
+        return redirect(url_for('login', next=request.path))
+
+
 def login_required(f):
+    """Conserve pour compatibilite/explicite sur certaines routes ; la verification globale
+    est de toute facon assuree par before_request ci-dessus."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not (auth.username == 'admin' and auth.password == 'Admin94200!!!2025'):
-            return 'Unauthorized', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'}
+        if not session.get('user_id'):
+            return redirect(url_for('login', next=request.path))
         return f(*args, **kwargs)
     return decorated_function
 
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('user_id'):
+            return redirect(url_for('login', next=request.path))
+        if session.get('role') != 'admin':
+            flash("Accès réservé aux administrateurs")
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if session.get('user_id'):
+        return redirect(url_for('index'))
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        conn = get_db()
+        user = conn.execute('SELECT * FROM users WHERE username=? AND is_active=1', (username,)).fetchone()
+        conn.close()
+        if user and check_password_hash(user['password_hash'], password):
+            session.clear()
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['role'] = user['role']
+            next_url = request.form.get('next') or url_for('index')
+            return redirect(next_url)
+        flash('Identifiants incorrects')
+    return render_template('login.html', next=request.args.get('next', ''))
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
+@app.route('/users')
+@admin_required
+def list_users():
+    conn = get_db()
+    users = conn.execute('SELECT * FROM users ORDER BY username').fetchall()
+    conn.close()
+    return render_template('users.html', users=users)
+
+
+@app.route('/users/add', methods=['POST'])
+@admin_required
+def add_user():
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '')
+    role = request.form.get('role', 'user')
+    if role not in ('admin', 'user'):
+        role = 'user'
+    if not username or not password:
+        flash("Nom d'utilisateur et mot de passe requis")
+        return redirect(url_for('list_users'))
+    if len(password) < 8:
+        flash('Le mot de passe doit contenir au moins 8 caractères')
+        return redirect(url_for('list_users'))
+
+    conn = get_db()
+    try:
+        conn.execute('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
+                     (username, generate_password_hash(password), role))
+        conn.commit()
+        flash(f"Utilisateur {username} créé avec succès")
+    except sqlite3.IntegrityError:
+        flash(f"Le nom d'utilisateur {username} existe déjà")
+    finally:
+        conn.close()
+    return redirect(url_for('list_users'))
+
+
+@app.route('/users/<int:user_id>/delete', methods=['POST'])
+@admin_required
+def delete_user(user_id):
+    if user_id == session.get('user_id'):
+        flash('Vous ne pouvez pas supprimer votre propre compte')
+        return redirect(url_for('list_users'))
+
+    conn = get_db()
+    target = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        flash('Utilisateur non trouvé')
+        return redirect(url_for('list_users'))
+    if target['role'] == 'admin':
+        nb_admins = conn.execute("SELECT COUNT(*) as c FROM users WHERE role='admin' AND is_active=1").fetchone()['c']
+        if nb_admins <= 1:
+            conn.close()
+            flash('Impossible de supprimer le dernier administrateur')
+            return redirect(url_for('list_users'))
+
+    conn.execute('DELETE FROM users WHERE id=?', (user_id,))
+    conn.commit()
+    conn.close()
+    flash(f"Utilisateur {target['username']} supprimé")
+    return redirect(url_for('list_users'))
+
+
+@app.route('/users/<int:user_id>/toggle', methods=['POST'])
+@admin_required
+def toggle_user(user_id):
+    if user_id == session.get('user_id'):
+        flash('Vous ne pouvez pas désactiver votre propre compte')
+        return redirect(url_for('list_users'))
+
+    conn = get_db()
+    target = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        flash('Utilisateur non trouvé')
+        return redirect(url_for('list_users'))
+    new_active = 0 if target['is_active'] else 1
+    if target['role'] == 'admin' and not new_active:
+        nb_admins = conn.execute("SELECT COUNT(*) as c FROM users WHERE role='admin' AND is_active=1").fetchone()['c']
+        if nb_admins <= 1:
+            conn.close()
+            flash('Impossible de désactiver le dernier administrateur')
+            return redirect(url_for('list_users'))
+    conn.execute('UPDATE users SET is_active=? WHERE id=?', (new_active, user_id))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('list_users'))
+
+
 @app.route('/')
-@login_required
 def index():
     conn = get_db()
     boites = conn.execute('SELECT * FROM boites_compromises ORDER BY created_at DESC').fetchall()
@@ -631,7 +1000,8 @@ def index():
             'nb_audit': conn.execute('SELECT COUNT(*) as c FROM audit_logs WHERE boite_id=?', (bid,)).fetchone()['c'],
         }
     conn.close()
-    return render_template('index.html', boites=boites, stats=stats)
+    graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+    return render_template('index.html', boites=boites, stats=stats, graph_configured=graph_configured)
 
 @app.route('/boite/add', methods=['GET', 'POST'])
 def add_boite():
@@ -665,6 +1035,10 @@ def view_boite(bid):
         nb_rules = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
         nb_suspicious_rules = conn.execute("SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (bid,)).fetchone()['c']
         graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+        risk_analysis = analyze_compromise(bid)
+        risk_score = risk_analysis['score']
+        risk_verdict = risk_analysis['verdict']
+        risk_findings_count = len(risk_analysis['findings'])
         ips = conn.execute('SELECT DISTINCT from_ip, COUNT(*) as cnt FROM messages WHERE boite_id=? AND from_ip!="" GROUP BY from_ip', (bid,)).fetchall()
         recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC LIMIT 50', (bid,)).fetchall()
         all_recipients = conn.execute('SELECT DISTINCT recipient_address, COUNT(*) as cnt FROM messages WHERE boite_id=? GROUP BY recipient_address ORDER BY cnt DESC', (bid,)).fetchall()
@@ -751,7 +1125,8 @@ def view_boite(bid):
                          sender_domain=sender_domain, spf_dkim_dmarc=spf_dkim_dmarc,
                          nb_signins=nb_signins, nb_audit=nb_audit,
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
-                         graph_configured=graph_configured)
+                         graph_configured=graph_configured,
+                         risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count)
 
 def _timeline_query(conn, table, bid):
     rows = conn.execute(f'''SELECT
@@ -775,6 +1150,351 @@ def _is_success_status(status):
 
 def _is_truthy(value):
     return (value or '').strip().lower() in ('true', 'vrai', 'yes', 'oui', '1')
+
+
+def _parse_iso(value):
+    """Parse une date ISO8601 (avec 'Z', fractions de secondes variables, ou offset) en
+    datetime naïf UTC comparable. Retourne None si la valeur est absente/invalide."""
+    from datetime import datetime, timezone
+    if not value:
+        return None
+    s = str(value).strip()
+    try:
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        if '.' in s:
+            head, _, rest = s.partition('.')
+            tz = ''
+            for sep in ('+', '-'):
+                if sep in rest:
+                    frac, _, tz_part = rest.partition(sep)
+                    tz = sep + tz_part
+                    rest = frac
+                    break
+            rest = (rest[:6] or '0').ljust(6, '0')
+            s = f'{head}.{rest}{tz}'
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _build_signin_event(s, ref_id=None):
+    """Construit un evenement de timeline a partir d'une ligne signin_logs (sqlite3.Row
+    ou dict). Fonction pure : reutilisee pour les boites en base et le scan rapide."""
+    success = _is_success_status(s['status'])
+    title = ('Connexion réussie' if success else 'Connexion échouée')
+    if s['application']:
+        title += f" — {s['application']}"
+    detail_parts = [s['user_upn'] or s['user_display_name'] or '']
+    if s['ip_address']:
+        detail_parts.append(f"depuis {s['ip_address']}")
+    if s['location']:
+        detail_parts.append(f"({s['location']})")
+    if not success and s['failure_reason']:
+        detail_parts.append(f"— {s['failure_reason']}")
+    return {
+        'timestamp': s['date_utc'],
+        'dt': _parse_iso(s['date_utc']),
+        'type': 'signin',
+        'success': success,
+        'title': title,
+        'detail': ' '.join(p for p in detail_parts if p),
+        'ip': s['ip_address'],
+        'country': s['country'],
+        'user': s['user_upn'] or s['user_display_name'] or '',
+        'ref_id': ref_id if ref_id is not None else s['id'] if 'id' in s.keys() else None,
+    }
+
+
+def _build_audit_event(a, ref_id=None):
+    """Construit un evenement de timeline a partir d'une ligne audit_logs (sqlite3.Row
+    ou dict). Fonction pure : reutilisee pour les boites en base et le scan rapide."""
+    title = a['activite'] or 'Événement d\'audit'
+    detail_parts = []
+    actor = a['actor_display_name'] or a['actor_upn']
+    target = a['target_upn'] or a['target_display_name']
+    if actor:
+        detail_parts.append(f"par {actor}")
+    if target:
+        detail_parts.append(f"sur {target}")
+    if a['modifications_summary']:
+        detail_parts.append(f"— {a['modifications_summary']}")
+    return {
+        'timestamp': a['date_utc'],
+        'dt': _parse_iso(a['date_utc']),
+        'type': 'audit',
+        'success': (a['resultat'] == 'Success' or _is_success_status(a['resultat'])),
+        'title': title,
+        'detail': ' '.join(p for p in detail_parts if p),
+        'ip': a['ip_address'],
+        'country': '',
+        'user': target or actor or '',
+        'ref_id': ref_id if ref_id is not None else a['id'] if 'id' in a.keys() else None,
+    }
+
+
+def build_timeline_events(signins, audits):
+    """Fusionne des lignes signin_logs/audit_logs (ou dicts equivalents issus d'un scan
+    rapide) en une seule liste d'evenements tries chronologiquement. Fonction pure,
+    aucun acces DB."""
+    events = [_build_signin_event(s) for s in signins] + [_build_audit_event(a) for a in audits]
+    events.sort(key=lambda e: e['timestamp'] or '')
+    return events
+
+
+def build_unified_timeline(boite_id):
+    """Fusionne les connexions (signin_logs) et le journal d'audit (audit_logs) d'une
+    boite (persistee en base) en une seule liste d'evenements tries chronologiquement."""
+    conn = get_db()
+    signins = conn.execute('SELECT * FROM signin_logs WHERE boite_id=? ORDER BY date_utc', (boite_id,)).fetchall()
+    audits = conn.execute('SELECT * FROM audit_logs WHERE boite_id=? ORDER BY date_utc', (boite_id,)).fetchall()
+    conn.close()
+    return build_timeline_events(signins, audits)
+
+
+def compute_risk_score(findings):
+    """Convertit la liste de findings (issus de analyze_compromise_events) en un score
+    de risque de compromission sur 10, a partir de la severite de chaque signal."""
+    weights = {'critical': 4, 'high': 2, 'medium': 1, 'low': 0.5}
+    score = sum(weights.get(f['severity'], 0) for f in findings)
+    return min(10, round(score))
+
+
+def analyze_compromise_events(events, suspicious_rules=None, owner_domain=''):
+    """Analyse heuristique d'une liste d'evenements (connexions + audit) deja fusionnee
+    pour identifier ce qui ressemble a une compromission : deplacement impossible,
+    connexion reussie depuis un pays inhabituel, rafale d'echecs suivie d'un succes,
+    activite sensible (changement de mot de passe/MFA, regle de boite mail...), et
+    enchainement temporel entre une connexion suspecte et une action sensible juste
+    apres. Fonction pure (aucun acces DB) : reutilisee pour les boites en base
+    (analyze_compromise) et pour le scan rapide ephemere (quick_scan_mailbox)."""
+    suspicious_rules = suspicious_rules or []
+    findings = []
+
+    signin_events = [e for e in events if e['type'] == 'signin']
+    successful_signins = [e for e in signin_events if e['success']]
+
+    # Pays de reference = pays le plus frequent parmi les connexions reussies
+    country_counts = {}
+    for e in successful_signins:
+        if e['country']:
+            country_counts[e['country']] = country_counts.get(e['country'], 0) + 1
+    baseline_country = max(country_counts, key=country_counts.get) if country_counts else None
+
+    # 1) Deplacement impossible : deux connexions reussies consecutives, pays different,
+    #    ecart de temps trop court pour un vrai deplacement (< 2h)
+    prev = None
+    for e in successful_signins:
+        if prev and e['dt'] and prev['dt'] and e['country'] and prev['country'] and e['country'] != prev['country']:
+            delta = abs((e['dt'] - prev['dt']).total_seconds())
+            if delta < 2 * 3600:
+                findings.append({
+                    'severity': 'critical',
+                    'title': 'Déplacement impossible (impossible travel)',
+                    'description': (f"Connexion réussie depuis {prev['country']} ({prev['ip']}) à {prev['timestamp']}, "
+                                     f"puis depuis {e['country']} ({e['ip']}) à {e['timestamp']} — seulement "
+                                     f"{int(delta // 60)} min d'écart : physiquement impossible pour un seul utilisateur."),
+                    'events': [prev, e],
+                })
+        prev = e
+
+    # 2) Connexion reussie depuis un pays inhabituel par rapport a la reference
+    for e in successful_signins:
+        if baseline_country and e['country'] and e['country'] != baseline_country:
+            findings.append({
+                'severity': 'high',
+                'title': 'Connexion réussie depuis un pays inhabituel',
+                'description': f"{e['user']} s'est connecté avec succès depuis {e['country']} ({e['ip']}) le {e['timestamp']}, alors que le pays habituel est {baseline_country}.",
+                'events': [e],
+            })
+
+    # 3) Rafale d'echecs suivie d'un succes (>=3 echecs en 15 min puis succes dans les 15 min suivantes)
+    failures_window = []
+    for e in signin_events:
+        if not e['dt']:
+            continue
+        if not e['success']:
+            failures_window = [f for f in failures_window if (e['dt'] - f['dt']).total_seconds() <= 900] + [e]
+        else:
+            recent_failures = [f for f in failures_window if 0 <= (e['dt'] - f['dt']).total_seconds() <= 900]
+            if len(recent_failures) >= 3:
+                findings.append({
+                    'severity': 'high',
+                    'title': "Rafale d'échecs de connexion suivie d'un succès",
+                    'description': (f"{len(recent_failures)} échecs de connexion en moins de 15 min pour {e['user']}, "
+                                     f"suivis d'une connexion réussie à {e['timestamp']} depuis {e['ip']} — signature typique "
+                                     f"d'une attaque par force brute/password spray ayant abouti."),
+                    'events': recent_failures + [e],
+                })
+            failures_window = []
+
+    # 4) Activites d'audit sensibles (mot de passe, MFA, regles de messagerie, consentement...)
+    for e in events:
+        if e['type'] != 'audit':
+            continue
+        norm = _normalize_header(e['title'] or '')
+        if any(kw in norm for kw in SUSPICIOUS_AUDIT_KEYWORDS):
+            findings.append({
+                'severity': 'medium',
+                'title': f"Activité sensible : {e['title']}",
+                'description': e['detail'] or e['title'],
+                'events': [e],
+            })
+
+    # 5) Enchainement : activite sensible survenant peu apres (< 2h) une connexion suspecte
+    #    (deplacement impossible ou pays inhabituel) -> tres probable compromission
+    suspicious_signin_times = [
+        f['events'][-1]['dt'] for f in findings
+        if f['title'] in ('Déplacement impossible (impossible travel)', 'Connexion réussie depuis un pays inhabituel')
+        and f['events'][-1]['dt']
+    ]
+    for e in events:
+        if e['type'] != 'audit' or not e['dt']:
+            continue
+        norm = _normalize_header(e['title'] or '')
+        if not any(kw in norm for kw in SUSPICIOUS_AUDIT_KEYWORDS):
+            continue
+        for sdt in suspicious_signin_times:
+            delta = (e['dt'] - sdt).total_seconds()
+            if 0 <= delta <= 2 * 3600:
+                findings.append({
+                    'severity': 'critical',
+                    'title': 'Action sensible juste après une connexion suspecte',
+                    'description': (f"« {e['title']} » effectuée à {e['timestamp']} — seulement {int(delta // 60)} min après "
+                                     f"une connexion suspecte. Enchaînement typique d'une prise de contrôle du compte "
+                                     f"(l'attaquant se connecte puis modifie le compte pour garder l'accès)."),
+                    'events': [e],
+                })
+                break
+
+    # 6) Regles de messagerie suspectes (transfert/suppression), passees en parametre.
+    #    - Un transfert vers une adresse du meme domaine (ex: collegue en delegation/absence)
+    #      est nettement moins alarmant qu'un transfert vers un domaine externe/inconnu.
+    #    - Une suppression automatique simple (delete) est tres majoritairement une regle de
+    #      confort banale (notifications de supervision, mailer-daemon, newsletters...) : elle
+    #      n'est remontee que si elle cible specifiquement des messages lies a la securite
+    #      (alertes de connexion, mots de passe...), ou si elle est definitive (permanentDelete),
+    #      seuls cas ou elle peut servir a masquer des traces d'une compromission.
+    owner_domain = (owner_domain or '').lower()
+    for r in suspicious_rules:
+        targets = [t.strip() for t in (r['forwards_to'] or '').split(',') if t.strip()]
+        external_targets = [t for t in targets if '@' in t and t.split('@')[-1].lower() != owner_domain]
+        internal_targets = [t for t in targets if t not in external_targets]
+        actions_summary = (r['actions_summary'] or '')
+        is_permanent_delete = 'permanentdelete: true' in actions_summary.lower()
+        text_for_keywords = f"{r['display_name'] or ''} {r['conditions_summary'] or ''}".lower()
+        looks_security_related = any(kw in text_for_keywords for kw in SECURITY_RULE_KEYWORDS)
+
+        if external_targets:
+            severity = 'critical'
+            note = f"vers une adresse EXTERNE : {', '.join(external_targets)}"
+        elif internal_targets:
+            severity = 'medium'
+            note = f"vers une adresse interne (même domaine) : {', '.join(internal_targets)} — probablement légitime (délégation, absence...), à confirmer auprès de l'utilisateur"
+        elif is_permanent_delete:
+            severity = 'high' if looks_security_related else 'medium'
+            note = 'suppression DÉFINITIVE automatique (sans passer par les éléments supprimés)' + (
+                ' — cible des messages liés à la sécurité : à vérifier en priorité' if looks_security_related else '')
+        elif looks_security_related:
+            severity = 'high'
+            note = 'suppression automatique de messages liés à la sécurité (alertes, connexions...) — peut servir à masquer des alertes'
+        else:
+            # Suppression simple sans lien avec la securite : tres frequent et generalement
+            # benin (filtrage de notifications automatiques...) -> pas remonte comme signal.
+            continue
+
+        findings.append({
+            'severity': severity,
+            'title': f"Règle de messagerie suspecte : {r['display_name']}",
+            'description': f"Actions : {r['actions_summary']} — {note}",
+            'events': [],
+        })
+
+    severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+    findings.sort(key=lambda f: severity_order.get(f['severity'], 9))
+
+    if any(f['severity'] == 'critical' for f in findings):
+        verdict = 'compromise_likely'
+    elif any(f['severity'] in ('high', 'medium') for f in findings):
+        verdict = 'signals_to_check'
+    else:
+        verdict = 'no_strong_signal'
+
+    return {
+        'events': events,
+        'findings': findings,
+        'baseline_country': baseline_country,
+        'verdict': verdict,
+        'score': compute_risk_score(findings),
+    }
+
+
+def analyze_compromise(boite_id):
+    """Analyse heuristique des connexions + journal d'audit d'une boite deja presente
+    en base (voir analyze_compromise_events pour le detail des regles de detection)."""
+    events = build_unified_timeline(boite_id)
+    conn = get_db()
+    boite_row = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (boite_id,)).fetchone()
+    suspicious_rules = conn.execute("SELECT * FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (boite_id,)).fetchall()
+    conn.close()
+    owner_domain = (boite_row['user_email'].split('@')[-1] if boite_row and '@' in (boite_row['user_email'] or '') else '')
+    return analyze_compromise_events(events, suspicious_rules=suspicious_rules, owner_domain=owner_domain)
+
+
+def quick_scan_mailbox(user_upn, days=7):
+    """Scan rapide et EPHEMERE d'une boite via Microsoft Graph (rien n'est ecrit en base) :
+    recupere connexions + journal d'audit + regles de messagerie sur les N derniers jours,
+    et applique la meme analyse heuristique que pour une boite deja suivie."""
+    from datetime import datetime, timedelta, timezone
+    import urllib.parse
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    upn_escaped = (user_upn or '').replace("'", "''")
+
+    signin_items = graph_get_all('/auditLogs/signIns', params={
+        '$filter': f"userPrincipalName eq '{upn_escaped}' and createdDateTime ge {since}", '$top': '999'})
+    signin_dicts = [_map_graph_signin(it) for it in signin_items]
+
+    audit_items = graph_get_all('/auditLogs/directoryAudits', params={'$filter': f'activityDateTime ge {since}', '$top': '999'})
+    upn_lower = (user_upn or '').lower()
+    audit_dicts = []
+    for it in audit_items:
+        targets = it.get('targetResources') or []
+        initiator = (it.get('initiatedBy') or {}).get('user') or {}
+        if any((t.get('userPrincipalName') or '').lower() == upn_lower for t in targets) or \
+           (initiator.get('userPrincipalName') or '').lower() == upn_lower:
+            audit_dicts.append(_map_graph_audit(it))
+
+    encoded_upn = urllib.parse.quote(user_upn or '')
+    rule_items = graph_get_all(f'/users/{encoded_upn}/mailFolders/inbox/messageRules')
+    rule_dicts = [_map_graph_rule(it) for it in rule_items]
+    suspicious_rules = [r for r in rule_dicts if r['is_suspicious'] == 'true']
+
+    owner_domain = user_upn.split('@')[-1] if user_upn and '@' in user_upn else ''
+    events = build_timeline_events(signin_dicts, audit_dicts)
+    analysis = analyze_compromise_events(events, suspicious_rules=suspicious_rules, owner_domain=owner_domain)
+    analysis['nb_signins'] = len(signin_dicts)
+    analysis['nb_audit'] = len(audit_dicts)
+    analysis['nb_rules'] = len(rule_dicts)
+    analysis['user_upn'] = user_upn
+    analysis['days'] = days
+    return analysis
+
+
+@app.route('/boite/<int:bid>/timeline')
+def view_timeline(bid):
+    conn = get_db()
+    boite = conn.execute('SELECT * FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    conn.close()
+    if not boite:
+        flash('Boîte non trouvée')
+        return redirect(url_for('index'))
+
+    analysis = analyze_compromise(bid)
+    return render_template('timeline.html', boite=boite, **analysis)
 
 
 @app.route('/boite/<int:bid>/signins')
@@ -925,6 +1645,269 @@ def view_audit_detail(event_id):
                          back_label="Retour au journal d'audit")
 
 
+@app.route('/quick-scan', methods=['POST'])
+def quick_scan():
+    email = request.form.get('email', '').strip()
+    if not email or '@' not in email:
+        flash('Adresse email invalide pour le scan rapide')
+        return redirect(url_for('index'))
+
+    try:
+        days = max(1, min(int(request.form.get('days', '7')), 90))
+    except ValueError:
+        days = 7
+
+    try:
+        result = quick_scan_mailbox(email, days)
+    except Exception as e:
+        add_log('ERROR', 'GRAPH', f'Échec du scan rapide pour {email}', str(e))
+        flash(f"Erreur lors du scan rapide via Microsoft Graph : {e}")
+        return redirect(url_for('index'))
+
+    add_log('INFO', 'GRAPH', f'Scan rapide effectué pour {email}',
+            f"score {result['score']}/10, verdict {result['verdict']}, {len(result['findings'])} signal(aux)")
+
+    existing = None
+    conn = get_db()
+    row = conn.execute('SELECT id FROM boites_compromises WHERE user_email=? ORDER BY id DESC LIMIT 1', (email,)).fetchone()
+    conn.close()
+    if row:
+        existing = row['id']
+
+    return render_template('quick_scan_result.html', email=email, existing_boite_id=existing, **result)
+
+
+@app.route('/quick-scan/create', methods=['POST'])
+def quick_scan_create():
+    email = request.form.get('email', '').strip()
+    if not email or '@' not in email:
+        flash('Adresse email invalide')
+        return redirect(url_for('index'))
+    try:
+        days = max(1, min(int(request.form.get('days', '7')), 90))
+    except ValueError:
+        days = 7
+
+    conn = get_db()
+    row = conn.execute('SELECT id FROM boites_compromises WHERE user_email=? ORDER BY id DESC LIMIT 1', (email,)).fetchone()
+    if row:
+        bid = row['id']
+        conn.close()
+        flash(f"Une boîte existait déjà pour {email} — réutilisation de l'investigation existante.")
+    else:
+        from datetime import date
+        conn.execute('''INSERT INTO boites_compromises (user_email, date_compromission, notes)
+            VALUES (?, ?, ?)''',
+            (email, date.today().isoformat(), "Créée automatiquement depuis l'analyse rapide (page d'accueil)."))
+        conn.commit()
+        bid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.close()
+
+    summary = []
+    errors = []
+    try:
+        c, d = fetch_signins_from_graph(bid, email, days)
+        summary.append(f'{c} connexion(s) ({d} doublon(s) ignoré(s))')
+    except Exception as e:
+        errors.append(f'Connexions : {e}')
+    try:
+        c, d = fetch_audit_from_graph(bid, email, days)
+        summary.append(f"{c} événement(s) d'audit ({d} doublon(s) ignoré(s))")
+    except Exception as e:
+        errors.append(f'Journal d\'audit : {e}')
+    try:
+        c = fetch_inbox_rules_from_graph(bid, email)
+        summary.append(f'{c} règle(s) de messagerie')
+    except Exception as e:
+        errors.append(f'Règles de messagerie : {e}')
+
+    if summary:
+        add_log('INFO', 'GRAPH', f'Boîte créée/mise à jour depuis analyse rapide pour {email}', ', '.join(summary), bid)
+        flash("Boîte compromise créée, données importées : " + ', '.join(summary))
+    for err in errors:
+        add_log('ERROR', 'GRAPH', f'Erreur import Microsoft Graph pour {email}', err, bid)
+        flash(f'Erreur Microsoft Graph — {err}')
+
+    return redirect(url_for('view_timeline', bid=bid))
+
+
+# ============================================================================
+# Surveillance planifiee : scan rapide automatique (via Microsoft Graph) d'une
+# liste de boites a intervalle regulier, sans creer de dossier d'investigation
+# tant que rien d'anormal n'est detecte. Reserve aux administrateurs.
+# ============================================================================
+
+import threading
+import time as _time
+
+_monitoring_thread_started = False
+_monitoring_lock = threading.Lock()
+
+
+def run_monitoring_scan(mailbox_row):
+    """Execute un scan rapide pour une boite surveillee et enregistre le resultat
+    (score, verdict, nombre de signaux) sur la ligne monitored_mailboxes, plus une
+    entree dans le journal applicatif (categorie MONITORING)."""
+    email = mailbox_row['user_email']
+    now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn = get_db()
+    try:
+        # Marquer immediatement last_scan_at pour eviter qu'un autre passage du
+        # planificateur ne relance le meme scan en parallele (verrouillage optimiste).
+        conn.execute('UPDATE monitored_mailboxes SET last_scan_at=? WHERE id=?', (now_iso, mailbox_row['id']))
+        conn.commit()
+
+        result = quick_scan_mailbox(email, days=1)
+
+        conn.execute('''UPDATE monitored_mailboxes SET
+            last_scan_at=?, last_scan_score=?, last_scan_verdict=?, last_scan_findings_count=?, last_error=NULL
+            WHERE id=?''',
+            (now_iso, result['score'], result['verdict'], len(result['findings']), mailbox_row['id']))
+        conn.commit()
+
+        level = 'WARNING' if result['score'] >= 6 else 'INFO'
+        add_log(level, 'MONITORING',
+                f"Scan de surveillance pour {email} : score {result['score']}/10 ({result['verdict']})",
+                f"{len(result['findings'])} signal(aux) détecté(s) sur les dernières 24h")
+    except Exception as e:
+        conn.execute('UPDATE monitored_mailboxes SET last_scan_at=?, last_error=? WHERE id=?',
+                     (now_iso, str(e), mailbox_row['id']))
+        conn.commit()
+        add_log('ERROR', 'MONITORING', f'Échec du scan de surveillance pour {email}', str(e))
+    finally:
+        conn.close()
+
+
+def _monitoring_scan_due(row, now):
+    if not row['last_scan_at']:
+        return True
+    last = _parse_iso(row['last_scan_at'])
+    if not last:
+        return True
+    elapsed_minutes = (now - last).total_seconds() / 60
+    return elapsed_minutes >= (row['interval_minutes'] or 60)
+
+
+def monitoring_scheduler_tick():
+    """Un passage du planificateur : scanne toutes les boites actives dont l'intervalle
+    est ecoule. Ne fait rien si la configuration Microsoft Graph est incomplete."""
+    if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
+        return
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM monitored_mailboxes WHERE is_active=1').fetchall()
+    conn.close()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for row in rows:
+        if _monitoring_scan_due(row, now):
+            run_monitoring_scan(row)
+
+
+def monitoring_scheduler_loop(tick_seconds=60):
+    while True:
+        try:
+            with _monitoring_lock:
+                monitoring_scheduler_tick()
+        except Exception as e:
+            print(f"Erreur boucle de surveillance: {e}")
+        _time.sleep(tick_seconds)
+
+
+def start_monitoring_scheduler():
+    global _monitoring_thread_started
+    if _monitoring_thread_started:
+        return
+    _monitoring_thread_started = True
+    t = threading.Thread(target=monitoring_scheduler_loop, daemon=True, name='monitoring-scheduler')
+    t.start()
+
+
+@app.route('/monitoring')
+@admin_required
+def view_monitoring():
+    conn = get_db()
+    mailboxes = conn.execute('SELECT * FROM monitored_mailboxes ORDER BY user_email').fetchall()
+    conn.close()
+    graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+    return render_template('monitoring.html', mailboxes=mailboxes, graph_configured=graph_configured)
+
+
+@app.route('/monitoring/add', methods=['POST'])
+@admin_required
+def add_monitored_mailbox():
+    email = request.form.get('email', '').strip()
+    try:
+        interval = max(5, min(int(request.form.get('interval_minutes', '60')), 10080))
+    except ValueError:
+        interval = 60
+    if not email or '@' not in email:
+        flash('Adresse email invalide')
+        return redirect(url_for('view_monitoring'))
+
+    conn = get_db()
+    try:
+        conn.execute('''INSERT INTO monitored_mailboxes (user_email, interval_minutes, created_by)
+            VALUES (?, ?, ?)''', (email, interval, session.get('username', '')))
+        conn.commit()
+        flash(f'{email} ajoutée à la surveillance (toutes les {interval} min)')
+    except sqlite3.IntegrityError:
+        flash(f'{email} est déjà surveillée')
+    finally:
+        conn.close()
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/<int:mailbox_id>/update', methods=['POST'])
+@admin_required
+def update_monitored_mailbox(mailbox_id):
+    try:
+        interval = max(5, min(int(request.form.get('interval_minutes', '60')), 10080))
+    except ValueError:
+        interval = 60
+    conn = get_db()
+    conn.execute('UPDATE monitored_mailboxes SET interval_minutes=? WHERE id=?', (interval, mailbox_id))
+    conn.commit()
+    conn.close()
+    flash('Intervalle mis à jour')
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/<int:mailbox_id>/toggle', methods=['POST'])
+@admin_required
+def toggle_monitored_mailbox(mailbox_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM monitored_mailboxes WHERE id=?', (mailbox_id,)).fetchone()
+    if row:
+        conn.execute('UPDATE monitored_mailboxes SET is_active=? WHERE id=?', (0 if row['is_active'] else 1, mailbox_id))
+        conn.commit()
+    conn.close()
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/<int:mailbox_id>/delete', methods=['POST'])
+@admin_required
+def delete_monitored_mailbox(mailbox_id):
+    conn = get_db()
+    conn.execute('DELETE FROM monitored_mailboxes WHERE id=?', (mailbox_id,))
+    conn.commit()
+    conn.close()
+    flash('Boîte retirée de la surveillance')
+    return redirect(url_for('view_monitoring'))
+
+
+@app.route('/monitoring/<int:mailbox_id>/scan-now', methods=['POST'])
+@admin_required
+def scan_now_monitored_mailbox(mailbox_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM monitored_mailboxes WHERE id=?', (mailbox_id,)).fetchone()
+    conn.close()
+    if not row:
+        flash('Boîte non trouvée')
+        return redirect(url_for('view_monitoring'))
+    run_monitoring_scan(row)
+    flash(f"Scan effectué pour {row['user_email']}")
+    return redirect(url_for('view_monitoring'))
+
+
 @app.route('/boite/<int:bid>/graph/fetch', methods=['POST'])
 def graph_fetch(bid):
     conn = get_db()
@@ -939,8 +1922,16 @@ def graph_fetch(bid):
     except ValueError:
         days = 30
 
+    include_messages = request.form.get('include_messages') == 'on'
     summary = []
     errors = []
+
+    if include_messages:
+        try:
+            c, d = fetch_sent_messages_from_graph(bid, boite['user_email'], days)
+            summary.append(f'{c} message(s) envoyé(s) ({d} doublon(s) ignoré(s))')
+        except Exception as e:
+            errors.append(f'Messages envoyés : {e}')
 
     try:
         c, d = fetch_signins_from_graph(bid, boite['user_email'], days)
@@ -1169,6 +2160,17 @@ SUSPICIOUS_AUDIT_KEYWORDS = [
     'serviceprincipal', 'approleassignment', 'addowner', 'federation', 'password',
     'credential', 'authenticationmethod', 'strongauthentication', 'mfa', 'phonenumber',
     'permission', 'roleassignment', 'admin', 'stsrefreshtokenvalidfrom',
+]
+
+# Mots-clés (substring, non normalises) indiquant qu'une regle de suppression automatique de
+# messages cible specifiquement du courrier lie a la securite (alertes de connexion, mots de
+# passe...). Une suppression qui ne matche aucun de ces mots-clés est tres majoritairement une
+# regle de confort banale (notifications de supervision, mailer-daemon, newsletters...) et
+# n'est donc pas consideree comme suspecte.
+SECURITY_RULE_KEYWORDS = [
+    'security', 'securite', 'sécurité', 'alert', 'alerte', 'unusual', 'inhabituel',
+    'sign-in', 'signin', 'connexion', 'password', 'mot de passe', 'mfa',
+    'suspicious', 'suspect', 'risk', 'risque', 'compromise', 'compromis', 'protection',
 ]
 
 
@@ -1909,8 +2911,14 @@ if __name__ == '__main__':
     import sys
     load_config_from_env()
     if len(sys.argv) > 1 and sys.argv[1] == '--dev':
+        # Sous le reloader Werkzeug, le script tourne dans 2 processus (superviseur +
+        # enfant) : ne demarrer le planificateur que dans le processus qui sert reellement
+        # les requetes, sous peine de le lancer en double.
+        if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+            start_monitoring_scheduler()
         app.run(host='0.0.0.0', debug=True, port=5050)
     else:
         from waitress import serve
+        start_monitoring_scheduler()
         print("Démarrage avec Waitress (stable)...")
         serve(app, host='0.0.0.0', port=5050, threads=4)

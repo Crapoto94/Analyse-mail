@@ -17,6 +17,9 @@
         <button onclick="sendEmails()" class="btn btn-warning">
             <i class="bi bi-envelope-paper"></i> Envoyer mails aux destinataires
         </button>
+        <a href="{{ url_for('view_timeline', bid=boite.id) }}" class="btn btn-outline-primary">
+            <i class="bi bi-clock-history"></i> Timeline & analyse
+        </a>
         <a href="{{ url_for('upload_csv', bid=boite.id) }}" class="btn btn-success">
             <i class="bi bi-cloud-upload"></i> Importer CSV
         </a>
@@ -27,6 +30,34 @@
 </div>
 
 <div id="send-result" class="mb-3" style="display:none;"></div>
+
+<a href="{{ url_for('view_timeline', bid=boite.id) }}" class="text-decoration-none">
+    <div class="card mb-4 {% if risk_score >= 8 %}border-danger{% elif risk_score >= 4 %}border-warning{% elif risk_score >= 1 %}border-secondary{% else %}border-success{% endif %}">
+        <div class="card-body d-flex align-items-center gap-4 flex-wrap">
+            <div class="text-center">
+                <div class="display-4 fw-bold {% if risk_score >= 8 %}text-danger{% elif risk_score >= 4 %}text-warning{% elif risk_score >= 1 %}text-secondary{% else %}text-success{% endif %}">
+                    {{ risk_score }}<span class="fs-5">/10</span>
+                </div>
+                <small class="text-muted text-nowrap">Risque de compromission</small>
+            </div>
+            <div class="flex-grow-1">
+                <div class="progress mb-2" style="height: 10px;">
+                    <div class="progress-bar {% if risk_score >= 8 %}bg-danger{% elif risk_score >= 4 %}bg-warning{% elif risk_score >= 1 %}bg-secondary{% else %}bg-success{% endif %}"
+                         style="width: {{ (risk_score / 10 * 100)|round }}%;"></div>
+                </div>
+                {% if risk_verdict == 'compromise_likely' %}
+                <strong class="text-danger"><i class="bi bi-exclamation-octagon-fill"></i> Compromission probable</strong>
+                {% elif risk_verdict == 'signals_to_check' %}
+                <strong class="text-warning"><i class="bi bi-exclamation-triangle-fill"></i> Signaux à vérifier</strong>
+                {% else %}
+                <strong class="text-success"><i class="bi bi-check-circle-fill"></i> Aucun signal fort détecté</strong>
+                {% endif %}
+                <span class="text-muted">— {{ risk_findings_count }} élément(s) détecté(s) sur les connexions/audit importés</span>
+            </div>
+            <i class="bi bi-chevron-right fs-3 text-muted"></i>
+        </div>
+    </div>
+</a>
 
 <div class="row mb-4">
     <div class="col-md-4">
@@ -103,7 +134,8 @@
     <div class="col-md-6">
         <div class="card h-100 border-dark">
             <div class="card-body">
-                <form method="POST" action="{{ url_for('graph_fetch', bid=boite.id) }}" class="d-flex align-items-center gap-2">
+                <form method="POST" action="{{ url_for('graph_fetch', bid=boite.id) }}" class="d-flex align-items-center gap-2 flex-wrap"
+                      onsubmit="showGlobalLoading('Interrogation de Microsoft Graph en cours (connexions, audit, règles, messages)…'); return true;">
                     <span class="text-nowrap"><i class="bi bi-microsoft"></i> <strong>Microsoft Graph</strong></span>
                     <select name="days" class="form-select form-select-sm w-auto">
                         <option value="1">1 jour</option>
@@ -111,6 +143,10 @@
                         <option value="30">30 jours</option>
                         <option value="90">90 jours</option>
                     </select>
+                    <div class="form-check form-check-inline m-0">
+                        <input class="form-check-input" type="checkbox" name="include_messages" id="include_messages" value="on">
+                        <label class="form-check-label small" for="include_messages">+ messages envoyés</label>
+                    </div>
                     {% if graph_configured %}
                     <button type="submit" class="btn btn-sm btn-dark">
                         <i class="bi bi-cloud-download"></i> Récupérer
@@ -121,7 +157,7 @@
                     </a>
                     {% endif %}
                 </form>
-                <small class="text-muted d-block mt-1">Connexions, audit et règles de messagerie de <strong>{{ boite.user_email }}</strong> directement via l'API, sans CSV.</small>
+                <small class="text-muted d-block mt-1">Connexions, audit et règles de messagerie de <strong>{{ boite.user_email }}</strong> directement via l'API.</small>
             </div>
         </div>
     </div>
@@ -420,8 +456,8 @@
         <div class="row">
             <div class="col-md-6">
                 <h6><i class="bi bi-clock-history"></i> Fenêtre d'attaque</h6>
-                <p>Premier message: <strong>{{ first_msg or 'N/A' }}</strong></p>
-                <p>Dernier message: <strong>{{ last_msg or 'N/A' }}</strong></p>
+                <p>Premier message: <strong>{{ first_msg|paris if first_msg else 'N/A' }}</strong></p>
+                <p>Dernier message: <strong>{{ last_msg|paris if last_msg else 'N/A' }}</strong></p>
             </div>
             <div class="col-md-6">
                 <h6><i class="bi bi-graph-up"></i> Volume par domaine</h6>
@@ -532,11 +568,11 @@
                 <tbody>
                     {% for msg in messages %}
                     <tr>
-                        <td><small>{{ msg.received }}</small></td>
+                        <td><small>{{ msg.received|paris }}</small></td>
                         <td><small>{{ msg.recipient_address }}</small></td>
                         <td><small>{{ msg.subject }}</small></td>
                         <td>
-                            <span class="badge bg-{% if msg.status == 'Delivered' %}success{% elif msg.status == 'Failed' %}danger{% elif msg.status == 'Resolved' %}secondary{% elif msg.status == 'Quarantined' %}warning{% else %}primary{% endif %}">
+                            <span class="badge bg-{% if msg.status in ('Delivered', 'Envoyé') %}success{% elif msg.status == 'Failed' %}danger{% elif msg.status == 'Resolved' %}secondary{% elif msg.status == 'Quarantined' %}warning{% else %}primary{% endif %}">
                                 {{ msg.status }}
                             </span>
                         </td>

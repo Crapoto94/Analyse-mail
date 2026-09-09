@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Analyse rapide - {{ email }}{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-lightning-charge"></i> Analyse rapide - {{ email }}</h1>
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Accueil
+    </a>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body text-center">
+                <div class="display-3 fw-bold {% if score >= 8 %}text-danger{% elif score >= 4 %}text-warning{% elif score >= 1 %}text-secondary{% else %}text-success{% endif %}">
+                    {{ score }}<span class="fs-4">/10</span>
+                </div>
+                <div class="text-muted">Score de risque de compromission</div>
+                <div class="progress mt-2" style="height: 10px;">
+                    <div class="progress-bar {% if score >= 8 %}bg-danger{% elif score >= 4 %}bg-warning{% elif score >= 1 %}bg-secondary{% else %}bg-success{% endif %}"
+                         style="width: {{ (score / 10 * 100)|round }}%;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-8">
+        <div class="card h-100">
+            <div class="card-body">
+                <p class="mb-1"><strong>Période analysée :</strong> {{ days }} jour(s)</p>
+                <p class="mb-1"><strong>Connexions examinées :</strong> {{ nb_signins }}</p>
+                <p class="mb-1"><strong>Événements d'audit examinés :</strong> {{ nb_audit }}</p>
+                <p class="mb-0"><strong>Règles de messagerie examinées :</strong> {{ nb_rules }}</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if verdict == 'compromise_likely' %}
+<div class="alert alert-danger">
+    <h4 class="alert-heading"><i class="bi bi-exclamation-octagon-fill"></i> Compromission probable</h4>
+    <p class="mb-0">Un ou plusieurs signaux forts ont été détectés. Une investigation complète est recommandée.</p>
+</div>
+{% elif verdict == 'signals_to_check' %}
+<div class="alert alert-warning">
+    <h4 class="alert-heading"><i class="bi bi-exclamation-triangle-fill"></i> Signaux à vérifier</h4>
+    <p class="mb-0">Des éléments méritent une vérification manuelle, sans enchaînement clair de compromission.</p>
+</div>
+{% else %}
+<div class="alert alert-success">
+    <h4 class="alert-heading"><i class="bi bi-check-circle-fill"></i> Aucun signal fort détecté</h4>
+    <p class="mb-0">Rien d'anormal détecté automatiquement sur la période analysée.</p>
+</div>
+{% endif %}
+
+{% if findings %}
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-search"></i> Éléments détectés ({{ findings|length }})</div>
+    <div class="card-body">
+        {% for f in findings %}
+        <div class="alert mb-2 {% if f.severity == 'critical' %}alert-danger{% elif f.severity == 'high' %}alert-warning{% elif f.severity == 'medium' %}alert-secondary{% else %}alert-light{% endif %}">
+            <strong>
+                {% if f.severity == 'critical' %}<span class="badge bg-danger">CRITIQUE</span>
+                {% elif f.severity == 'high' %}<span class="badge bg-warning text-dark">ÉLEVÉ</span>
+                {% else %}<span class="badge bg-secondary">À VÉRIFIER</span>{% endif %}
+                {{ f.title }}
+            </strong>
+            <div class="small mt-1">{{ f.description }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-body d-flex justify-content-between align-items-center flex-wrap gap-3">
+        <div>
+            <h5 class="mb-1">Poursuivre l'investigation</h5>
+            <p class="text-muted small mb-0">
+                {% if existing_boite_id %}
+                Une boîte existe déjà pour cette adresse : les données seront importées dedans (avec déduplication).
+                {% else %}
+                Crée une nouvelle boîte compromise et importe ces données (connexions, audit, règles) pour une analyse complète avec timeline.
+                {% endif %}
+            </p>
+        </div>
+        <div class="d-flex gap-2">
+            {% if existing_boite_id %}
+            <a href="{{ url_for('view_timeline', bid=existing_boite_id) }}" class="btn btn-outline-primary">
+                <i class="bi bi-clock-history"></i> Voir l'investigation existante
+            </a>
+            {% endif %}
+            <form method="POST" action="{{ url_for('quick_scan_create') }}"
+                  onsubmit="showGlobalLoading('Import complet des données via Microsoft Graph en cours…'); return true;">
+                <input type="hidden" name="email" value="{{ email }}">
+                <input type="hidden" name="days" value="{{ days }}">
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-shield-plus"></i>
+                    {% if existing_boite_id %}Importer dans la boîte existante{% else %}Créer une boîte compromise{% endif %}
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
