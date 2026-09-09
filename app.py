@@ -14,6 +14,15 @@ app.secret_key = 'analyse-compromis-secret-key'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
+# Derriere un reverse proxy qui termine le HTTPS (nginx, IIS...), waitress ne voit que du
+# HTTP en interne : sans ProxyFix, url_for(_external=True) (utilise pour l'URI de
+# redirection Microsoft) generait du "http://" au lieu du "https://" attendu par Azure,
+# provoquant une erreur AADSTS50011 (URI de redirection non reconnue). ProxyFix fait
+# confiance aux en-tetes X-Forwarded-* envoyes par le proxy pour retrouver le schema, l'hote
+# et le chemin d'origine reels — le proxy DOIT positionner ces en-tetes (voir /config).
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 
 def format_paris_datetime(value, fmt='%d/%m/%Y %H:%M:%S'):
     """Convertit une date ISO8601 (UTC, telle que fournie par les CSV Microsoft 365 /

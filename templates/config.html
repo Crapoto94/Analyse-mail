@@ -127,7 +127,12 @@
                             <div class="input-group input-group-sm mt-1 mb-1">
                                 <input type="text" class="form-control" value="{{ microsoft_redirect_uri }}" readonly onclick="this.select()">
                             </div>
-                            <span class="text-muted">(doit être en HTTPS en production ; http://localhost fonctionne en développement)</span>
+                            <span class="text-muted">(doit être en HTTPS en production ; http://localhost fonctionne en développement — cette valeur reflète la façon dont <em>cette</em> requête a atteint l'application, donc rechargez cette page en passant par votre URL de prod pour voir la bonne valeur)</span>
+                        </li>
+                        <li>
+                            Si l'application est derrière un <strong>reverse proxy</strong> (nginx, IIS...) qui termine le HTTPS, celui-ci doit transmettre l'en-tête <code>X-Forwarded-Proto: https</code> (et idéalement <code>X-Forwarded-Host</code>) — sinon l'URI générée reste en <code>http://</code> et Azure refuse la connexion (<code>AADSTS50011</code>). Exemple nginx :
+                            <pre class="bg-light p-2 small mb-0 mt-1">proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $host;</pre>
                         </li>
                         <li>Toujours dans <em>Autorisations API</em>, ajoutez cette fois des <strong>autorisations déléguées</strong> Microsoft Graph :
                             <code>openid</code>, <code>profile</code>, <code>email</code>, <code>User.Read</code> (généralement sans consentement admin requis).
