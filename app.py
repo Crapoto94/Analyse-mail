@@ -185,6 +185,48 @@ def _compute_mfa_linkage(signins, window_seconds=15):
 
 app.jinja_env.filters['mfa_status'] = format_mfa_status
 
+
+def friendly_graph_error(message):
+    """Resume une erreur technique Microsoft Graph (souvent une longue URL + un corps
+    JSON) en une phrase courte et comprehensible, pour affichage direct dans l'UI
+    (le message brut integral reste disponible en infobulle). Conserve un eventuel
+    prefixe de source court (ex: 'Règles de messagerie : ') devant le resume."""
+    if not message:
+        return ''
+
+    prefix = ''
+    rest = message
+    if ': ' in message:
+        candidate_prefix, candidate_rest = message.split(': ', 1)
+        if len(candidate_prefix) <= 40 and 'http' not in candidate_prefix.lower():
+            prefix, rest = candidate_prefix + ' : ', candidate_rest
+
+    text = rest.lower()
+    if 'mailboxnotenabledforrestapi' in text or ('404' in text and 'mailfolders' in text):
+        summary = "boîte Exchange indisponible (normal pour un compte d'administration dédié sans licence Exchange)"
+    elif 'read operation timed out' in text or "n'a pas répondu à temps" in text or 'timed out' in text:
+        summary = "Microsoft Graph n'a pas répondu à temps (temporaire, devrait se résoudre au prochain scan)"
+    elif 'http 403' in text or 'authorization_requestdenied' in text:
+        summary = "permission Microsoft Graph manquante ou consentement admin non accordé (voir Configuration)"
+    elif 'http 401' in text or 'invalidauthenticationtoken' in text:
+        summary = 'authentification Microsoft Graph refusée (secret expiré ou configuration incorrecte)'
+    elif 'configuration microsoft graph incomplète' in text:
+        summary = 'configuration Microsoft Graph incomplète (voir Configuration)'
+    else:
+        summary = rest if len(rest) <= 140 else rest[:140] + '…'
+
+    return prefix + summary
+
+
+app.jinja_env.filters['friendly_graph_error'] = friendly_graph_error
+
+
+def _is_no_mailbox_error(e):
+    """True si une erreur Graph correspond a un compte sans boite Exchange (courant et
+    normal pour un compte d'administration dedie 'adm-*') : ce n'est pas un vrai echec
+    de scan, juste l'absence de regles de messagerie a examiner pour ce compte."""
+    return 'mailboxnotenabledforrestapi' in str(e).lower()
+
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs('templates', exist_ok=True)
 
@@ -1144,6 +1186,11 @@ def microsoft_login():
         'response_mode': 'query',
         'scope': 'openid profile email User.Read',
         'state': state,
+        # Force systematiquement l'ecran de choix de compte : sans ca, Microsoft ne le
+        # montre que s'il detecte plusieurs comptes actifs dans le navigateur — avec un
+        # seul compte deja connecte (ex: personnel), il enchaine silencieusement dessus,
+        # ce qui peut ne pas etre le compte professionnel attendu pour cette application.
+        'prompt': 'select_account',
     }
     auth_url = (f'https://login.microsoftonline.com/{urllib.parse.quote(tenant_id)}/oauth2/v2.0/authorize?'
                 + urllib.parse.urlencode(params))
@@ -2075,8 +2122,9 @@ def quick_scan_mailbox(user_upn, days=7, on_step=None):
         suspicious_rules = [r for r in rule_dicts if r['is_suspicious'] == 'true']
         notify('rules', 'done')
     except Exception as e:
-        errors.append(f'Règles de messagerie : {e}')
-        notify('rules', 'error')
+        if not _is_no_mailbox_error(e):
+            errors.append(f'Règles de messagerie : {e}')
+        notify('rules', 'done')
 
     if len(errors) == 3:
         # Les 3 sources ont echoue : remonter une vraie erreur plutot qu'un scan "propre" trompeur
@@ -2390,7 +2438,8 @@ def quick_scan_create():
         c = fetch_inbox_rules_from_graph(bid, email)
         summary.append(f'{c} règle(s) de messagerie')
     except Exception as e:
-        errors.append(f'Règles de messagerie : {e}')
+        if not _is_no_mailbox_error(e):
+            errors.append(f'Règles de messagerie : {e}')
 
     if summary:
         add_log('INFO', 'GRAPH', f'Boîte créée/mise à jour depuis analyse rapide pour {email}', ', '.join(summary), bid)
@@ -2800,8 +2849,9 @@ def graph_fetch_start(bid):
             summary.append(f'{c} règle(s) de messagerie')
             _job_step(job_id, 'rules', 'done')
         except Exception as e:
-            errors.append(f'Règles de messagerie : {e}')
-            _job_step(job_id, 'rules', 'error')
+            if not _is_no_mailbox_error(e):
+                errors.append(f'Règles de messagerie : {e}')
+            _job_step(job_id, 'rules', 'done')
 
         if summary:
             add_log('INFO', 'GRAPH', f'Import Microsoft Graph pour {email}', ', '.join(summary), bid)

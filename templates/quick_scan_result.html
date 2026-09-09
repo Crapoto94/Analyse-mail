@@ -40,7 +40,7 @@
     <i class="bi bi-exclamation-triangle"></i> <strong>Scan partiel</strong> — certaines sources n'ont pas pu être lues,
     le score ci-dessous ne se base que sur les données disponibles :
     <ul class="mb-0 mt-1">
-        {% for err in errors %}<li>{{ err }}</li>{% endfor %}
+        {% for err in errors %}<li title="{{ err }}">{{ err|friendly_graph_error }}</li>{% endfor %}
     </ul>
 </div>
 {% endif %}
