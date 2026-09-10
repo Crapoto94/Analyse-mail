@@ -2872,7 +2872,8 @@ def view_boite(bid):
         graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
         groq_ai_configured = bool(get_config('groq_api_key', ''))
         nvidia_ai_configured = bool(get_config('nvidia_api_key', ''))
-        ai_configured = groq_ai_configured or nvidia_ai_configured
+        ollama_ai_configured = get_config('ollama_enabled', '1') != '0'
+        ai_configured = groq_ai_configured or nvidia_ai_configured or ollama_ai_configured
         rh_studio_configured = bool(get_config('rh_studio_url', '') and get_config('rh_studio_api_key', ''))
         dsi_actions = conn.execute('SELECT * FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)).fetchall()
         risk_analysis = analyze_compromise(bid)
@@ -2967,6 +2968,7 @@ def view_boite(bid):
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
                          graph_configured=graph_configured, ai_configured=ai_configured,
                          groq_ai_configured=groq_ai_configured, nvidia_ai_configured=nvidia_ai_configured,
+                         ollama_ai_configured=ollama_ai_configured,
                          dsi_actions=dsi_actions, now_local_dt=_now_local_datetime_input(),
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count,
                          rh_studio_configured=rh_studio_configured)
@@ -3496,6 +3498,9 @@ GROQ_AVAILABLE_MODELS = [
 NVIDIA_API_URL = 'https://integrate.api.nvidia.com/v1/chat/completions'
 NVIDIA_DEFAULT_MODEL = 'meta/llama-3.1-70b-instruct'
 
+OLLAMA_DEFAULT_URL = 'http://10.103.130.166:11434'
+OLLAMA_DEFAULT_MODEL = 'gemma4:e4b'
+
 GROQ_DEFAULT_PROMPT_TEMPLATE = """Tu es un analyste en cybersécurité spécialisé dans la réponse à incident sur Microsoft 365 / Entra ID (Azure AD).
 
 Voici les journaux collectés pour la boîte {{email}}, ainsi que le résultat d'une analyse heuristique automatique (score de risque {{score}}/10, verdict : {{verdict}}).
@@ -3665,21 +3670,36 @@ def call_nvidia_chat(prompt, api_key=None, model=None, timeout=60):
     return _call_openai_compatible_chat(NVIDIA_API_URL, api_key, model, prompt, timeout, 'NVIDIA')
 
 
+def call_ollama_chat(prompt, url=None, model=None, timeout=120):
+    url = url or get_config('ollama_url', '') or OLLAMA_DEFAULT_URL
+    model = model or get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL
+    if not url:
+        raise RuntimeError("URL de l'instance Ollama non configurée")
+    ollama_api_url = url.rstrip('/') + '/v1/chat/completions'
+    return _call_openai_compatible_chat(ollama_api_url, 'ollama', model, prompt, timeout, 'Ollama')
+
+
 def run_ai_analysis(bid, preferred_provider=None):
     """Construit le prompt pour la boite et interroge l'IA : essaie d'abord le
-    fournisseur choisi par l'utilisateur (`preferred_provider`, 'groq' ou 'nvidia' —
-    Groq par defaut si non precise), et bascule automatiquement sur l'autre fournisseur
-    (si configure) en cas d'echec (cle manquante, quota/limite de debit depasse,
-    panne...). Retourne (texte, fournisseur, modele). Ne persiste rien : c'est a
-    l'appelant de sauvegarder le resultat."""
+    fournisseur choisi par l'utilisateur, et bascule automatiquement sur les autres
+    (si configures) en cas d'echec. Retourne (texte, fournisseur, modele)."""
     prompt, _analysis = build_ai_analysis_prompt(bid)
 
     groq_key = get_config('groq_api_key', '')
     nvidia_key = get_config('nvidia_api_key', '')
-    if not groq_key and not nvidia_key:
-        raise RuntimeError('Aucun fournisseur IA configuré (Groq ou NVIDIA)')
+    ollama_url = get_config('ollama_url', '') or OLLAMA_DEFAULT_URL
+    ollama_enabled = get_config('ollama_enabled', '1') != '0'
+    has_ollama = ollama_enabled and ollama_url
 
-    order = ['nvidia', 'groq'] if preferred_provider == 'nvidia' else ['groq', 'nvidia']
+    if not groq_key and not nvidia_key and not has_ollama:
+        raise RuntimeError('Aucun fournisseur IA configuré (Groq, NVIDIA ou Ollama)')
+
+    # Construction de l'ordre : fournisseur préféré en premier, puis les autres
+    all_providers = ['groq', 'nvidia', 'ollama']
+    if preferred_provider and preferred_provider in all_providers:
+        order = [preferred_provider] + [p for p in all_providers if p != preferred_provider]
+    else:
+        order = ['groq', 'nvidia', 'ollama']
 
     errors = []
     for provider in order:
@@ -3695,6 +3715,12 @@ def run_ai_analysis(bid, preferred_provider=None):
                 return call_nvidia_chat(prompt, api_key=nvidia_key, model=model), 'NVIDIA', model
             except Exception as e:
                 errors.append(f'NVIDIA : {e}')
+        elif provider == 'ollama' and has_ollama:
+            model = get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL
+            try:
+                return call_ollama_chat(prompt, url=ollama_url, model=model), 'Ollama', model
+            except Exception as e:
+                errors.append(f'Ollama : {e}')
 
     raise RuntimeError(' / '.join(errors))
 
@@ -6175,6 +6201,18 @@ def config():
             set_config('nvidia_model', request.form.get('nvidia_model', '').strip())
             set_config('groq_prompt_template', request.form.get('groq_prompt_template', '').strip())
             flash('Configuration IA enregistrée avec succès')
+        elif 'ollama_enabled' in request.form or 'ollama_url' in request.form or 'ollama_model' in request.form:
+            new_ollama_enabled = request.form.get('ollama_enabled', '')
+            if new_ollama_enabled not in ('0', '1', '', None):
+                new_ollama_enabled = '1'
+            set_config('ollama_enabled', str(new_ollama_enabled).strip())
+            new_ollama_url = request.form.get('ollama_url', '')
+            if new_ollama_url:
+                set_config('ollama_url', new_ollama_url.strip())
+            new_ollama_model = request.form.get('ollama_model', '')
+            if new_ollama_model:
+                set_config('ollama_model', new_ollama_model.strip())
+            flash('Configuration Ollama enregistrée avec succès')
         elif 'teams_webhook_url' in request.form:
             set_config('teams_webhook_url', request.form.get('teams_webhook_url', '').strip())
             threshold_raw = request.form.get('teams_alert_score_threshold', '').strip()
@@ -6228,7 +6266,10 @@ def config():
         teams_alert_score_threshold=get_teams_alert_threshold(),
         abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')),
         rh_studio_url=get_config('rh_studio_url', ''),
-        rh_studio_api_key_set=bool(get_config('rh_studio_api_key', '')))
+        rh_studio_api_key_set=bool(get_config('rh_studio_api_key', '')),
+        ollama_enabled=get_config('ollama_enabled', '1'),
+        ollama_url=get_config('ollama_url', 'http://10.103.130.166:11434'),
+        ollama_model=get_config('ollama_model', 'gemma4:e4b'))
 
 @app.route('/api/diag/proxy-headers')
 @admin_required
@@ -6279,6 +6320,15 @@ def test_api_nvidia():
     try:
         reply = call_nvidia_chat("Réponds uniquement par : OK")
         return jsonify({'success': True, 'message': f"Connexion à l'API NVIDIA réussie — réponse du modèle : {reply.strip()[:200]}"})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/test-ollama')
+@admin_required
+def test_api_ollama():
+    try:
+        reply = call_ollama_chat("Réponds uniquement par : OK")
+        return jsonify({'success': True, 'message': f"Connexion à Ollama réussie — réponse du modèle : {reply.strip()[:200]}"})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 

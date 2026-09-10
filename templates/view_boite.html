@@ -92,13 +92,30 @@
                       window.location.hash = 'ai-analysis';
                       window.location.reload();
                   });">
-            {% if groq_ai_configured and nvidia_ai_configured %}
+            {% if groq_ai_configured and nvidia_ai_configured and ollama_ai_configured %}
             <select name="provider" class="form-select form-select-sm w-auto" title="Fournisseur IA (l'autre est utilisé en repli automatique en cas d'échec)">
-                <option value="groq" selected>Groq</option>
+                <option value="groq">Groq</option>
+                <option value="nvidia">NVIDIA</option>
+                <option value="ollama">Ollama</option>
+            </select>
+            {% elif nvidia_ai_configured and ollama_ai_configured %}
+            <select name="provider" class="form-select form-select-sm w-auto">
+                <option value="nvidia">NVIDIA</option>
+                <option value="ollama">Ollama</option>
+            </select>
+            {% elif ollama_ai_configured %}
+            <select name="provider" class="form-select form-select-sm w-auto">
+                <option value="ollama">Ollama</option>
+            </select>
+            {% elif groq_ai_configured and nvidia_ai_configured %}
+            <select name="provider" class="form-select form-select-sm w-auto" title="Fournisseur IA (l'autre est utilisé en repli automatique en cas d'échec)">
+                <option value="groq">Groq</option>
                 <option value="nvidia">NVIDIA</option>
             </select>
             {% elif nvidia_ai_configured %}
             <input type="hidden" name="provider" value="nvidia">
+            {% elif ollama_ai_configured %}
+            <input type="hidden" name="provider" value="ollama">
             {% else %}
             <input type="hidden" name="provider" value="groq">
             {% endif %}
