@@ -350,6 +350,40 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                 </form>
             </div>
         </div>
+
+        <div class="card mt-4">
+            <div class="card-header text-white" style="background-color: #6f42c1;">
+                <h4 class="mb-0"><i class="bi bi-people"></i> Annuaire RH (RH Studio)</h4>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Permet de vérifier la <strong>présence ou le départ</strong> des destinataires dans l'annuaire RH.
+                    Utile lors d'une compromission pour savoir si un destinataire de mails suspects est toujours
+                    présent dans l'organisation ou s'il est parti.
+                </p>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="rh_studio_url" class="form-label">URL de l'API RH Studio</label>
+                        <input type="url" class="form-control" id="rh_studio_url" name="rh_studio_url" value="{{ rh_studio_url }}" placeholder="https://rhstudio.ivry94.fr">
+                        <div class="form-text">URL de base de l'API RH Studio (sans le slash final)</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="rh_studio_api_key" class="form-label">Clé API</label>
+                        <input type="password" class="form-control" id="rh_studio_api_key" name="rh_studio_api_key" placeholder="{% if rh_studio_api_key_set %}•••••••• (laisser vide pour conserver la clé actuelle){% else %}Saisir la clé API...{% endif %}">
+                        {% if rh_studio_api_key_set %}
+                        <div class="form-text text-success"><i class="bi bi-check-circle"></i> Une clé est déjà enregistrée.</div>
+                        {% endif %}
+                    </div>
+                    <button type="submit" class="btn" style="background-color: #6f42c1; color: white;">
+                        <i class="bi bi-check-lg"></i> Enregistrer
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="testRhStudio()">
+                        <i class="bi bi-plug"></i> Tester la connexion
+                    </button>
+                </form>
+                <div id="test-result-rhstudio" class="mt-3" style="display:none;"></div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -488,6 +522,33 @@ function testTeamsWebhook() {
                 resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
             } else {
                 resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+            }
+        })
+        .catch(error => {
+            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
+        });
+}
+
+function testRhStudio() {
+    const resultDiv = document.getElementById('test-result-rhstudio');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
+
+    fetch('{{ url_for("test_api_rhstudio") }}')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                let html = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+                if (data.response) {
+                    html += '<div class="mt-2"><small><strong>Réponse:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+                }
+                resultDiv.innerHTML = html;
+            } else {
+                let html = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
+                if (data.response) {
+                    html += '<div class="mt-2"><small><strong>Erreur:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+                }
+                resultDiv.innerHTML = html;
             }
         })
         .catch(error => {

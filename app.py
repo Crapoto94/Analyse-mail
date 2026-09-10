@@ -1418,6 +1418,40 @@ def graph_request(method, path, body=None, timeout=20):
         raise RuntimeError(f"Microsoft Graph n'a pas répondu à temps sur {method} {url} : {e}")
 
 
+def rh_studio_check_presence(email=None, q=None, nom=None, prenom=None):
+    """Interroge l'API RH Studio (GET /api/agents/presence) pour verifier si un agent
+    est present, parti, ou pas encore arrive. Renvoie un dict avec les cles found,
+    matchType, score, agent (dict ou None). En cas d'erreur lève une exception."""
+    import urllib.request, urllib.parse
+    api_url = get_config('rh_studio_url', '').rstrip('/')
+    api_key = get_config('rh_studio_api_key', '')
+    if not api_url:
+        raise ValueError("URL de l'API RH Studio non configurée")
+    if not api_key:
+        raise ValueError("Clé API RH Studio non configurée")
+    params = {}
+    if email:
+        params['email'] = email
+    elif q:
+        params['q'] = q
+    elif nom:
+        params['nom'] = nom
+        if prenom:
+            params['prenom'] = prenom
+    elif prenom:
+        params['prenom'] = prenom
+    else:
+        raise ValueError("Aucun paramètre de recherche fourni")
+    qs = urllib.parse.urlencode(params)
+    url = f"{api_url}/api/agents/presence?{qs}"
+    req = urllib.request.Request(url, headers={
+        'Authorization': f'Bearer {api_key}',
+        'Accept': 'application/json',
+    })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
 def _graph_status_text(status_obj):
     error_code = (status_obj or {}).get('errorCode')
     return 'Success' if error_code in (0, None) else 'Failure'
@@ -2810,6 +2844,7 @@ def view_boite(bid):
         groq_ai_configured = bool(get_config('groq_api_key', ''))
         nvidia_ai_configured = bool(get_config('nvidia_api_key', ''))
         ai_configured = groq_ai_configured or nvidia_ai_configured
+        rh_studio_configured = bool(get_config('rh_studio_url', '') and get_config('rh_studio_api_key', ''))
         dsi_actions = conn.execute('SELECT * FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)).fetchall()
         risk_analysis = analyze_compromise(bid)
         risk_score = risk_analysis['score']
@@ -2904,7 +2939,8 @@ def view_boite(bid):
                          graph_configured=graph_configured, ai_configured=ai_configured,
                          groq_ai_configured=groq_ai_configured, nvidia_ai_configured=nvidia_ai_configured,
                          dsi_actions=dsi_actions, now_local_dt=_now_local_datetime_input(),
-                         risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count)
+                         risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count,
+                         rh_studio_configured=rh_studio_configured)
 
 def _timeline_query(conn, table, bid):
     rows = conn.execute(f'''SELECT
@@ -5993,6 +6029,12 @@ def config():
             if new_key:
                 set_config('abuseipdb_api_key', new_key.strip())
             flash("Configuration de réputation IP enregistrée avec succès")
+        elif 'rh_studio_url' in request.form or 'rh_studio_api_key' in request.form:
+            set_config('rh_studio_url', request.form.get('rh_studio_url', '').strip())
+            new_rh_key = request.form.get('rh_studio_api_key', '')
+            if new_rh_key:
+                set_config('rh_studio_api_key', new_rh_key.strip())
+            flash('Configuration RH Studio enregistrée avec succès')
         return redirect(url_for('config'))
 
     return render_template('config.html',
@@ -6022,7 +6064,9 @@ def config():
         groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE,
         teams_webhook_url=get_config('teams_webhook_url', ''),
         teams_alert_score_threshold=get_teams_alert_threshold(),
-        abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')))
+        abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')),
+        rh_studio_url=get_config('rh_studio_url', ''),
+        rh_studio_api_key_set=bool(get_config('rh_studio_api_key', '')))
 
 @app.route('/api/diag/proxy-headers')
 @admin_required
@@ -6140,6 +6184,33 @@ def test_api_ville():
             'message': f'Erreur HTTP {e.code}',
             'response': error_body,
             'url': api_url.rstrip('/') + '/ping'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
+
+@app.route('/api/test-rhstudio')
+@admin_required
+def test_api_rhstudio():
+    import urllib.error
+    api_url = get_config('rh_studio_url', '')
+    api_key = get_config('rh_studio_api_key', '')
+    if not api_url:
+        return jsonify({'success': False, 'message': 'URL de l\'API RH Studio non configurée'})
+    if not api_key:
+        return jsonify({'success': False, 'message': 'Clé API RH Studio non configurée'})
+    try:
+        result = rh_studio_check_presence(email='test@test.fr')
+        return jsonify({
+            'success': True,
+            'message': 'Connexion à l\'API RH Studio réussie',
+            'response': json.dumps(result, ensure_ascii=False, indent=2)
+        })
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8')
+        return jsonify({
+            'success': False,
+            'message': f'Erreur HTTP {e.code}',
+            'response': error_body
         })
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
@@ -6265,6 +6336,56 @@ def get_recipients_count(bid):
     count = conn.execute('SELECT COUNT(DISTINCT recipient_address) as cnt FROM messages WHERE boite_id=?', (bid,)).fetchone()['cnt']
     conn.close()
     return jsonify({'count': count})
+
+@app.route('/boite/<int:bid>/rhstudio-check', methods=['POST'])
+@login_required
+def rhstudio_check_recipients(bid):
+    """Interroge RH Studio pour chaque destinataire unique de la boîte et renvoie
+    les résultats (statut de présence). Utilisé en AJAX depuis view_boite.html."""
+    api_url = get_config('rh_studio_url', '')
+    api_key = get_config('rh_studio_api_key', '')
+    if not api_url or not api_key:
+        return jsonify({'success': False, 'message': 'RH Studio non configuré (URL ou clé API manquante)'})
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            'SELECT DISTINCT recipient_address FROM messages WHERE boite_id=?',
+            (bid,)
+        ).fetchall()
+    finally:
+        conn.close()
+    results = []
+    errors = 0
+    for row in rows:
+        email = row['recipient_address']
+        try:
+            resp = rh_studio_check_presence(email=email)
+            agent = resp.get('agent')
+            status = agent.get('status', 'unknown') if agent else 'not_found'
+            status_label = agent.get('statusLabel', 'Non trouvé') if agent else 'Non trouvé'
+            results.append({
+                'email': email,
+                'found': resp.get('found', False),
+                'status': status,
+                'statusLabel': status_label,
+                'agent': {
+                    'nom': agent.get('nom', ''),
+                    'prenom': agent.get('prenom', ''),
+                    'service': agent.get('service', ''),
+                    'direction': agent.get('direction', ''),
+                    'fonction': agent.get('fonction', ''),
+                } if agent else None
+            })
+        except Exception:
+            errors += 1
+            results.append({
+                'email': email,
+                'found': False,
+                'status': 'error',
+                'statusLabel': 'Erreur',
+                'agent': None
+            })
+    return jsonify({'success': True, 'results': results, 'errors': errors})
 
 @app.route('/boite/<int:bid>/send-emails', methods=['POST'])
 def send_emails_to_recipients(bid):
