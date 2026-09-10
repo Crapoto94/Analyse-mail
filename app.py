@@ -3496,7 +3496,48 @@ GROQ_AVAILABLE_MODELS = [
 # catalogue de modeles (100+, en evolution constante) — pas de liste figee ici, l'admin
 # saisit librement l'identifiant du modele de son choix (ex: meta/llama-3.1-70b-instruct).
 NVIDIA_API_URL = 'https://integrate.api.nvidia.com/v1/chat/completions'
-NVIDIA_DEFAULT_MODEL = 'meta/llama-3.1-70b-instruct'
+NVIDIA_DEFAULT_MODEL = 'mixtral-8x7b-instruct'
+
+# Léger parser pour les modèles multiples.
+# Accepte deux formats (l'un ou l'autre, pas besoin des deux mélangés) :
+#   Format A (pipe) : "nom1|model1|nom2|model2"   — peut être sur une ligne ou plusieurs
+#   Format B (ligne) : un modèle par ligne, soit "modèle_technique"
+#                    soit "nom_user|modèle_technique"
+# La fonction détecte automatiquement quel format est utilisé.
+def _parse_models(text, sep='|'):
+    """Retourne [{'name': ..., 'model': ...}, ...]"""
+    if not text or not text.strip():
+        return []
+
+    text = text.strip()
+
+    # Essai Format B d'abord : chaque ligne est un modèle
+    lines = text.splitlines()
+    # Si toutes les lignes non-vides contiennent un '|', on suppose le Format A (pipe)
+    # Sinon, on suppose le Format B (ligne par ligne)
+    has_pipe_on_any_line = any('|' in line.strip() for line in lines if line.strip())
+
+    if not has_pipe_on_any_line:
+        # Format B : ligne par ligne
+        result = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Si la ligne contient un '|', c'est "nom|modele", sinon c'est juste "modele"
+            if '|' in line:
+                name, model = line.split('|', 1)
+                result.append({'name': name.strip(), 'model': model.strip()})
+            else:
+                # Ligne sans '|' = juste le modèle, pas de nom friendly
+                result.append({'name': line, 'model': line})
+        return result
+
+    # Format A : séparation par '|' (peut être sur plusieurs lignes)
+    parts = text.split(sep)
+    # Filtrer les parties vides (au cas où il y ait des sauts de ligne ou espaces en trop)
+    parts = [p.strip() for p in parts if p.strip()]
+    return [{'name': parts[i], 'model': parts[i+1]} for i in range(0, len(parts)-1, 2)]
 
 OLLAMA_DEFAULT_URL = 'http://10.103.130.166:11434'
 OLLAMA_DEFAULT_MODEL = 'gemma4:e4b'
@@ -3691,6 +3732,20 @@ def run_ai_analysis(bid, preferred_provider=None):
     ollama_enabled = get_config('ollama_enabled', '1') != '0'
     has_ollama = ollama_enabled and ollama_url
 
+    # --- Modèles multiples (nouvelle feature, optionnelle) ---
+    # Lecture depuis config : format "nom1|model1|nom2|model2"
+    groq_models_raw = get_config('groq_models', '')
+    groq_models = _parse_models(groq_models_raw)  # liste de {'name':..., 'model':...}
+    groq_default_model = groq_models[0]['model'] if groq_models else (get_config('groq_model', '') or GROQ_DEFAULT_MODEL)
+
+    nvidia_models_raw = get_config('nvidia_models', '')
+    nvidia_models = _parse_models(nvidia_models_raw)
+    nvidia_default_model = nvidia_models[0]['model'] if nvidia_models else (get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL)
+
+    ollama_models_raw = get_config('ollama_models', '')
+    ollama_models = _parse_models(ollama_models_raw)
+    ollama_default_model = ollama_models[0]['model'] if ollama_models else (get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL)
+
     if not groq_key and not nvidia_key and not has_ollama:
         raise RuntimeError('Aucun fournisseur IA configuré (Groq, NVIDIA ou Ollama)')
 
@@ -3704,19 +3759,20 @@ def run_ai_analysis(bid, preferred_provider=None):
     errors = []
     for provider in order:
         if provider == 'groq' and groq_key:
-            model = get_config('groq_model', '') or GROQ_DEFAULT_MODEL
+            # Utilise le modèle par défaut (premier de la liste multi, ou la constante classique)
+            model = groq_default_model
             try:
                 return call_groq_chat(prompt, api_key=groq_key, model=model), 'Groq', model
             except Exception as e:
                 errors.append(f'Groq : {e}')
         elif provider == 'nvidia' and nvidia_key:
-            model = get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL
+            model = nvidia_default_model
             try:
                 return call_nvidia_chat(prompt, api_key=nvidia_key, model=model), 'NVIDIA', model
             except Exception as e:
                 errors.append(f'NVIDIA : {e}')
         elif provider == 'ollama' and has_ollama:
-            model = get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL
+            model = ollama_default_model
             try:
                 return call_ollama_chat(prompt, url=ollama_url, model=model), 'Ollama', model
             except Exception as e:
@@ -6190,16 +6246,29 @@ def config():
         elif 'groq_api_key' in request.form or 'nvidia_api_key' in request.form:
             # Ne pas ecraser les cles existantes si les champs sont laisses vides (meme
             # logique que pour le secret Graph : evite d'effacer accidentellement une cle
-            # deja enregistree lors d'une simple mise a jour du modele/prompt).
+            # deja enregistre lors d'une simple mise a jour du modele/prompt).
+            # ON NE SAUVEGARDE LA CLE QUE SI ELLE A UNE VALEUR REELLE (non vide)
             new_groq_key = request.form.get('groq_api_key', '')
             if new_groq_key:
                 set_config('groq_api_key', new_groq_key.strip())
-            set_config('groq_model', request.form.get('groq_model', '').strip())
+            # NOW SAVE THE MODELS LIST (meme si la cle n'a pas ete modifiée)
+            new_groq_models = request.form.get('groq_models', '').strip()
+            if new_groq_models:
+                set_config('groq_models', new_groq_models)
             new_nvidia_key = request.form.get('nvidia_api_key', '')
             if new_nvidia_key:
                 set_config('nvidia_api_key', new_nvidia_key.strip())
-            set_config('nvidia_model', request.form.get('nvidia_model', '').strip())
-            set_config('groq_prompt_template', request.form.get('groq_prompt_template', '').strip())
+            new_nvidia_models = request.form.get('nvidia_models', '').strip()
+            if new_nvidia_models:
+                set_config('nvidia_models', new_nvidia_models)
+            # Ollama models aussi
+            new_ollama_models = request.form.get('ollama_models', '').strip()
+            if new_ollama_models:
+                set_config('ollama_models', new_ollama_models.strip())
+            # Ne pas ecraser le prompt si vide
+            new_prompt = request.form.get('groq_prompt_template', '').strip()
+            if new_prompt:
+                set_config('groq_prompt_template', new_prompt)
             flash('Configuration IA enregistrée avec succès')
         elif 'ollama_enabled' in request.form or 'ollama_url' in request.form or 'ollama_model' in request.form:
             new_ollama_enabled = request.form.get('ollama_enabled', '')
@@ -6213,6 +6282,9 @@ def config():
             if new_ollama_model:
                 set_config('ollama_model', new_ollama_model.strip())
             flash('Configuration Ollama enregistrée avec succès')
+        # L'ancienne condition elif 'groq_models'... est maintenant inutile car
+        # la section IA ci-dessus gère maintenant tout (cle + modèles).
+        # On saute directement à la section Teams.
         elif 'teams_webhook_url' in request.form:
             set_config('teams_webhook_url', request.form.get('teams_webhook_url', '').strip())
             threshold_raw = request.form.get('teams_alert_score_threshold', '').strip()
@@ -6267,9 +6339,12 @@ def config():
         abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')),
         rh_studio_url=get_config('rh_studio_url', ''),
         rh_studio_api_key_set=bool(get_config('rh_studio_api_key', '')),
-        ollama_enabled=get_config('ollama_enabled', '1'),
-        ollama_url=get_config('ollama_url', 'http://10.103.130.166:11434'),
-        ollama_model=get_config('ollama_model', 'gemma4:e4b'))
+ollama_enabled=get_config('ollama_enabled', '1'),
+         ollama_url=get_config('ollama_url', 'http://10.103.130.166:11434'),
+         ollama_model=get_config('ollama_model', 'gemma4:e4b'),
+         groq_models=get_config('groq_models', ''),
+         nvidia_models=get_config('nvidia_models', ''),
+         ollama_models=get_config('ollama_models', ''))
 
 @app.route('/api/diag/proxy-headers')
 @admin_required

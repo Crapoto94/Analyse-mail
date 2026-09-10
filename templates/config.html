@@ -211,11 +211,23 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                     </div>
                     <div class="mb-3">
                         <label for="groq_model" class="form-label">Modèle Groq</label>
-                        <select class="form-select" id="groq_model" name="groq_model">
-                            {% for m in groq_available_models %}
-                            <option value="{{ m }}" {% if m == groq_model %}selected{% endif %}>{{ m }}</option>
-                            {% endfor %}
-                        </select>
+                        <p class="text-muted small">
+                            Saisissez "nom|identifiant" par ligne (ex: <code>Rapide|llama-3.3-70b|Précis|openai/gpt-oss-20b</code>).
+                        </p>
+                        <textarea class="form-control" id="groq_models" name="groq_models" rows="3"
+                                  style="font-family: monospace; font-size: 0.85em;"
+                                  placeholder="{% if groq_models %}{{ groq_models }}{% else %}Laisser vide pour utiliser le modèle par défaut (gpt-oss-20b){% endif %}">{{ groq_models | default('') }}</textarea>
+                        <div class="form-text">
+                            Les 5 modèles Groq d'origine sont toujours disponibles via le système classique,
+                            mais vous pouvez ajouter les vôtres ci-dessus avec des noms personnalisés.
+                            <ul>
+                                <li><strong>Modèles d'origine (toujours disponibles) :</strong>
+                                    openai/gpt-oss-20b, llama-3.3-70b-versatile, llama-3.1-8b-instant,
+                                    meta-llama/llama-4-maverick-17b-16e-instruct, meta-llama/llama-4-scout-16e-instruct</li>
+                                <li>Format : <code>nom_user_friendly|identifiant_technique</code>, plusieurs lignes</li>
+                                <li>Le premier modèle de la liste devient le modèle par défaut</li>
+                            </ul>
+                        </div>
                     </div>
                     <button type="button" class="btn btn-sm btn-outline-success mb-3" onclick="testGroqApi()">
                         <i class="bi bi-plug"></i> Tester la connexion Groq
@@ -238,8 +250,14 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                     </div>
                     <div class="mb-3">
                         <label for="nvidia_model" class="form-label">Modèle NVIDIA</label>
-                        <input type="text" class="form-control" id="nvidia_model" name="nvidia_model" value="{{ nvidia_model }}" placeholder="{{ nvidia_default_model }}">
-                        <div class="form-text">Identifiant exact du modèle (ex: <code>{{ nvidia_default_model }}</code>). Laissé vide, ce modèle par défaut est utilisé.</div>
+                        <textarea class="form-control" id="nvidia_models" name="nvidia_models" rows="3"
+                                  style="font-family: monospace; font-size: 0.85em;"
+                                  placeholder="{% if nvidia_models %}{{ nvidia_models }}{% else %}Laisser vide pour utiliser le modèle par défaut (meta/llama-3.1-70b-instruct){% endif %}">{{ nvidia_models | default('') }}</textarea>
+                        <div class="form-text">
+                            Format : <code>nom_user_friendly|identifiant_technique</code>, plusieurs lignes<br>
+                            Exemple : <code>Modèle_A|meta/llama-3.1-70b-instruct|Modèle_B|mixtral-8x7b-instruct</code><br>
+                            Le premier modèle devient le modèle par défaut utilisé automatiquement.
+                        </div>
                     </div>
                     <button type="button" class="btn btn-sm btn-outline-success mb-3" onclick="testNvidiaApi()">
                         <i class="bi bi-plug"></i> Tester la connexion NVIDIA
@@ -267,9 +285,14 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                     </div>
                     <div class="mb-3">
                         <label for="ollama_model" class="form-label">Modèle</label>
-                        <input type="text" class="form-control" id="ollama_model" name="ollama_model"
-                               value="{{ ollama_model }}">
-                        <div class="form-text">Exemple : <code>gemma4:e4b</code> ou <code>llama3.1:8b</code></div>
+                        <textarea class="form-control" id="ollama_models" name="ollama_models" rows="3"
+                                  style="font-family: monospace; font-size: 0.85em;"
+                                  placeholder="{% if ollama_models %}{{ ollama_models }}{% else %}Laisser vide pour utiliser le modèle par défaut (gemma4:e4b){% endif %}">{{ ollama_models | default('') }}</textarea>
+                        <div class="form-text">
+                            Format : <code>nom_user_friendly|identifiant_technique</code>, plusieurs lignes<br>
+                            Exemple : <code>Gemma|gemma4:e4b|Llama|llama3.1:8b|Mistral|mistral:instruct</code><br>
+                            Le premier modèle devient le modèle par défaut.
+                        </div>
                     </div>
                     <button type="button" class="btn btn-sm btn-outline-success mb-3" onclick="testOllamaApi()">
                         <i class="bi bi-plug"></i> Tester la connexion Ollama
