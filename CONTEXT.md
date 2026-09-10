@@ -1,5 +1,40 @@
 # CONTEXT - Analyse de Compromission
 
+## État de la session - 2026-09-10 (suite : dashboard connexions + acquittement)
+
+### Ajout : filtres serveur + pagination + acquittement des lieux suspects (carte dashboard)
+- **Fix connexions perdues (délai d'ingestion Graph)** : `auditLogs/signIns` a jusqu'à ~2 h de
+  retard d'ingestion. `refresh_tenant_signins` repart désormais **3 h en arrière** à chaque
+  passage au lieu de 10 min (dédup par `request_id` UNIQUE). Backfill validé : +361 puis +44
+  connexions (~579 au total). Bandeau explicatif ajouté sur `/connexions`.
+- **Filtres 100 % SQL serveur sur `/connexions`** : `q` (LIKE sur user_display_name/user_upn/
+  ip_address/location/application/failure_reason), `status` (Success/Failure), `pays` (FR,
+  hors_france, inconnu, code ISO 2 lettres, ou pays du select dynamique avec comptes), `type`
+  (fixe/mobile/vpn/dc/trusted/autre via `LEFT JOIN ip_info` ; `dc` exclut `trusted_ips`),
+  `per_page` (10/25/50/100/200/500/1000/all). Lien de pagination clampé avant requête et
+  conservant tous les filtres.
+- **Acquittement des lieux suspects ("à examiner" rouge de la carte)** : bouton "**Acquitter**"
+  dans l'infobulle d'un point suspect non validé → POST `/api/signin-ack` enregistre qui a
+  acquitté (`username` de session) + horodatage dans la nouvelle table `signin_acks`
+  (clé unique `(city, country_code)`, idem bucketing de la carte). Ensuite le point passe en
+  **rouge fixe plus petit SANS animation** (classes `.pulse-marker.acked`, pas de halo ni de
+  clignotement), taille toujours liée au volume (`6+sqrt(count)*2.2`), et l'infobulle affiche
+  "**vérifié par X — date UTC**" au lieu de "à examiner". Mise à jour en direct via fetch sans
+  rechargement (`ackLocation` + registres `markerData`/`mapMarkers`, `esc`/`escJs` pour
+  l'échappement HTML/JS). `compute_dashboard_kpis` ajoute `is_acknowledged`,
+  `acknowledged_by`, `acknowledged_at` à chaque point.
+- **Header renommé "Mail Analyse"** : `.app-container` en `d-flex align-items-center flex-wrap`,
+  brand à gauche, recherche + menu à droite sur la même ligne.
+- RH Studio : le JS envoie par lots de 40 (`RH_BATCH_SIZE`) ; le serveur garde `[:50]` en
+  sécurité.
+- **Commits poussés sur `master`** (seule branche remote, pas de `main`) : `f058d68`
+  (fix ingestion + pagination + lots RH + navbar), `16c022e` (filtres pays/type), `ab99305`
+  (Mail Analyse + bandeau ingestion). Push : `git push origin master`.
+- Prod Docker : `docker-compose up -d --build` pour déployer (DB persistée via
+  `./compromis.db:/app/compromis.db`).
+- Tests : `python -m pytest -q` → **41 passed** (+1 test acquittement dans
+  `tests/test_kpis.py`).
+
 ## État de la session - 2026-09-10
 
 ### Ajout : scan des règles de messagerie de tout le tenant + menu "Premiers secours"

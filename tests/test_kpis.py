@@ -88,6 +88,51 @@ def test_connections_geo_groups_by_city_and_flags_suspicious(app_module, monkeyp
     assert 'Nowhere City' not in home_cities
 
 
+def test_signin_ack_records_who_acknowledged(app_module, client):
+    """Acquittement : un lieu suspect "à examiner" peut etre acquitte par un admin ; la
+    route enregistre qui a valide, le point passe a is_acknowledged (rouge fixe reduit,
+    plus de clignotement) et le popup affiche "vérifié par X"."""
+    from datetime import datetime, timezone
+    conn = app_module.get_db()
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute("INSERT OR REPLACE INTO ip_info (ip, country, country_code, city, lat, lon) VALUES "
+                 "('2.2.2.2', 'Nowhereland', 'XX', 'Nowhere City', 10.0, 10.0)")
+    for i in range(3):
+        conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, country, status, fetched_at) "
+                     "VALUES (?, ?, '2.2.2.2', 'XX', 'Failure', ?)", (f'ack-bad-{i}', now, now))
+    conn.commit()
+    conn.close()
+
+    reader = app_module.compute_dashboard_kpis
+    by_city = {p['city']: p for p in reader()['connections_geo_world']}
+    assert by_city['Nowhere City']['is_suspicious'] is True
+    assert by_city['Nowhere City']['is_acknowledged'] is False
+
+    # Sans authentification : refus (redirect login / 403).
+    anon = app_module.app.test_client()
+    anon_resp = anon.post('/api/signin-ack', json={'city': 'Nowhere City', 'country_code': 'XX'})
+    assert anon_resp.status_code in (302, 403)
+
+    login_as_default_admin(client)
+    r = client.post('/api/signin-ack', json={'city': 'Nowhere City', 'country_code': 'XX'})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data['success'] is True
+    assert data['acked']['acknowledged_by'] == 'admin'
+
+    # Le point reparait acquitte (et "vérifié par admin"), l'autre carte aussi.
+    by_city2 = {p['city']: p for p in reader()['connections_geo_world']}
+    assert by_city2['Nowhere City']['is_acknowledged'] is True
+    assert by_city2['Nowhere City']['acknowledged_by'] == 'admin'
+    assert by_city2['Nowhere City']['acknowledged_at']
+
+    # La page (map + JS) embarque le bouton "Acquitter" et le rendu "vérifié par".
+    page = client.get('/').get_data(as_text=True)
+    assert 'Acquitter' in page
+    assert 'vérifié par' in page
+    assert 'pulse-marker.acked' in page
+
+
 def test_graph_provided_coordinates_prevent_two_distinct_cities_from_merging(app_module, monkeypatch):
     """Regression : deux connexions dont la geolocalisation par bloc IP (ipwho.is)
     retomberait sur la meme grande ville (ex: Paris) doivent quand meme apparaitre comme

@@ -483,6 +483,20 @@ def init_db():
     )''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_tenant_signins_date ON tenant_signins(date_utc)')
 
+    # Acquittement des lieux suspects de la carte des connexions (voir /#cartes et la
+    # fonction compute_dashboard_kpis) : un administrateur peut "acquitter" un lieu
+    # sensible deja examine (ex: connexion VPN de l'equipe en deplacement) ; le point
+    # passe alors en rouge fixe reduit (plus d'animation) et le popup affiche "vérifié
+    # par X". La cle est (ville, code pays), identique au bucketing de la carte.
+    c.execute('''CREATE TABLE IF NOT EXISTS signin_acks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        city TEXT DEFAULT '',
+        country_code TEXT DEFAULT '',
+        acknowledged_by TEXT NOT NULL,
+        acknowledged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(city, country_code)
+    )''')
+
     # Migration : ville + coordonnees fournies directement par Microsoft Graph pour chaque
     # connexion (bases existantes) — voir _map_graph_signin, nettement plus precises qu'une
     # geolocalisation par bloc IP pour le placement sur les cartes du tableau de bord.
@@ -2707,6 +2721,8 @@ def compute_dashboard_kpis():
     home_country = get_home_country_code()
     signin_window_rows = conn.execute(
         f"SELECT ip_address, country, city, lat, lon, status FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
+    acks = {((r['city'] or '').lower(), (r['country_code'] or '').upper()): dict(r) for r in
+            conn.execute('SELECT city, country_code, acknowledged_by, acknowledged_at FROM signin_acks').fetchall()}
     conn.close()
 
     nb_signins_foreign = 0
@@ -2775,12 +2791,19 @@ def compute_dashboard_kpis():
         # du pays de reference et/ou IP a mauvaise reputation) — cligote sur la carte pour
         # attirer l'oeil, plutot qu'un simple point statique parmi d'autres.
         is_suspicious = fail_ratio >= 0.5 or bucket_trust < 40
+        ack = acks.get(((bucket['city'] or '').lower(), (bucket['country_code'] or '').upper()))
         point = {
             'city': bucket['city'], 'country': bucket['country'], 'country_code': bucket['country_code'],
             'count': bucket['count'], 'fail_count': bucket['fail_count'],
             'trust_score': bucket_trust, 'is_suspicious': is_suspicious,
             'lat': sum(bucket['lats']) / len(bucket['lats']),
             'lon': sum(bucket['lons']) / len(bucket['lons']),
+            # Acquittement : lieu suspect deja examine/valide par un administrateur — la
+            # carte le montre en rouge fixe reduit (plus de clignotement), le popup affiche
+            # "vérifié par <user>". Demande non acquittee -> proposition d'acquittement.
+            'is_acknowledged': bool(ack),
+            'acknowledged_by': (ack or {}).get('acknowledged_by', ''),
+            'acknowledged_at': (ack or {}).get('acknowledged_at', ''),
         }
         connections_geo_world.append(point)
         if bucket['country_code'].upper() == home_country:
@@ -4986,6 +5009,31 @@ def update_tenant_signins_settings():
 
     flash('Paramètres enregistrés' if ok else 'Paramètres enregistrés (certaines valeurs invalides ont été ignorées)')
     return redirect(url_for('view_tenant_signins'))
+
+
+@app.route('/api/signin-ack', methods=['POST'])
+@login_required
+def signin_ack():
+    """Acquitte un lieu suspect de la carte des connexions (voir compute_dashboard_kpis) :
+    enregistre que <utilisateur connecte> a examine/valide les connexions de ce lieu. Le
+    point passe alors en rouge fixe reduit (plus d'animation de clignotement) et le popup
+    affiche "vérifié par X". La cle est identique au bucketing de la carte : (ville, code
+    pays). Renvoie un JSON decrivant l'acquittement cree, pour la mise a jour de la carte
+    sans rechargement."""
+    data = request.get_json(silent=True) or {}
+    city = (data.get('city') or '').strip()[:200]
+    country_code = (data.get('country_code') or '').strip().upper()[:10]
+    by = session.get('username') or 'utilisateur inconnu'
+    conn = get_db()
+    conn.execute('''INSERT INTO signin_acks (city, country_code, acknowledged_by)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(city, country_code) DO UPDATE SET acknowledged_by=excluded.acknowledged_by,
+                        acknowledged_at=CURRENT_TIMESTAMP''', (city, country_code, by))
+    conn.commit()
+    ack = conn.execute('SELECT * FROM signin_acks WHERE city=? AND country_code=?',
+                       (city, country_code)).fetchone()
+    conn.close()
+    return jsonify({'success': True, 'acked': dict(ack) if ack else None})
 
 
 @app.route('/connexions/refresh', methods=['POST'])
