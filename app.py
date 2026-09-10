@@ -620,6 +620,15 @@ def init_db():
     except Exception:
         pass
 
+    # Migration : qualification manuelle "super-administrateur" (voir user_is_superadmin) —
+    # en plus des comptes reconnus automatiquement par leur identifiant (motif
+    # adm*@ivry94fr.onmicrosoft.com), un super-administrateur existant peut qualifier
+    # explicitement un autre compte admin comme tel depuis /users.
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN is_superadmin INTEGER NOT NULL DEFAULT 0')
+    except Exception:
+        pass
+
     c.execute('''CREATE TABLE IF NOT EXISTS monitored_mailboxes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_email TEXT UNIQUE NOT NULL,
@@ -1762,6 +1771,17 @@ _AUTH_METHOD_LABELS = {
 }
 
 
+# Methodes qui NE constituent PAS un veritable second facteur : le mot de passe (toujours
+# present, c'est l'identifiant primaire) et l'e-mail de recuperation (secours pour la
+# reinitialisation en libre-service, pas un facteur de connexion). Toute autre methode
+# retournee par Graph (Authenticator, telephone, FIDO2, Windows Hello, OTP logiciel...)
+# compte comme un vrai MFA — voir _has_real_mfa.
+_NON_MFA_METHOD_TYPES = {
+    '#microsoft.graph.passwordAuthenticationMethod',
+    '#microsoft.graph.emailAuthenticationMethod',
+}
+
+
 def graph_get_auth_methods(upn):
     """Liste les methodes d'authentification (MFA) enregistrees pour un compte —
     permet de reperer une methode ajoutee par un attaquant apres compromission (nouveau
@@ -1773,10 +1793,18 @@ def graph_get_auth_methods(upn):
         t = it.get('@odata.type', '')
         out.append({
             'type': _AUTH_METHOD_LABELS.get(t, t.replace('#microsoft.graph.', '').replace('AuthenticationMethod', '')),
+            'raw_type': t,
             'detail': it.get('displayName') or it.get('phoneNumber') or '',
             'created': it.get('createdDateTime'),
         })
     return out
+
+
+def _has_real_mfa(auth_methods):
+    """Vrai si au moins une methode d'authentification enregistree constitue un vrai
+    second facteur (voir _NON_MFA_METHOD_TYPES) — mot de passe et e-mail de recuperation
+    seuls ne comptent pas comme du MFA."""
+    return any(m.get('raw_type') not in _NON_MFA_METHOD_TYPES for m in auth_methods)
 
 
 def graph_set_account_enabled(upn, enabled):
@@ -2016,6 +2044,49 @@ def admin_required(f):
     return decorated_function
 
 
+# Motif reconnaissant automatiquement les comptes "super-administrateur" par leur
+# identifiant : les boites d'administration Microsoft dediees du tenant (ex:
+# adm-marc@ivry94fr.onmicrosoft.com). Ne depend d'aucune configuration — a adapter ici si
+# le domaine du tenant change.
+SUPERADMIN_USERNAME_RE = re.compile(r'^adm[^@]*@ivry94fr\.onmicrosoft\.com$', re.IGNORECASE)
+
+
+def is_superadmin_username(username):
+    return bool(username) and bool(SUPERADMIN_USERNAME_RE.match(username.strip()))
+
+
+def user_is_superadmin(user_row):
+    """Vrai si le compte est reconnu super-administrateur : soit par son identifiant
+    (voir SUPERADMIN_USERNAME_RE), soit parce qu'il a ete explicitement qualifie comme tel
+    par un super-administrateur existant (colonne is_superadmin, voir /users). Les
+    super-administrateurs sont seuls a pouvoir consulter /logs (donnees potentiellement
+    sensibles : qui a consulte/agi sur quel compte, y compris via "Premiers secours")."""
+    if not user_row:
+        return False
+    if is_superadmin_username(user_row['username']):
+        return True
+    try:
+        return bool(user_row['is_superadmin'])
+    except (KeyError, IndexError):
+        return False
+
+
+app.jinja_env.globals['user_is_superadmin'] = user_is_superadmin
+app.jinja_env.globals['is_superadmin_username'] = is_superadmin_username
+
+
+def superadmin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('user_id'):
+            return redirect(url_for('login', next=request.path))
+        if not session.get('is_superadmin'):
+            flash("Accès réservé aux super-administrateurs")
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if session.get('user_id'):
@@ -2031,6 +2102,7 @@ def login():
             session['user_id'] = user['id']
             session['username'] = user['username']
             session['role'] = user['role']
+            session['is_superadmin'] = user_is_superadmin(user)
             session['must_change_password'] = bool(user['must_change_password'])
             next_url = request.form.get('next') or url_for('index')
             return redirect(next_url)
@@ -2240,6 +2312,7 @@ def microsoft_callback():
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
+    session['is_superadmin'] = user_is_superadmin(user)
     add_log('INFO', 'AUTH', f'Connexion Microsoft réussie pour {upn}')
     return redirect(next_url)
 
@@ -2333,6 +2406,34 @@ def toggle_user(user_id):
     conn.execute('UPDATE users SET is_active=? WHERE id=?', (new_active, user_id))
     conn.commit()
     conn.close()
+    return redirect(url_for('list_users'))
+
+
+@app.route('/users/<int:user_id>/toggle-superadmin', methods=['POST'])
+@superadmin_required
+def toggle_superadmin(user_id):
+    """Qualifie/retire manuellement un compte admin comme super-administrateur (seul
+    acces autorise a /logs) — reserve aux super-administrateurs existants. Sans effet sur
+    un compte deja reconnu automatiquement par son identifiant (voir SUPERADMIN_USERNAME_RE) :
+    il reste super-administrateur quel que soit cet indicateur."""
+    conn = get_db()
+    target = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        flash('Utilisateur non trouvé')
+        return redirect(url_for('list_users'))
+    if target['role'] != 'admin':
+        conn.close()
+        flash('Seul un compte administrateur peut être qualifié super-administrateur')
+        return redirect(url_for('list_users'))
+    new_value = 0 if target['is_superadmin'] else 1
+    conn.execute('UPDATE users SET is_superadmin=? WHERE id=?', (new_value, user_id))
+    conn.commit()
+    conn.close()
+    add_log('WARNING', 'AUTH',
+            f"{target['username']} {'qualifié' if new_value else 'retiré'} super-administrateur",
+            username=session.get('username'))
+    flash(f"{target['username']} {'qualifié' if new_value else 'retiré'} super-administrateur")
     return redirect(url_for('list_users'))
 
 
@@ -4809,7 +4910,13 @@ def account_firstaid(upn):
     """Fiche "premiers secours" d'un compte : infos cles issues de Microsoft Graph
     (statut, derniere connexion, licences, methodes MFA enregistrees) et actions
     d'urgence (desactivation, revocation des sessions, reinitialisation du mot de passe,
-    MFA). Fonctionne pour n'importe quel UPN du tenant, meme sans fiche d'incident."""
+    MFA). Fonctionne pour n'importe quel UPN du tenant, meme sans fiche d'incident.
+
+    Toute consultation est journalisee (qui a recherche/consulte quel compte, et quand) —
+    la fiche donne acces a des informations sensibles (derniere connexion, methodes MFA
+    enregistrees...) qui pourraient sinon etre consultees sans tracabilite."""
+    add_log('INFO', 'PREMIERS_SECOURS', f'Consultation du compte : {upn}', recipient=upn, username=session.get('username'))
+
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     account, auth_methods, error, auth_methods_error = None, [], None, None
     if graph_configured:
@@ -4822,6 +4929,10 @@ def account_firstaid(upn):
         if account and account.get('id'):
             try:
                 auth_methods = graph_get_auth_methods(upn)
+                if not _has_real_mfa(auth_methods):
+                    registered = ', '.join(m['type'] for m in auth_methods) or 'aucune'
+                    add_log('WARNING', 'PREMIERS_SECOURS', f'Aucun MFA réel enregistré : {upn}',
+                            f'Méthodes enregistrées : {registered}', recipient=upn, username=session.get('username'))
             except Exception as e:
                 auth_methods_error = str(e)
     else:
@@ -5666,7 +5777,7 @@ def clear_audit(bid):
     return redirect(url_for('view_boite', bid=bid))
 
 @app.route('/logs')
-@admin_required
+@superadmin_required
 def view_logs():
     conn = get_db()
     page = request.args.get('page', 1, type=int)
@@ -5719,7 +5830,7 @@ def view_logs():
                            level_filter=level_filter, category_filter=category_filter, search=search)
 
 @app.route('/logs/clear', methods=['POST'])
-@admin_required
+@superadmin_required
 def clear_logs():
     conn = get_db()
     conn.execute('DELETE FROM logs')
@@ -5729,7 +5840,7 @@ def clear_logs():
     return redirect(url_for('view_logs'))
 
 @app.route('/log/<int:log_id>')
-@admin_required
+@superadmin_required
 def view_log_detail(log_id):
     conn = get_db()
     log = conn.execute('SELECT * FROM logs WHERE id=?', (log_id,)).fetchone()

@@ -8,6 +8,12 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; }
+        /* Zone utile elargie (marges laterales reduites) : le .container Bootstrap par
+           defaut plafonne a 1140px, trop etroit pour les tableaux denses de l'appli
+           (regles tenant, connexions, logs...). .app-container remplace .container
+           partout (nav + contenu) pour rester aligne, avec une largeur max plus genereuse
+           mais toujours centree (pas de bord-a-bord sur tres grands ecrans). */
+        .app-container { max-width: 1700px; margin-left: auto; margin-right: auto; padding-left: 1.5rem; padding-right: 1.5rem; }
         .stat-card { border-left: 4px solid #0d6efd; }
         .status-delivered { color: #198754; }
         status-resolved { color: #6c757d; }
@@ -144,7 +150,7 @@ function showGlobalLoadingFatalError(err) {
 }
 </script>
 <nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">
-    <div class="container">
+    <div class="app-container">
         <a class="navbar-brand" href="{{ url_for('index') }}">
             <i class="bi bi-shield-exclamation"></i> Analyse Compromission
         </a>
@@ -168,7 +174,9 @@ function showGlobalLoadingFatalError(err) {
                     <li><a class="dropdown-item" href="{{ url_for('view_tenant_rules') }}"><i class="bi bi-envelope-arrow-up"></i> Règles de messagerie (tenant)</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('account_firstaid_search') }}"><i class="bi bi-life-preserver"></i> Premiers secours</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('list_users') }}"><i class="bi bi-people"></i> Utilisateurs</a></li>
+                    {% if session.get('is_superadmin') %}
                     <li><a class="dropdown-item" href="{{ url_for('view_logs') }}"><i class="bi bi-journal-text"></i> Logs</a></li>
+                    {% endif %}
                     <li><a class="dropdown-item" href="{{ url_for('config') }}"><i class="bi bi-gear"></i> Configuration</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('list_api_keys') }}"><i class="bi bi-key"></i> Clés d'API</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('list_trusted_ips') }}"><i class="bi bi-patch-check"></i> IPs de confiance</a></li>
@@ -189,7 +197,7 @@ function showGlobalLoadingFatalError(err) {
         </div>
     </div>
 </nav>
-    <div class="container">
+    <div class="app-container">
         {% with messages = get_flashed_messages() %}
             {% if messages %}
                 {% for message in messages %}

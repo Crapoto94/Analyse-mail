@@ -52,13 +52,23 @@
                             {% if u.id == session.get('user_id') %}<span class="badge bg-info">Vous</span>{% endif %}
                             {% if u.auth_source == 'microsoft' %}<span class="badge bg-dark"><i class="bi bi-microsoft"></i> Microsoft</span>{% endif %}
                         </td>
-                        <td><span class="badge bg-{% if u.role == 'admin' %}dark{% else %}secondary{% endif %}">{{ 'Administrateur' if u.role == 'admin' else 'Utilisateur' }}</span></td>
+                        <td>
+                            <span class="badge bg-{% if u.role == 'admin' %}dark{% else %}secondary{% endif %}">{{ 'Administrateur' if u.role == 'admin' else 'Utilisateur' }}</span>
+                            {% if user_is_superadmin(u) %}<span class="badge bg-danger" title="Accès à /logs"><i class="bi bi-shield-lock-fill"></i> Super-admin</span>{% endif %}
+                        </td>
                         <td>{% if u.is_active %}<span class="badge bg-success">Actif</span>{% else %}<span class="badge bg-secondary">Désactivé</span>{% endif %}</td>
                         <td><small class="text-muted">{{ u.created_at|paris }}</small></td>
                         <td class="text-end">
                             <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#pwd-{{ u.id }}">
                                 <i class="bi bi-key"></i> Mot de passe
                             </button>
+                            {% if session.get('is_superadmin') and u.role == 'admin' and not is_superadmin_username(u.username) %}
+                            <form method="POST" action="{{ url_for('toggle_superadmin', user_id=u.id) }}" class="d-inline">
+                                <button class="btn btn-sm btn-outline-danger" type="submit" title="{% if user_is_superadmin(u) %}Retirer{% else %}Qualifier{% endif %} super-administrateur (accès à /logs)">
+                                    <i class="bi bi-shield-lock{% if user_is_superadmin(u) %}-fill{% endif %}"></i>
+                                </button>
+                            </form>
+                            {% endif %}
                             {% if u.id != session.get('user_id') %}
                             <form method="POST" action="{{ url_for('toggle_user', user_id=u.id) }}" class="d-inline">
                                 <button class="btn btn-sm btn-outline-secondary" type="submit">

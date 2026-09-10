@@ -122,7 +122,11 @@
     <div class="card mb-4 border-danger">
         <div class="card-header bg-danger text-white"><i class="bi bi-exclamation-triangle-fill"></i> Actions d'urgence</div>
         <div class="card-body">
-            <p class="text-muted small">Chaque action est journalisée (voir <a href="{{ url_for('view_logs') }}?category=PREMIERS_SECOURS">Logs</a>) et effective immédiatement sur le compte réel — vérifiez l'adresse ci-dessus avant de cliquer.</p>
+            <p class="text-muted small">
+                Chaque action est journalisée
+                {% if session.get('is_superadmin') %}(voir <a href="{{ url_for('view_logs') }}?category=PREMIERS_SECOURS">Logs</a>){% else %}(consultable par un super-administrateur){% endif %}
+                et effective immédiatement sur le compte réel — vérifiez l'adresse ci-dessus avant de cliquer.
+            </p>
             <div class="d-flex flex-wrap gap-2">
                 {% if account.accountEnabled %}
                 <form method="POST" action="{{ url_for('account_firstaid_disable', upn=upn) }}"
@@ -216,7 +220,7 @@
     </div>
     {% endif %}
 
-    {% if recent_actions %}
+    {% if session.get('is_superadmin') and recent_actions %}
     <div class="card">
         <div class="card-header"><i class="bi bi-clock-history"></i> Dernières actions "premiers secours" sur ce compte</div>
         <div class="card-body p-0">
