@@ -324,7 +324,7 @@ function buildPopupHtml(p) {
         html += '<br>— <a href="' + connexionsBase + '?pays=' + encodeURIComponent(p.country_code || '') +
                 '&q=' + encodeURIComponent(p.city || '') + '" class="text-danger fw-semibold">à examiner</a> ' +
                 '<button type="button" class="btn btn-sm btn-outline-success ms-1 py-0" ' +
-                'onclick="ackLocation(\\'' + escJs(key) + '\\')"><i class="bi bi-check2-circle"></i> Acquitter</button>';
+                'onclick="ackLocation(\'' + escJs(key) + '\')"><i class="bi bi-check2-circle"></i> Acquitter</button>';
     }
     return html;
 }
