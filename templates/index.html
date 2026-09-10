@@ -59,12 +59,14 @@
             <div class="card h-100">
                 <div class="card-header d-flex justify-content-between align-items-center">
                     <strong>{{ boite.user_email }}</strong>
+                    {% if session.get('role') == 'admin' %}
                     <form method="POST" action="{{ url_for('delete_boite', bid=boite.id) }}" 
                           onsubmit="return confirm('Confirmer la suppression ?')" class="d-inline">
                         <button class="btn btn-sm btn-outline-danger" type="submit">
                             <i class="bi bi-trash"></i>
                         </button>
                     </form>
+                    {% endif %}
                 </div>
                 <div class="card-body">
                     <p class="card-text">

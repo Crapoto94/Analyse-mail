@@ -1422,7 +1422,7 @@ def rh_studio_check_presence(email=None, q=None, nom=None, prenom=None):
     """Interroge l'API RH Studio (GET /api/agents/presence) pour verifier si un agent
     est present, parti, ou pas encore arrive. Renvoie un dict avec les cles found,
     matchType, score, agent (dict ou None). En cas d'erreur lève une exception."""
-    import urllib.request, urllib.parse
+    import urllib.request, urllib.parse, ssl
     api_url = get_config('rh_studio_url', '').rstrip('/')
     api_key = get_config('rh_studio_api_key', '')
     if not api_url:
@@ -1443,12 +1443,18 @@ def rh_studio_check_presence(email=None, q=None, nom=None, prenom=None):
     else:
         raise ValueError("Aucun paramètre de recherche fourni")
     qs = urllib.parse.urlencode(params)
-    url = f"{api_url}/api/agents/presence?{qs}"
+    base = api_url
+    if base.endswith('/api'):
+        base = base[:-4]
+    url = f"{base}/api/agents/presence?{qs}"
     req = urllib.request.Request(url, headers={
-        'Authorization': f'Bearer {api_key}',
+        'X-Api-Key': api_key,
         'Accept': 'application/json',
     })
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
@@ -5748,6 +5754,7 @@ def import_audit_logs(boite_id, filepath, source):
 
 
 @app.route('/boite/<int:bid>/delete', methods=['POST'])
+@admin_required
 def delete_boite(bid):
     conn = get_db()
     conn.execute('DELETE FROM messages WHERE boite_id=?', (bid,))
@@ -6191,29 +6198,80 @@ def test_api_ville():
 @app.route('/api/test-rhstudio')
 @admin_required
 def test_api_rhstudio():
-    import urllib.error
-    api_url = get_config('rh_studio_url', '')
+    import urllib.error, urllib.parse, ssl
+    api_url = get_config('rh_studio_url', '').rstrip('/')
     api_key = get_config('rh_studio_api_key', '')
     if not api_url:
         return jsonify({'success': False, 'message': 'URL de l\'API RH Studio non configurée'})
     if not api_key:
         return jsonify({'success': False, 'message': 'Clé API RH Studio non configurée'})
+    email = request.args.get('email', '').strip()
+    if not email:
+        return jsonify({'success': False, 'message': 'Adresse email requise pour tester un utilisateur'})
+    base = api_url
+    if base.endswith('/api'):
+        base = base[:-4]
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    def _rh_studio_request(params):
+        qs = urllib.parse.urlencode(params)
+        url = f"{base}/api/agents/presence?{qs}"
+        req = urllib.request.Request(url, headers={
+            'X-Api-Key': api_key,
+            'Accept': 'application/json',
+        })
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            raw = resp.read().decode('utf-8')
+            return json.loads(raw) if raw.strip() else {}
+
+    result_data = {'graph': None, 'rh_studio_email': None, 'rh_studio_name': None}
+    nom, prenom = None, None
     try:
-        result = rh_studio_check_presence(email='test@test.fr')
-        return jsonify({
-            'success': True,
-            'message': 'Connexion à l\'API RH Studio réussie',
-            'response': json.dumps(result, ensure_ascii=False, indent=2)
-        })
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode('utf-8')
-        return jsonify({
-            'success': False,
-            'message': f'Erreur HTTP {e.code}',
-            'response': error_body
-        })
+        graph_user = graph_get_account_overview(email)
+        if graph_user and graph_user.get('displayName'):
+            result_data['graph'] = {
+                'displayName': graph_user.get('displayName', ''),
+                'mail': graph_user.get('mail', ''),
+                'jobTitle': graph_user.get('jobTitle', ''),
+                'department': graph_user.get('department', ''),
+                'accountEnabled': graph_user.get('accountEnabled'),
+            }
+            parts = graph_user['displayName'].strip().split()
+            if len(parts) >= 2:
+                prenom = parts[0]
+                nom = ' '.join(parts[1:])
+            elif len(parts) == 1:
+                nom = parts[0]
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Erreur: {str(e)}'})
+        result_data['graph'] = {'error': str(e)}
+
+    try:
+        result_data['rh_studio_email'] = _rh_studio_request({'email': email})
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else ''
+        result_data['rh_studio_email'] = {'_http_error': e.code, '_body': error_body[:1000]}
+    except Exception as e:
+        result_data['rh_studio_email'] = {'_error': str(e)}
+
+    if nom:
+        try:
+            params = {'nom': nom}
+            if prenom:
+                params['prenom'] = prenom
+            result_data['rh_studio_name'] = _rh_studio_request(params)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            result_data['rh_studio_name'] = {'_http_error': e.code, '_body': error_body[:1000]}
+        except Exception as e:
+            result_data['rh_studio_name'] = {'_error': str(e)}
+
+    return jsonify({
+        'success': True,
+        'message': f'Résultats pour {email}',
+        'response': json.dumps(result_data, ensure_ascii=False, indent=2)
+    })
 
 @app.route('/api/test-send')
 @admin_required
@@ -6386,6 +6444,54 @@ def rhstudio_check_recipients(bid):
                 'agent': None
             })
     return jsonify({'success': True, 'results': results, 'errors': errors})
+
+@app.route('/api/rh-batch-status', methods=['POST'])
+@login_required
+def rh_batch_status():
+    """Recoit une liste d'emails ET de noms (nom/prenom) en POST JSON et renvoie le
+    statut RH Studio de chacun. Utilise en AJAX par le script automatique de pastilles."""
+    api_url = get_config('rh_studio_url', '').rstrip('/')
+    api_key = get_config('rh_studio_api_key', '')
+    if not api_url or not api_key:
+        return jsonify({})
+    data = request.get_json(silent=True) or {}
+    results = {}
+
+    def _extract_agent(email_key, resp):
+        agent = resp.get('agent')
+        if not agent:
+            return {'found': False, 'status': 'not_found', 'statusLabel': 'Non trouvé'}
+        info = {
+            'found': True,
+            'status': agent.get('status', 'unknown'),
+            'statusLabel': agent.get('statusLabel', ''),
+        }
+        for f in ('dateArrivee', 'dateDepart', 'date_arrivee', 'date_depart',
+                   'arrivalDate', 'departureDate', 'startDate', 'endDate',
+                   'datePriseDePoste', 'dateSortie'):
+            val = agent.get(f)
+            if val:
+                info[f] = val
+        return info
+
+    for email in (data.get('emails') or [])[:50]:
+        if email in results:
+            continue
+        try:
+            results[email] = _extract_agent(email, rh_studio_check_presence(email=email))
+        except Exception:
+            results[email] = {'found': False, 'status': 'error', 'statusLabel': 'Erreur'}
+    for item in (data.get('names') or [])[:50]:
+        nom = item.get('nom', '').strip()
+        prenom = item.get('prenom', '').strip()
+        key = f"{nom} {prenom}".strip()
+        if not nom or key in results:
+            continue
+        try:
+            results[key] = _extract_agent(key, rh_studio_check_presence(nom=nom, prenom=prenom or None))
+        except Exception:
+            results[key] = {'found': False, 'status': 'error', 'statusLabel': 'Erreur'}
+    return jsonify(results)
 
 @app.route('/boite/<int:bid>/send-emails', methods=['POST'])
 def send_emails_to_recipients(bid):

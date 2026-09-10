@@ -364,8 +364,8 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                 <form method="POST">
                     <div class="mb-3">
                         <label for="rh_studio_url" class="form-label">URL de l'API RH Studio</label>
-                        <input type="url" class="form-control" id="rh_studio_url" name="rh_studio_url" value="{{ rh_studio_url }}" placeholder="https://rhstudio.ivry94.fr">
-                        <div class="form-text">URL de base de l'API RH Studio (sans le slash final)</div>
+                        <input type="url" class="form-control" id="rh_studio_url" name="rh_studio_url" value="{{ rh_studio_url }}" placeholder="https://studiorh.ivry.local">
+                        <div class="form-text">URL de base de l'API RH Studio (le chemin /api/agents/presence est ajouté automatiquement)</div>
                     </div>
                     <div class="mb-3">
                         <label for="rh_studio_api_key" class="form-label">Clé API</label>
@@ -377,10 +377,18 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                     <button type="submit" class="btn" style="background-color: #6f42c1; color: white;">
                         <i class="bi bi-check-lg"></i> Enregistrer
                     </button>
-                    <button type="button" class="btn btn-outline-secondary" onclick="testRhStudio()">
-                        <i class="bi bi-plug"></i> Tester la connexion
-                    </button>
                 </form>
+                <hr>
+                <p class="text-muted small mb-2">
+                    <strong>Tester un utilisateur :</strong> saisissez une adresse email pour rechercher
+                    l'utilisateur dans Microsoft Graph (nom, prénom, service) puis dans l'annuaire RH.
+                </p>
+                <div class="input-group mb-2">
+                    <input type="email" class="form-control" id="rh_studio_test_email" placeholder="utilisateur@ivry94.fr">
+                    <button type="button" class="btn" style="background-color: #6f42c1; color: white;" onclick="testRhStudio()">
+                        <i class="bi bi-search"></i> Tester
+                    </button>
+                </div>
                 <div id="test-result-rhstudio" class="mt-3" style="display:none;"></div>
             </div>
         </div>
@@ -531,22 +539,28 @@ function testTeamsWebhook() {
 
 function testRhStudio() {
     const resultDiv = document.getElementById('test-result-rhstudio');
+    const email = document.getElementById('rh_studio_test_email').value.trim();
+    if (!email) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '<div class="alert alert-warning"><i class="bi bi-exclamation-triangle"></i> Veuillez saisir une adresse email.</div>';
+        return;
+    }
     resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
+    resultDiv.innerHTML = '<div class="alert alert-info">Recherche en cours (Graph + RH Studio)...</div>';
 
-    fetch('{{ url_for("test_api_rhstudio") }}')
+    fetch('{{ url_for("test_api_rhstudio") }}?email=' + encodeURIComponent(email))
         .then(response => response.json())
         .then(data => {
             if (data.success) {
                 let html = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
                 if (data.response) {
-                    html += '<div class="mt-2"><small><strong>Réponse:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+                    html += '<div class="mt-2"><small><strong>Réponse complète :</strong></small><pre class="bg-light p-2 mt-1" style="max-height:400px;overflow:auto;"><code>' + data.response + '</code></pre></div>';
                 }
                 resultDiv.innerHTML = html;
             } else {
                 let html = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
                 if (data.response) {
-                    html += '<div class="mt-2"><small><strong>Erreur:</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
+                    html += '<div class="mt-2"><small><strong>Erreur :</strong></small><pre class="bg-light p-2 mt-1"><code>' + data.response + '</code></pre></div>';
                 }
                 resultDiv.innerHTML = html;
             }

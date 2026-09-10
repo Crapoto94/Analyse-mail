@@ -32,6 +32,8 @@
         .ip-rep-badge { text-decoration: none; cursor: pointer; display: inline-block; vertical-align: middle; }
         .ip-rep-badge:hover { opacity: 0.7; }
         .ip-rep-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
+        .rh-badge { display: inline-block; vertical-align: middle; margin-left: 4px; font-size: 0.7em; }
+        .rh-badge-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 2px; }
     </style>
 </head>
 <body>
@@ -431,6 +433,170 @@ function showGlobalLoadingFatalError(err) {
         // Ce script est charge en fin de body : le DOM initial est deja disponible.
         linkifyIPsIn(document.body);
         observer.observe(document.body, {childList: true, subtree: true});
+    })();
+
+    // --- Pastilles presence RH : detecte automatiquement les adresses email ET
+    // les noms (NOM Prenom) dans le DOM, interroge RH Studio en batch, et affiche
+    // une pastille coloree (present/parti/non trouve) a cote. ----------------------
+    (function() {
+        var RH_EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+        var RH_NAME_RE = /\b([A-ZÀ-Ü]{3,})\s+([A-ZÀ-Ü][a-zéèêëàâäùûüôöîïçœæ]+(?:[\- ][A-ZÀ-Ü][a-zéèêëàâäùûüôöîïçœæ]+)*)\b/g;
+        var RH_SKIP = 'script, style, textarea, select, option, [contenteditable], .ql-editor, .rh-badge, input[type="email"], input[type="text"]';
+        var rhPendingEmails = new Set();
+        var rhPendingNames = [];
+        var rhFlushTimer = null;
+        var rhStatusCache = {};
+        var RH_NO_NAME = /^(OUTLOOK|MOBILE|BENEFIT|PROXY|BOOTSTRAP|VISTA|SIGNAL|TEAMS|GROUP|OFFICE|WINDOWS|SERVER|CLIENT|PUBLIC|PRIVATE|SHARED|DEFAULT|GLOBAL|SYSTEM|ONEDRIVE|EXCHANGE|SECURITY|NETWORK|FIREWALL|ROUTER|SWITCH|PRINTER|SCANNER|BACKUP|ARCHIVE|SECURITY|PREMIUM|STANDARD|ENTERPRISE|EDUCATION|HEALTHCARE|FINANCE|MARKETING|SALES|SUPPORT|OPERATIONS|LOGISTICS|PROCUREMENT|HUMAN|RESOURCES|ACCOUNTING|LEGAL|COMMUNICATIONS|ADMINISTRATION|DEVELOPMENT|INFRASTRUCTURE|DATA|ANALYTICS|RESEARCH|QUALITY|COMPLIANCE|RISK|AUDIT|INSPECTION|CONTROL|MANAGEMENT|DIRECTION|SERVICE|DEPARTMENT|DIVISION|BUREAU|SECTION|UNIT|TEAM|GROUP|AGENCY|OFFICE|COUNCIL|BOARD|COMMITTEE|COMMISSION|AUTHORITY|INSTITUTE|FOUNDATION|CENTER|CENTRE|HOSPITAL|SCHOOL|UNIVERSITY|COLLEGE|LIBRARY|MUSEUM|PARK|GARDEN|STATION|AIRPORT|HARBOR|PORT|BRIDGE|TUNNEL|HIGHWAY|AVENUE|BOULEVARD|STREET|ROAD|LANE|SQUARE|PLACE|COURT|DRIVE|PASSAGE|RUE|AVENUE|BOULEVARD|IMPASSE|ALLEE|COURS|PROMENADE|ESPLANADE|PARVIS|PASSAGE|RONDPOINT|CERCLE|CARRE|PONT|PORT|GARE|AEROPORT|BORNE|BASE|SITE|ZONE|ILE|FRONT|REAR|LEFT|RIGHT|TOP|BOTTOM|INSIDE|OUTSIDE|UPPER|LOWER|INNER|OUTER|MAIN|CORE|EDGE|END|START|BEGIN|FINISH|FIRST|LAST|NEXT|PREV|BACK|HOME|MENU|LIST|ITEM|TYPE|NAME|CODE|DATA|INFO|TEXT|LINK|LIST|FORM|VIEW|PAGE|TAB|BOX|CARD|CELL|ROW|COL|BTN|IMG|ICON|LOGO|ADDR|AUTH|DNS|SSL|TLS|API|URL|URI|SQL|CSV|XML|JSON|YAML|INI|CFG|CONF|ENV|VAR|KEY|VAL|SET|GET|PUT|DEL|POST|PATCH|HEAD|OPTIONS|TRACE|CONNECT)$/;
+
+        function badgeHtmlForStatus(status, info) {
+            var tip = info.statusLabel || status;
+            if (status === 'present') {
+                tip = 'Présent';
+            } else if (status === 'parti' || status === 'left') {
+                tip = 'Parti';
+                var dd = info.dateDepart || info.date_depart || info.departureDate || info.endDate || info.dateSortie;
+                if (dd) tip += ' — ' + dd;
+            } else if (status === 'not_arrived' || status === 'not_arrived_yet') {
+                tip = 'Arrive bientôt';
+                var da = info.dateArrivee || info.date_arrivee || info.arrivalDate || info.startDate || info.datePriseDePoste;
+                if (da) tip += ' — ' + da;
+            } else if (status === 'not_found') {
+                tip = 'Non trouvé';
+            } else if (status === 'error') {
+                tip = 'Erreur';
+            }
+            var icons = {
+                'present': '<i class="bi bi-person-check-fill" style="color:#198754;"></i>',
+                'parti': '<i class="bi bi-person-x-fill" style="color:#dc3545;"></i>',
+                'left': '<i class="bi bi-person-x-fill" style="color:#dc3545;"></i>',
+                'not_arrived': '<i class="bi bi-person-plus-fill" style="color:#fd7e14;"></i>',
+                'not_arrived_yet': '<i class="bi bi-person-plus-fill" style="color:#fd7e14;"></i>',
+                'not_found': '<i class="bi bi-person-dash" style="color:#6c757d;"></i>',
+                'error': '<i class="bi bi-exclamation-triangle" style="color:#6c757d;"></i>',
+            };
+            var icon = icons[status] || '<i class="bi bi-question-circle" style="color:#6c757d;"></i>';
+            return '<span class="rh-badge" title="' + tip + '">' + icon + '</span>';
+        }
+
+        function processTextNodes(root) {
+            if (!root || root.nodeType !== 1 || root.closest(RH_SKIP)) return;
+            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                acceptNode: function(node) {
+                    var p = node.parentElement;
+                    if (!p || p.closest(RH_SKIP)) return NodeFilter.FILTER_REJECT;
+                    RH_EMAIL_RE.lastIndex = 0;
+                    RH_NAME_RE.lastIndex = 0;
+                    if (node.nodeValue && (RH_EMAIL_RE.test(node.nodeValue) || RH_NAME_RE.test(node.nodeValue)))
+                        return NodeFilter.FILTER_ACCEPT;
+                    return NodeFilter.FILTER_REJECT;
+                }
+            });
+            var textNodes = [];
+            var n;
+            while ((n = walker.nextNode())) textNodes.push(n);
+
+            textNodes.forEach(function(node) {
+                var text = node.nodeValue;
+                var frag = document.createDocumentFragment();
+                var lastIndex = 0;
+                var allMatches = [];
+
+                RH_EMAIL_RE.lastIndex = 0;
+                var em;
+                while ((em = RH_EMAIL_RE.exec(text))) {
+                    allMatches.push({start: em.index, end: em.index + em[0].length, type: 'email', value: em[0]});
+                }
+                RH_NAME_RE.lastIndex = 0;
+                var nm;
+                while ((nm = RH_NAME_RE.exec(text))) {
+                    if (RH_NO_NAME.test(nm[1]) || RH_NO_NAME.test(nm[2])) continue;
+                    allMatches.push({start: nm.index, end: nm.index + nm[0].length, type: 'name', value: nm[0], nom: nm[1], prenom: nm[2]});
+                }
+
+                allMatches.sort(function(a, b) { return a.start - b.start; });
+                var filtered = [];
+                var prevEnd = 0;
+                allMatches.forEach(function(m) {
+                    if (m.start >= prevEnd) { filtered.push(m); prevEnd = m.end; }
+                });
+
+                if (!filtered.length) return;
+                filtered.forEach(function(m) {
+                    if (m.start > lastIndex) frag.appendChild(document.createTextNode(text.slice(lastIndex, m.start)));
+                    var key = m.value;
+                    var span = document.createElement('span');
+                    span.className = 'text-nowrap';
+                    var inner = m.type === 'email'
+                        ? '<span class="rh-email-text">' + m.value + '</span>'
+                        : '<span class="rh-name-text" data-nom="' + m.nom + '" data-prenom="' + m.prenom + '">' + m.value + '</span>';
+                    span.innerHTML = inner;
+                    frag.appendChild(span);
+                    if (rhStatusCache[key]) {
+                        var info = rhStatusCache[key];
+                        span.insertAdjacentHTML('beforeend', badgeHtmlForStatus(info.status, info));
+                    } else {
+                        if (m.type === 'email') {
+                            rhPendingEmails.add(m.value);
+                        } else {
+                            rhPendingNames.push({nom: m.nom, prenom: m.prenom, key: key});
+                        }
+                    }
+                    lastIndex = m.end;
+                });
+                if (lastIndex < text.length) frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+                node.parentNode.replaceChild(frag, node);
+            });
+
+            if (rhPendingEmails.size || rhPendingNames.length) {
+                if (rhFlushTimer) clearTimeout(rhFlushTimer);
+                rhFlushTimer = setTimeout(flushRhPending, 500);
+            }
+        }
+
+        function flushRhPending() {
+            var emails = Array.from(rhPendingEmails);
+            var names = rhPendingNames.slice();
+            rhPendingEmails.clear();
+            rhPendingNames = [];
+            if (!emails.length && !names.length) return;
+            fetch('/api/rh-batch-status', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({emails: emails, names: names})
+            }).then(function(r) { return r.json(); })
+              .then(function(data) {
+                  Object.keys(data).forEach(function(key) {
+                      var info = data[key];
+                      rhStatusCache[key] = info;
+                      var selector = '.rh-email-text, .rh-name-text';
+                      document.querySelectorAll(selector).forEach(function(el) {
+                          var elKey = el.classList.contains('rh-email-text') ? el.textContent : (el.getAttribute('data-nom') + ' ' + el.getAttribute('data-prenom'));
+                          if (elKey === key && !el.parentElement.querySelector('.rh-badge')) {
+                              el.parentElement.insertAdjacentHTML('beforeend', badgeHtmlForStatus(info.status, info));
+                          }
+                      });
+                  });
+              })
+              .catch(function() {});
+        }
+
+        var rhMoTimer = null;
+        var rhMoNodes = [];
+        var rhObserver = new MutationObserver(function(mutations) {
+            mutations.forEach(function(m) {
+                m.addedNodes.forEach(function(node) {
+                    if (node.nodeType === 1) rhMoNodes.push(node);
+                });
+            });
+            if (rhMoTimer) clearTimeout(rhMoTimer);
+            rhMoTimer = setTimeout(function() {
+                var nodes = rhMoNodes; rhMoNodes = [];
+                nodes.forEach(processTextNodes);
+            }, 300);
+        });
+
+        processTextNodes(document.body);
+        rhObserver.observe(document.body, {childList: true, subtree: true});
     })();
     </script>
 </body>
