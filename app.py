@@ -1715,15 +1715,34 @@ def graph_get_sku_names():
     return mapping
 
 
+_ACCOUNT_OVERVIEW_BASE_FIELDS = (
+    'id,displayName,userPrincipalName,mail,accountEnabled,createdDateTime,jobTitle,'
+    'department,officeLocation,onPremisesSyncEnabled,userType,assignedLicenses'
+)
+
+
 def graph_get_account_overview(upn):
     """Recupere les informations cles d'un compte pour la page /admin/compte/<upn> :
-    identite, statut (actif/desactive), derniere connexion (signInActivity, necessite
-    AuditLog.Read.All, deja utilise ailleurs dans l'appli), licences affectees (traduites
-    en noms lisibles). Retourne {} si le compte n'existe pas dans l'annuaire."""
-    items = graph_get_all(f'/users/{_graph_quote(upn)}', params={
-        '$select': 'id,displayName,userPrincipalName,mail,accountEnabled,createdDateTime,jobTitle,'
-                    'department,officeLocation,onPremisesSyncEnabled,userType,assignedLicenses,signInActivity',
-    }, timeout=20, max_pages=1)
+    identite, statut (actif/desactive), derniere connexion (signInActivity), licences
+    affectees (traduites en noms lisibles). Retourne {} si le compte n'existe pas dans
+    l'annuaire.
+
+    signInActivity a un comportement particulier documente par Microsoft : si l'app n'a
+    pas A LA FOIS AuditLog.Read.All ET User.Read.All (par ex. consentement admin pas encore
+    accorde pour l'une des deux), Graph renvoie une erreur 400 Bad Request — pas le 403
+    habituel pour une permission manquante — ce qui ferait echouer toute la fiche pour un
+    seul champ. On retente donc sans ce champ dans ce cas precis, plutot que de priver
+    l'administrateur du reste des informations du compte en pleine urgence."""
+    try:
+        items = graph_get_all(f'/users/{_graph_quote(upn)}', params={
+            '$select': _ACCOUNT_OVERVIEW_BASE_FIELDS + ',signInActivity',
+        }, timeout=20, max_pages=1)
+    except RuntimeError as e:
+        if 'HTTP 400' not in str(e):
+            raise
+        items = graph_get_all(f'/users/{_graph_quote(upn)}', params={
+            '$select': _ACCOUNT_OVERVIEW_BASE_FIELDS,
+        }, timeout=20, max_pages=1)
     data = dict(items[0]) if items else {}
     if data.get('id'):
         sku_names = graph_get_sku_names()

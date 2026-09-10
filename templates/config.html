@@ -113,7 +113,9 @@
                                 <li><code>AuditLog.Read.All</code> — connexions (sign-ins) et journal d'audit</li>
                                 <li><code>MailboxSettings.Read</code> — règles de messagerie (transfert, suppression...)</li>
                                 <li><code>Mail.Read</code> — messages envoyés (optionnel, seulement si vous cochez "+ messages envoyés")</li>
-                                <li><code>User.Read.All</code> — résolution des utilisateurs, découverte automatique par motif (ex: <code>adm-*</code>) et scan des règles de messagerie de tout le tenant sur la page Surveillance</li>
+                                <li><code>User.Read.All</code> — résolution des utilisateurs, découverte automatique par motif (ex: <code>adm-*</code>) et scan des règles de messagerie de tout le tenant sur la page Surveillance.
+                                    <span class="text-muted">Combinée à <code>AuditLog.Read.All</code>, nécessaire aussi pour afficher la dernière connexion sur la fiche "Premiers secours" — s'il manque l'une des deux, Microsoft Graph renvoie une erreur <strong>400</strong> (pas 403) sur ce champ précis ; l'appli se rabat alors automatiquement sur le reste des informations du compte.</span>
+                                </li>
                                 <li><code>User.ReadWrite.All</code> — actions d'urgence du menu <strong>Premiers secours</strong> (désactivation de compte, révocation des sessions, réinitialisation du mot de passe)</li>
                                 <li><code>UserAuthenticationMethod.Read.All</code> — consultation des méthodes MFA enregistrées sur la fiche "Premiers secours" (optionnel)</li>
                                 <li><code>UserAuthenticationMethod.ReadWrite.All</code> — action "Forcer le MFA (legacy)" sur la fiche "Premiers secours" (optionnel, sans effet si le MFA est géré par l'Accès conditionnel)</li>
