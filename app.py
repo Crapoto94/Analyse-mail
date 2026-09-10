@@ -2870,10 +2870,8 @@ def view_boite(bid):
         nb_rules = conn.execute('SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=?', (bid,)).fetchone()['c']
         nb_suspicious_rules = conn.execute("SELECT COUNT(*) as c FROM mailbox_rules WHERE boite_id=? AND is_suspicious='true'", (bid,)).fetchone()['c']
         graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
-        groq_ai_configured = bool(get_config('groq_api_key', ''))
-        nvidia_ai_configured = bool(get_config('nvidia_api_key', ''))
-        ollama_ai_configured = get_config('ollama_enabled', '1') != '0'
-        ai_configured = groq_ai_configured or nvidia_ai_configured or ollama_ai_configured
+        ai_models = [m for m in get_all_ai_models() if m['active']]
+        ai_configured = bool(ai_models)
         rh_studio_configured = bool(get_config('rh_studio_url', '') and get_config('rh_studio_api_key', ''))
         dsi_actions = conn.execute('SELECT * FROM dsi_actions WHERE boite_id=? ORDER BY created_at ASC', (bid,)).fetchall()
         risk_analysis = analyze_compromise(bid)
@@ -2967,11 +2965,7 @@ def view_boite(bid):
                          nb_signins=nb_signins, nb_audit=nb_audit,
                          nb_rules=nb_rules, nb_suspicious_rules=nb_suspicious_rules,
                          graph_configured=graph_configured, ai_configured=ai_configured,
-                         groq_ai_configured=groq_ai_configured, nvidia_ai_configured=nvidia_ai_configured,
-                         ollama_ai_configured=ollama_ai_configured,
-            groq_default_model=get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
-            nvidia_default_model=get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL,
-            ollama_default_model=get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL,
+                         ai_models=ai_models,
                          dsi_actions=dsi_actions, now_local_dt=_now_local_datetime_input(),
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count,
                          rh_studio_configured=rh_studio_configured)
@@ -3545,6 +3539,103 @@ def _parse_models(text):
 OLLAMA_DEFAULT_URL = 'http://10.103.130.166:11434'
 OLLAMA_DEFAULT_MODEL = 'gemma4:e4b'
 
+PROVIDER_LABELS = {'groq': 'Groq', 'nvidia': 'NVIDIA', 'ollama': 'Ollama'}
+
+# ----------------------------------------------------------------------------
+# Gestion "plusieurs modèles par fournisseur" : chaque fournisseur (Groq, NVIDIA,
+# Ollama) peut avoir 0, 1 ou plusieurs modèles enregistrés, chacun avec un nom
+# choisi par l'admin (ex: "Rapide") et un identifiant technique (ex:
+# "llama-3.1-8b-instant"). Stocké en JSON (clé de config "<provider>_models_json"),
+# un modèle = {'id': ..., 'name': ..., 'model': ...}. L'ancien format texte
+# ("nom1|model1|nom2|model2", clé "<provider>_models") est migré automatiquement
+# la première fois qu'on le lit.
+# ----------------------------------------------------------------------------
+
+def _load_provider_models(provider):
+    """Retourne [{'id', 'name', 'model'}, ...] pour ce fournisseur, en migrant si besoin
+    l'ancien format texte vers le nouveau format JSON (une seule fois, résultat persisté)."""
+    json_raw = get_config(f'{provider}_models_json', '')
+    if json_raw:
+        try:
+            models = json.loads(json_raw)
+        except (ValueError, TypeError):
+            models = None
+        if isinstance(models, list):
+            changed = False
+            for m in models:
+                if not m.get('id'):
+                    m['id'] = uuid.uuid4().hex[:8]
+                    changed = True
+            if changed:
+                _save_provider_models(provider, models)
+            return models
+
+    # Migration depuis l'ancien format texte, si présent.
+    legacy = _parse_models(get_config(f'{provider}_models', ''))
+    if legacy:
+        models = [{'id': uuid.uuid4().hex[:8], 'name': m['name'], 'model': m['model']} for m in legacy]
+        _save_provider_models(provider, models)
+        return models
+    return []
+
+
+def _save_provider_models(provider, models):
+    set_config(f'{provider}_models_json', json.dumps(models, ensure_ascii=False))
+
+
+def _provider_active(provider):
+    if provider == 'groq':
+        return bool(get_config('groq_api_key', ''))
+    if provider == 'nvidia':
+        return bool(get_config('nvidia_api_key', ''))
+    if provider == 'ollama':
+        return (get_config('ollama_enabled', '1') != '0') and bool(get_config('ollama_url', '') or OLLAMA_DEFAULT_URL)
+    return False
+
+
+def get_all_ai_models():
+    """Retourne tous les modèles configurés, tous fournisseurs confondus :
+    [{'key': 'groq:abcd1234', 'provider', 'provider_label', 'id', 'name', 'model',
+      'active' (le fournisseur est configuré), 'is_default'}, ...].
+    Si un fournisseur configuré n'a aucun modèle personnalisé, on retombe sur son
+    modèle classique historique pour ne jamais le faire disparaître de la liste."""
+    default_key = get_config('ai_default_model', '')
+
+    all_models = []
+    for provider in ('groq', 'nvidia', 'ollama'):
+        active = _provider_active(provider)
+        models = _load_provider_models(provider)
+        if not models:
+            fallback_model = {
+                'groq': get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
+                'nvidia': get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL,
+                'ollama': get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL,
+            }[provider]
+            models = [{'id': 'default', 'name': PROVIDER_LABELS[provider], 'model': fallback_model}]
+        for m in models:
+            key = f"{provider}:{m['id']}"
+            all_models.append({
+                'key': key,
+                'provider': provider,
+                'provider_label': PROVIDER_LABELS[provider],
+                'id': m['id'],
+                'name': m['name'],
+                'model': m['model'],
+                'active': active,
+                'is_default': (key == default_key),
+            })
+
+    # Pas de défaut choisi explicitement (ou il pointe vers un modèle supprimé) :
+    # le premier modèle d'un fournisseur actif devient le défaut implicite.
+    if not any(m['is_default'] for m in all_models):
+        for m in all_models:
+            if m['active']:
+                m['is_default'] = True
+                break
+
+    return all_models
+
+
 GROQ_DEFAULT_PROMPT_TEMPLATE = """Tu es un analyste en cybersécurité spécialisé dans la réponse à incident sur Microsoft 365 / Entra ID (Azure AD).
 
 Voici les journaux collectés pour la boîte {{email}}, ainsi que le résultat d'une analyse heuristique automatique (score de risque {{score}}/10, verdict : {{verdict}}).
@@ -3723,63 +3814,51 @@ def call_ollama_chat(prompt, url=None, model=None, timeout=120):
     return _call_openai_compatible_chat(ollama_api_url, 'ollama', model, prompt, timeout, 'Ollama')
 
 
-def run_ai_analysis(bid, preferred_provider=None):
-    """Construit le prompt pour la boite et interroge l'IA : essaie d'abord le
-    fournisseur choisi par l'utilisateur, et bascule automatiquement sur les autres
-    (si configures) en cas d'echec. Retourne (texte, fournisseur, modele)."""
+def run_ai_analysis(bid, preferred_model_key=None):
+    """Construit le prompt pour la boite et interroge l'IA : essaie d'abord le modèle
+    précis choisi par l'utilisateur (ex: 'nvidia:ab12cd34', voir get_all_ai_models), puis
+    bascule automatiquement sur le modèle par défaut de chaque autre fournisseur configuré
+    en cas d'échec (panne, quota dépassé, clé invalide...). Retourne (texte, fournisseur, modele)."""
     prompt, _analysis = build_ai_analysis_prompt(bid)
+
+    all_models = get_all_ai_models()
+    active_models = [m for m in all_models if m['active']]
+    if not active_models:
+        raise RuntimeError('Aucun fournisseur IA configuré (Groq, NVIDIA ou Ollama)')
+
+    # Ordre d'essai : le modèle demandé en premier (s'il existe et que son fournisseur est
+    # actif), puis le premier modèle configuré de chaque autre fournisseur actif, en repli.
+    ordered = []
+    seen_providers = set()
+    if preferred_model_key:
+        chosen = next((m for m in active_models if m['key'] == preferred_model_key), None)
+        if chosen:
+            ordered.append(chosen)
+            seen_providers.add(chosen['provider'])
+    for provider in ('groq', 'nvidia', 'ollama'):
+        if provider in seen_providers:
+            continue
+        candidates = [m for m in active_models if m['provider'] == provider]
+        if not candidates:
+            continue
+        ordered.append(candidates[0])
+        seen_providers.add(provider)
 
     groq_key = get_config('groq_api_key', '')
     nvidia_key = get_config('nvidia_api_key', '')
     ollama_url = get_config('ollama_url', '') or OLLAMA_DEFAULT_URL
-    ollama_enabled = get_config('ollama_enabled', '1') != '0'
-    has_ollama = ollama_enabled and ollama_url
-
-    # --- Modèles multiples (nouvelle feature, optionnelle) ---
-    # Lecture depuis config : format "nom1|model1|nom2|model2"
-    groq_models_raw = get_config('groq_models', '')
-    groq_models = _parse_models(groq_models_raw)  # liste de {'name':..., 'model':...}
-    groq_default_model = groq_models[0]['model'] if groq_models else (get_config('groq_model', '') or GROQ_DEFAULT_MODEL)
-
-    nvidia_models_raw = get_config('nvidia_models', '')
-    nvidia_models = _parse_models(nvidia_models_raw)
-    nvidia_default_model = nvidia_models[0]['model'] if nvidia_models else (get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL)
-
-    ollama_models_raw = get_config('ollama_models', '')
-    ollama_models = _parse_models(ollama_models_raw)
-    ollama_default_model = ollama_models[0]['model'] if ollama_models else (get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL)
-
-    if not groq_key and not nvidia_key and not has_ollama:
-        raise RuntimeError('Aucun fournisseur IA configuré (Groq, NVIDIA ou Ollama)')
-
-    # Construction de l'ordre : fournisseur préféré en premier, puis les autres
-    all_providers = ['groq', 'nvidia', 'ollama']
-    if preferred_provider and preferred_provider in all_providers:
-        order = [preferred_provider] + [p for p in all_providers if p != preferred_provider]
-    else:
-        order = ['groq', 'nvidia', 'ollama']
 
     errors = []
-    for provider in order:
-        if provider == 'groq' and groq_key:
-            # Utilise le modèle par défaut (premier de la liste multi, ou la constante classique)
-            model = groq_default_model
-            try:
-                return call_groq_chat(prompt, api_key=groq_key, model=model), 'Groq', model
-            except Exception as e:
-                errors.append(f'Groq : {e}')
-        elif provider == 'nvidia' and nvidia_key:
-            model = nvidia_default_model
-            try:
-                return call_nvidia_chat(prompt, api_key=nvidia_key, model=model), 'NVIDIA', model
-            except Exception as e:
-                errors.append(f'NVIDIA : {e}')
-        elif provider == 'ollama' and has_ollama:
-            model = ollama_default_model
-            try:
-                return call_ollama_chat(prompt, url=ollama_url, model=model), 'Ollama', model
-            except Exception as e:
-                errors.append(f'Ollama : {e}')
+    for m in ordered:
+        try:
+            if m['provider'] == 'groq':
+                return call_groq_chat(prompt, api_key=groq_key, model=m['model']), 'Groq', m['model']
+            elif m['provider'] == 'nvidia':
+                return call_nvidia_chat(prompt, api_key=nvidia_key, model=m['model']), 'NVIDIA', m['model']
+            elif m['provider'] == 'ollama':
+                return call_ollama_chat(prompt, url=ollama_url, model=m['model']), 'Ollama', m['model']
+        except Exception as e:
+            errors.append(f"{m['provider_label']} ({m['name']}) : {e}")
 
     raise RuntimeError(' / '.join(errors))
 
@@ -5603,19 +5682,19 @@ def ai_analyze_start(bid):
     conn.close()
     if not boite:
         return jsonify({'error': 'Boîte non trouvée'}), 404
-    if not get_config('groq_api_key', '') and not get_config('nvidia_api_key', ''):
-        return jsonify({'error': "Aucun fournisseur IA configuré (Groq ou NVIDIA) — demandez à un administrateur de le renseigner dans Configuration."}), 400
+    if not any(m['active'] for m in get_all_ai_models()):
+        return jsonify({'error': "Aucun fournisseur IA configuré (Groq, NVIDIA ou Ollama) — demandez à un administrateur de le renseigner dans Configuration."}), 400
 
-    # Fournisseur choisi dans le formulaire (le champ 'request' n'est plus accessible une
+    # Modèle choisi dans le formulaire (le champ 'request' n'est plus accessible une
     # fois dans le thread de fond, on le lit donc avant de le lancer).
-    preferred_provider = request.form.get('provider', 'groq').strip().lower()
+    preferred_model_key = request.form.get('model_key', '').strip()
 
     job_id = _job_create(['ai'])
 
     def worker():
         _job_step(job_id, 'ai', 'running')
         try:
-            result_text, provider, model = run_ai_analysis(bid, preferred_provider=preferred_provider)
+            result_text, provider, model = run_ai_analysis(bid, preferred_model_key=preferred_model_key)
             now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             conn2 = get_db()
             conn2.execute('''UPDATE boites_compromises SET
@@ -6254,39 +6333,57 @@ def config():
             new_groq_key = request.form.get('groq_api_key', '')
             if new_groq_key:
                 set_config('groq_api_key', new_groq_key.strip())
-            # NOW SAVE THE MODELS LIST (meme si la cle n'a pas ete modifiée)
-            new_groq_models = request.form.get('groq_models', '').strip()
-            if new_groq_models:
-                set_config('groq_models', new_groq_models)
             new_nvidia_key = request.form.get('nvidia_api_key', '')
             if new_nvidia_key:
                 set_config('nvidia_api_key', new_nvidia_key.strip())
-            new_nvidia_models = request.form.get('nvidia_models', '').strip()
-            if new_nvidia_models:
-                set_config('nvidia_models', new_nvidia_models)
-            # Ollama models aussi
-            new_ollama_models = request.form.get('ollama_models', '').strip()
-            if new_ollama_models:
-                set_config('ollama_models', new_ollama_models.strip())
+
+            # Listes de modèles (une par fournisseur), construites côté client en JSON par
+            # la page de configuration : [{'id':..., 'name':..., 'model':...}, ...].
+            for provider in ('groq', 'nvidia', 'ollama'):
+                raw = request.form.get(f'{provider}_models_json', '').strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, TypeError):
+                    flash(f"Liste de modèles {PROVIDER_LABELS[provider]} invalide — non enregistrée")
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                cleaned = []
+                for m in parsed:
+                    name = str(m.get('name', '')).strip()
+                    model = str(m.get('model', '')).strip()
+                    if not model:
+                        continue
+                    cleaned.append({
+                        'id': str(m.get('id') or uuid.uuid4().hex[:8]),
+                        'name': name or model,
+                        'model': model,
+                    })
+                _save_provider_models(provider, cleaned)
+
+            # Modèle par défaut global (un seul, tous fournisseurs confondus), ex: "nvidia:ab12cd34"
+            new_default = request.form.get('ai_default_model', '').strip()
+            if new_default:
+                set_config('ai_default_model', new_default)
+
+            # Ollama : activation + URL (dans le meme formulaire que Groq/NVIDIA)
+            new_ollama_enabled = request.form.get('ollama_enabled', '')
+            if new_ollama_enabled not in ('0', '1'):
+                new_ollama_enabled = '1'
+            set_config('ollama_enabled', new_ollama_enabled)
+            new_ollama_url = request.form.get('ollama_url', '')
+            if new_ollama_url:
+                set_config('ollama_url', new_ollama_url.strip())
+
             # Ne pas ecraser le prompt si vide
             new_prompt = request.form.get('groq_prompt_template', '').strip()
             if new_prompt:
                 set_config('groq_prompt_template', new_prompt)
             flash('Configuration IA enregistrée avec succès')
-        elif 'ollama_enabled' in request.form or 'ollama_url' in request.form or 'ollama_model' in request.form:
-            new_ollama_enabled = request.form.get('ollama_enabled', '')
-            if new_ollama_enabled not in ('0', '1', '', None):
-                new_ollama_enabled = '1'
-            set_config('ollama_enabled', str(new_ollama_enabled).strip())
-            new_ollama_url = request.form.get('ollama_url', '')
-            if new_ollama_url:
-                set_config('ollama_url', new_ollama_url.strip())
-            new_ollama_model = request.form.get('ollama_model', '')
-            if new_ollama_model:
-                set_config('ollama_model', new_ollama_model.strip())
-            flash('Configuration Ollama enregistrée avec succès')
-        # L'ancienne condition elif 'groq_models'... est maintenant inutile car
-        # la section IA ci-dessus gère maintenant tout (cle + modèles).
+        # L'ancienne condition elif 'ollama_enabled' in request.form... est maintenant inutile :
+        # Ollama fait partie du meme formulaire IA que Groq/NVIDIA, géré ci-dessus.
         # On saute directement à la section Teams.
         elif 'teams_webhook_url' in request.form:
             set_config('teams_webhook_url', request.form.get('teams_webhook_url', '').strip())
@@ -6331,10 +6428,9 @@ def config():
         microsoft_redirect_uri=_microsoft_redirect_uri(),
         microsoft_redirect_uri_auto=url_for('microsoft_callback', _external=True),
         groq_api_key_set=bool(get_config('groq_api_key', '')),
-        groq_model=get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
+        groq_default_model=GROQ_DEFAULT_MODEL,
         groq_available_models=GROQ_AVAILABLE_MODELS,
         nvidia_api_key_set=bool(get_config('nvidia_api_key', '')),
-        nvidia_model=get_config('nvidia_model', ''),
         nvidia_default_model=NVIDIA_DEFAULT_MODEL,
         groq_prompt_template=get_config('groq_prompt_template', '') or GROQ_DEFAULT_PROMPT_TEMPLATE,
         teams_webhook_url=get_config('teams_webhook_url', ''),
@@ -6342,12 +6438,16 @@ def config():
         abuseipdb_api_key_set=bool(get_config('abuseipdb_api_key', '')),
         rh_studio_url=get_config('rh_studio_url', ''),
         rh_studio_api_key_set=bool(get_config('rh_studio_api_key', '')),
-ollama_enabled=get_config('ollama_enabled', '1'),
-         ollama_url=get_config('ollama_url', 'http://10.103.130.166:11434'),
-         ollama_model=get_config('ollama_model', 'gemma4:e4b'),
-         groq_models=get_config('groq_models', ''),
-         nvidia_models=get_config('nvidia_models', ''),
-         ollama_models=get_config('ollama_models', ''))
+        ollama_enabled=get_config('ollama_enabled', '1'),
+        ollama_url=get_config('ollama_url', '') or OLLAMA_DEFAULT_URL,
+        ollama_default_model=OLLAMA_DEFAULT_MODEL,
+        # Modèles multiples : chaque fournisseur a sa propre liste [{'id','name','model'}, ...],
+        # rendue en JSON pour l'initialisation JS de la page (édition/suppression/test en direct)
+        # et en objets Python pour l'affichage serveur initial (pas de flash de contenu vide).
+        groq_models_list=_load_provider_models('groq'),
+        nvidia_models_list=_load_provider_models('nvidia'),
+        ollama_models_list=_load_provider_models('ollama'),
+        ai_default_model_key=next((m['key'] for m in get_all_ai_models() if m['is_default']), ''))
 
 @app.route('/api/diag/proxy-headers')
 @admin_required
@@ -6383,30 +6483,38 @@ def test_api_graph():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 
-@app.route('/api/test-groq')
+@app.route('/api/test-ai-model', methods=['POST'])
 @admin_required
-def test_api_groq():
-    try:
-        reply = call_groq_chat("Réponds uniquement par : OK")
-        return jsonify({'success': True, 'message': f"Connexion à l'API Groq réussie — réponse du modèle : {reply.strip()[:200]}"})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)})
+def test_api_ai_model():
+    """Teste un modèle précis (bouton « Tester » sur chaque ligne de la page Configuration).
+    Fonctionne même si la ligne n'a pas encore été enregistrée : si la clé API / l'URL n'est
+    pas fournie dans la requête, on retombe sur celle déjà enregistrée en base."""
+    data = request.get_json(silent=True) or {}
+    provider = (data.get('provider') or '').strip().lower()
+    model = (data.get('model') or '').strip()
+    if provider not in ('groq', 'nvidia', 'ollama'):
+        return jsonify({'success': False, 'message': 'Fournisseur inconnu'}), 400
+    if not model:
+        return jsonify({'success': False, 'message': "Identifiant technique du modèle manquant"}), 400
 
-@app.route('/api/test-nvidia')
-@admin_required
-def test_api_nvidia():
     try:
-        reply = call_nvidia_chat("Réponds uniquement par : OK")
-        return jsonify({'success': True, 'message': f"Connexion à l'API NVIDIA réussie — réponse du modèle : {reply.strip()[:200]}"})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)})
-
-@app.route('/api/test-ollama')
-@admin_required
-def test_api_ollama():
-    try:
-        reply = call_ollama_chat("Réponds uniquement par : OK")
-        return jsonify({'success': True, 'message': f"Connexion à Ollama réussie — réponse du modèle : {reply.strip()[:200]}"})
+        if provider == 'groq':
+            api_key = (data.get('api_key') or '').strip() or get_config('groq_api_key', '')
+            if not api_key:
+                return jsonify({'success': False, 'message': 'Clé API Groq non renseignée'})
+            reply = call_groq_chat("Réponds uniquement par : OK", api_key=api_key, model=model)
+            label = 'Groq'
+        elif provider == 'nvidia':
+            api_key = (data.get('api_key') or '').strip() or get_config('nvidia_api_key', '')
+            if not api_key:
+                return jsonify({'success': False, 'message': 'Clé API NVIDIA non renseignée'})
+            reply = call_nvidia_chat("Réponds uniquement par : OK", api_key=api_key, model=model)
+            label = 'NVIDIA'
+        else:
+            url = (data.get('url') or '').strip() or get_config('ollama_url', '') or OLLAMA_DEFAULT_URL
+            reply = call_ollama_chat("Réponds uniquement par : OK", url=url, model=model)
+            label = 'Ollama'
+        return jsonify({'success': True, 'message': f"{label} — modèle « {model} » opérationnel, réponse : {reply.strip()[:200]}"})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 

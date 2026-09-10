@@ -92,32 +92,23 @@
                       window.location.hash = 'ai-analysis';
                       window.location.reload();
                   });">
-            {% if groq_ai_configured and nvidia_ai_configured and ollama_ai_configured %}
-            <select name="provider" class="form-select form-select-sm w-auto" title="Fournisseur IA (l'autre est utilisé en repli automatique en cas d'échec)">
-                <option value="groq">Groq</option>
-                <option value="nvidia">NVIDIA</option>
-                <option value="ollama">Ollama</option>
+            {% if ai_models|length > 1 %}
+            <select name="model_key" class="form-select form-select-sm w-auto"
+                    title="Modèle IA utilisé (les autres fournisseurs configurés servent de repli automatique en cas d'échec)">
+                {% for provider, label in [('groq','Groq'), ('nvidia','NVIDIA'), ('ollama','Ollama')] %}
+                {% set provider_models = ai_models|selectattr('provider','equalto', provider)|list %}
+                {% if provider_models %}
+                <optgroup label="{{ label }}">
+                    {% for m in provider_models %}
+                    <option value="{{ m.key }}"{% if m.is_default %} selected{% endif %}>{{ m.name }}{% if m.is_default %} ★{% endif %}</option>
+                    {% endfor %}
+                </optgroup>
+                {% endif %}
+                {% endfor %}
             </select>
-            {% elif nvidia_ai_configured and ollama_ai_configured %}
-            <select name="provider" class="form-select form-select-sm w-auto">
-                <option value="nvidia">NVIDIA</option>
-                <option value="ollama">Ollama</option>
-            </select>
-            {% elif ollama_ai_configured %}
-            <select name="provider" class="form-select form-select-sm w-auto">
-                <option value="ollama">Ollama</option>
-            </select>
-            {% elif groq_ai_configured and nvidia_ai_configured %}
-            <select name="provider" class="form-select form-select-sm w-auto" title="Fournisseur IA (l'autre est utilisé en repli automatique en cas d'échec)">
-                <option value="groq">Groq</option>
-                <option value="nvidia">NVIDIA</option>
-            </select>
-            {% elif nvidia_ai_configured %}
-            <input type="hidden" name="provider" value="nvidia">
-            {% elif ollama_ai_configured %}
-            <input type="hidden" name="provider" value="ollama">
             {% else %}
-            <input type="hidden" name="provider" value="groq">
+            <input type="hidden" name="model_key" value="{{ ai_models[0].key }}">
+            <span class="text-white-50 small">{{ ai_models[0].provider_label }} · {{ ai_models[0].name }}</span>
             {% endif %}
             <button type="submit" class="btn btn-sm btn-light">
                 <i class="bi bi-stars"></i> {% if boite.ai_analysis %}Relancer l'analyse IA{% else %}Lancer l'analyse IA{% endif %}
@@ -133,13 +124,6 @@
         {% if boite.ai_analysis %}
         <p class="text-muted small mb-2">
             Générée le {{ boite.ai_analysis_at|paris }} via <strong>{{ boite.ai_analysis_provider or 'Groq' }}</strong>, modèle <code>{{ boite.ai_analysis_model }}</code>.
-
-Modèles configurés :
-<ul class="list-unstyled small">
-  <li><strong>Groq :</strong> {{ groq_default_model }}</li>
-  <li><strong>NVIDIA :</strong> {{ nvidia_default_model }}</li>
-  <li><strong>Ollama :</strong> {{ ollama_default_model }}</li>
-</ul>
             <span class="text-warning"><i class="bi bi-exclamation-triangle"></i> Analyse générée par une IA à partir des données déjà collectées — à vérifier avant toute décision.</span>
         </p>
         <div id="ai-analysis-content" class="ai-analysis-md"></div>
@@ -164,7 +148,7 @@ Modèles configurés :
         </p>
         {% else %}
         <p class="text-muted mb-0">
-            <i class="bi bi-info-circle"></i> Nécessite la configuration d'un fournisseur IA (Groq ou NVIDIA).
+            <i class="bi bi-info-circle"></i> Nécessite la configuration d'un fournisseur IA (Groq, NVIDIA ou Ollama).
             {% if session.get('role') == 'admin' %}<a href="{{ url_for('config') }}">Configurer maintenant</a>.{% else %}Demandez à un administrateur de la renseigner.{% endif %}
         </p>
         {% endif %}

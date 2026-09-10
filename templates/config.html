@@ -195,11 +195,14 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                 <p class="text-muted small">
                     Permet d'utiliser un bouton <strong>« Analyse IA »</strong> sur chaque boîte pour demander à un
                     modèle de langage d'expliquer le scénario le plus probable à partir des connexions et du journal
-                    d'audit déjà collectés, avec des recommandations. Deux fournisseurs compatibles, tous les deux
-                    facultatifs : <strong>Groq</strong> (utilisé en priorité s'il est configuré) et <strong>NVIDIA</strong>
-                    (utilisé automatiquement en repli si Groq échoue ou n'est pas configuré — panne, quota dépassé...).
+                    d'audit déjà collectés, avec des recommandations. Trois fournisseurs compatibles, tous facultatifs :
+                    <strong>Groq</strong>, <strong>NVIDIA</strong> et <strong>Ollama</strong> (local). Chacun peut avoir
+                    plusieurs modèles enregistrés, avec le nom de votre choix — ils apparaissent tous dans le menu
+                    déroulant de <code>/boite/x</code>, avec l'étoile (<i class="bi bi-star-fill text-warning"></i>) sur
+                    le modèle par défaut. En cas d'échec du modèle choisi, les autres fournisseurs configurés sont
+                    essayés automatiquement en repli.
                 </p>
-                <form method="POST">
+                <form method="POST" id="ai-config-form">
                     <h6 class="text-success"><i class="bi bi-1-circle"></i> Groq</h6>
                     <p class="text-muted small">Clé disponible sur <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a> (gratuit).</p>
                     <div class="mb-3">
@@ -210,32 +213,14 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                         {% endif %}
                     </div>
                     <div class="mb-3">
-                        <label for="groq_model" class="form-label">Modèle Groq</label>
-                        <p class="text-muted small">
-                            Saisissez "nom|identifiant" par ligne (ex: <code>Rapide|llama-3.3-70b|Précis|openai/gpt-oss-20b</code>).
-                        </p>
-                        <textarea class="form-control" id="groq_models" name="groq_models" rows="3"
-                                  style="font-family: monospace; font-size: 0.85em;"
-                                  placeholder="{% if groq_models %}{{ groq_models }}{% else %}Laisser vide pour utiliser le modèle par défaut (gpt-oss-20b){% endif %}">{{ groq_models | default('') }}</textarea>
-                        <div class="form-text">
-                            Les 5 modèles Groq d'origine sont toujours disponibles via le système classique,
-                            mais vous pouvez ajouter les vôtres ci-dessus avec des noms personnalisés.
-                            <ul>
-                                <li><strong>Modèles d'origine (toujours disponibles) :</strong>
-                                    openai/gpt-oss-20b, llama-3.3-70b-versatile, llama-3.1-8b-instant,
-                                    meta-llama/llama-4-maverick-17b-16e-instruct, meta-llama/llama-4-scout-16e-instruct</li>
-                                <li>Format : <code>nom_user_friendly|identifiant_technique</code>, plusieurs lignes</li>
-                                <li>Le premier modèle de la liste devient le modèle par défaut</li>
-                            </ul>
+                        <div class="form-text mb-2">
+                            Exemples d'identifiants Groq : <code>{{ groq_available_models|join('</code>, <code>')|safe }}</code>
                         </div>
+                        <div id="models-block-groq" data-provider="groq"></div>
                     </div>
-                    <button type="button" class="btn btn-sm btn-outline-success mb-3" onclick="testGroqApi()">
-                        <i class="bi bi-plug"></i> Tester la connexion Groq
-                    </button>
-                    <div id="test-result-groq" class="mb-3" style="display:none;"></div>
 
                     <hr>
-                    <h6 class="text-success"><i class="bi bi-2-circle"></i> NVIDIA (repli automatique)</h6>
+                    <h6 class="text-success"><i class="bi bi-2-circle"></i> NVIDIA</h6>
                     <p class="text-muted small">
                         Clé disponible sur <a href="https://build.nvidia.com" target="_blank">build.nvidia.com</a> (gratuit).
                         Catalogue de 100+ modèles sur <a href="https://build.nvidia.com/models" target="_blank">build.nvidia.com/models</a> —
@@ -249,25 +234,13 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                         {% endif %}
                     </div>
                     <div class="mb-3">
-                        <label for="nvidia_model" class="form-label">Modèle NVIDIA</label>
-                        <textarea class="form-control" id="nvidia_models" name="nvidia_models" rows="3"
-                                  style="font-family: monospace; font-size: 0.85em;"
-                                  placeholder="{% if nvidia_models %}{{ nvidia_models }}{% else %}Laisser vide pour utiliser le modèle par défaut (meta/llama-3.1-70b-instruct){% endif %}">{{ nvidia_models | default('') }}</textarea>
-                        <div class="form-text">
-                            Format : <code>nom_user_friendly|identifiant_technique</code>, plusieurs lignes<br>
-                            Exemple : <code>Modèle_A|meta/llama-3.1-70b-instruct|Modèle_B|mixtral-8x7b-instruct</code><br>
-                            Le premier modèle devient le modèle par défaut utilisé automatiquement.
-                        </div>
+                        <div id="models-block-nvidia" data-provider="nvidia"></div>
                     </div>
-                    <button type="button" class="btn btn-sm btn-outline-success mb-3" onclick="testNvidiaApi()">
-                        <i class="bi bi-plug"></i> Tester la connexion NVIDIA
-                    </button>
-                    <div id="test-result-nvidia" class="mb-3" style="display:none;"></div>
 
                     <hr>
                     <h6 class="text-success"><i class="bi bi-mic"></i> Ollama (local)</h6>
                     <p class="text-muted small">
-                        Instance locale Ollama. Pas de clé API requise. Le modèle <code>{{ ollama_default_model }}</code> est utilisé par défaut si aucun n'est spécifié.
+                        Instance locale Ollama. Pas de clé API requise.
                         <a href="https://ollama.ai" target="_blank">https://ollama.ai</a>.
                     </p>
                     <div class="mb-3">
@@ -284,24 +257,12 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                         <div class="form-text">Exemple : <code>http://localhost:11434</code></div>
                     </div>
                     <div class="mb-3">
-                        <label for="ollama_model" class="form-label">Modèle</label>
-                        <textarea class="form-control" id="ollama_models" name="ollama_models" rows="3"
-                                  style="font-family: monospace; font-size: 0.85em;"
-                                  placeholder="{% if ollama_models %}{{ ollama_models }}{% else %}Laisser vide pour utiliser le modèle par défaut (gemma4:e4b){% endif %}">{{ ollama_models | default('') }}</textarea>
-                        <div class="form-text">
-                            Format : <code>nom_user_friendly|identifiant_technique</code>, plusieurs lignes<br>
-                            Exemple : <code>Gemma|gemma4:e4b|Llama|llama3.1:8b|Mistral|mistral:instruct</code><br>
-                            Le premier modèle devient le modèle par défaut.
-                        </div>
+                        <div id="models-block-ollama" data-provider="ollama"></div>
                     </div>
-                    <button type="button" class="btn btn-sm btn-outline-success mb-3" onclick="testOllamaApi()">
-                        <i class="bi bi-plug"></i> Tester la connexion Ollama
-                    </button>
-                    <div id="test-result-ollama" class="mb-3" style="display:none;"></div>
 
                     <hr>
                     <div class="mb-3">
-                        <label for="groq_prompt_template" class="form-label">Prompt d'analyse (commun aux deux fournisseurs)</label>
+                        <label for="groq_prompt_template" class="form-label">Prompt d'analyse (commun à tous les fournisseurs)</label>
                         <textarea class="form-control" id="groq_prompt_template" name="groq_prompt_template" rows="12" style="font-family: monospace; font-size: 0.85em;">{{ groq_prompt_template }}</textarea>
                         <div class="form-text">
                             Variables disponibles, remplacées automatiquement : <code>{{ '{{email}}' }}</code>,
@@ -311,12 +272,169 @@ proxy_set_header X-Forwarded-Host $host;</pre>
                             <code>{{ '{{dsi_actions}}' }}</code> (actions de remédiation déjà saisies sur la fiche de la boîte).
                         </div>
                     </div>
+                    <input type="hidden" name="groq_models_json" id="groq_models_json">
+                    <input type="hidden" name="nvidia_models_json" id="nvidia_models_json">
+                    <input type="hidden" name="ollama_models_json" id="ollama_models_json">
+                    <input type="hidden" name="ai_default_model" id="ai_default_model_input" value="{{ ai_default_model_key }}">
                     <button type="submit" class="btn btn-success">
                         <i class="bi bi-check-lg"></i> Enregistrer
                     </button>
                 </form>
             </div>
         </div>
+
+        <script>
+        // ---- Gestion "plusieurs modèles par fournisseur" (Groq / NVIDIA / Ollama) ----
+        // Etat tenu en mémoire côté JS, synchronisé vers un champ caché JSON par fournisseur
+        // à chaque modification ; le formulaire classique fait le reste (POST + rechargement).
+        var AI_MODELS = {
+            groq: {{ groq_models_list | tojson }},
+            nvidia: {{ nvidia_models_list | tojson }},
+            ollama: {{ ollama_models_list | tojson }}
+        };
+        var AI_DEFAULT_KEY = {{ ai_default_model_key | tojson }};
+        var AI_EDITING = { groq: null, nvidia: null, ollama: null };
+        var AI_PROVIDER_LABELS = { groq: 'Groq', nvidia: 'NVIDIA', ollama: 'Ollama' };
+
+        function aiEscapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
+        function aiSyncHiddenInput(provider) {
+            document.getElementById(provider + '_models_json').value = JSON.stringify(AI_MODELS[provider]);
+        }
+
+        function renderAiModelsBlock(provider) {
+            var container = document.getElementById('models-block-' + provider);
+            var models = AI_MODELS[provider];
+            var editingIdx = AI_EDITING[provider];
+            var html = '<label class="form-label">Modèles ' + AI_PROVIDER_LABELS[provider] + '</label>';
+            if (models.length === 0) {
+                html += '<p class="text-muted small fst-italic">Aucun modèle ajouté pour l\'instant — ajoutez-en un ci-dessous ' +
+                        '(sinon un modèle par défaut classique sera utilisé).</p>';
+            } else {
+                html += '<div class="table-responsive"><table class="table table-sm align-middle mb-2">' +
+                    '<thead><tr><th style="width:3.5rem;" title="Modèle par défaut, utilisé en premier sur /boite/x">Défaut</th>' +
+                    '<th>Nom</th><th>Identifiant technique</th><th style="width:1%;white-space:nowrap;">Actions</th></tr></thead><tbody>';
+                models.forEach(function(m, idx) {
+                    var key = provider + ':' + m.id;
+                    var checked = (key === AI_DEFAULT_KEY) ? 'checked' : '';
+                    html += '<tr' + (idx === editingIdx ? ' class="table-warning"' : '') + '>' +
+                        '<td class="text-center"><input type="radio" name="ai_default_model_radio" value="' + key + '" ' + checked +
+                            ' onchange="setAiDefaultModel(\'' + key + '\')"></td>' +
+                        '<td>' + aiEscapeHtml(m.name) + '</td>' +
+                        '<td><code>' + aiEscapeHtml(m.model) + '</code></td>' +
+                        '<td class="text-nowrap">' +
+                            '<button type="button" class="btn btn-sm btn-outline-secondary" title="Tester ce modèle" ' +
+                                'onclick="testAiModel(\'' + provider + '\', ' + idx + ')"><i class="bi bi-plug"></i></button> ' +
+                            '<button type="button" class="btn btn-sm btn-outline-primary" title="Modifier" ' +
+                                'onclick="editAiModel(\'' + provider + '\', ' + idx + ')"><i class="bi bi-pencil"></i></button> ' +
+                            '<button type="button" class="btn btn-sm btn-outline-danger" title="Supprimer" ' +
+                                'onclick="deleteAiModel(\'' + provider + '\', ' + idx + ')"><i class="bi bi-trash"></i></button>' +
+                        '</td></tr>';
+                });
+                html += '</tbody></table></div>';
+            }
+            html += '<div id="ai-model-test-result-' + provider + '" class="mb-2" style="display:none;"></div>';
+            var editing = (editingIdx !== null);
+            var current = editing ? models[editingIdx] : { name: '', model: '' };
+            html += '<div class="input-group input-group-sm mb-3">' +
+                '<span class="input-group-text">Nom</span>' +
+                '<input type="text" class="form-control" id="ai-new-name-' + provider + '" placeholder="ex : Rapide" value="' + aiEscapeHtml(current.name) + '">' +
+                '<span class="input-group-text">Identifiant technique</span>' +
+                '<input type="text" class="form-control" id="ai-new-model-' + provider + '" placeholder="ex : llama-3.3-70b-versatile" value="' + aiEscapeHtml(current.model) + '">' +
+                (editing
+                    ? '<button type="button" class="btn btn-primary" onclick="saveAiModelEdit(\'' + provider + '\')"><i class="bi bi-check-lg"></i> Modifier</button>' +
+                      '<button type="button" class="btn btn-outline-secondary" onclick="cancelAiModelEdit(\'' + provider + '\')">Annuler</button>'
+                    : '<button type="button" class="btn btn-outline-success" onclick="addAiModel(\'' + provider + '\')"><i class="bi bi-plus-lg"></i> Ajouter</button>')
+                + '</div>';
+            container.innerHTML = html;
+        }
+
+        function addAiModel(provider) {
+            var nameEl = document.getElementById('ai-new-name-' + provider);
+            var modelEl = document.getElementById('ai-new-model-' + provider);
+            var name = nameEl.value.trim();
+            var model = modelEl.value.trim();
+            if (!model) { alert("L'identifiant technique du modèle est requis"); return; }
+            var id = 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+            AI_MODELS[provider].push({ id: id, name: name || model, model: model });
+            if (!AI_DEFAULT_KEY) {
+                AI_DEFAULT_KEY = provider + ':' + id;
+                document.getElementById('ai_default_model_input').value = AI_DEFAULT_KEY;
+            }
+            aiSyncHiddenInput(provider);
+            renderAiModelsBlock(provider);
+        }
+
+        function editAiModel(provider, idx) {
+            AI_EDITING[provider] = idx;
+            renderAiModelsBlock(provider);
+        }
+
+        function cancelAiModelEdit(provider) {
+            AI_EDITING[provider] = null;
+            renderAiModelsBlock(provider);
+        }
+
+        function saveAiModelEdit(provider) {
+            var idx = AI_EDITING[provider];
+            var name = document.getElementById('ai-new-name-' + provider).value.trim();
+            var model = document.getElementById('ai-new-model-' + provider).value.trim();
+            if (!model) { alert("L'identifiant technique du modèle est requis"); return; }
+            AI_MODELS[provider][idx].name = name || model;
+            AI_MODELS[provider][idx].model = model;
+            AI_EDITING[provider] = null;
+            aiSyncHiddenInput(provider);
+            renderAiModelsBlock(provider);
+        }
+
+        function deleteAiModel(provider, idx) {
+            var m = AI_MODELS[provider][idx];
+            if (!confirm('Supprimer le modèle « ' + m.name + ' » ?')) return;
+            var key = provider + ':' + m.id;
+            AI_MODELS[provider].splice(idx, 1);
+            if (AI_DEFAULT_KEY === key) {
+                AI_DEFAULT_KEY = '';
+                document.getElementById('ai_default_model_input').value = '';
+            }
+            if (AI_EDITING[provider] === idx) AI_EDITING[provider] = null;
+            aiSyncHiddenInput(provider);
+            renderAiModelsBlock(provider);
+        }
+
+        function setAiDefaultModel(key) {
+            AI_DEFAULT_KEY = key;
+            document.getElementById('ai_default_model_input').value = key;
+        }
+
+        function testAiModel(provider, idx) {
+            var m = AI_MODELS[provider][idx];
+            var resultDiv = document.getElementById('ai-model-test-result-' + provider);
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-info py-1 px-2 mb-1 small">Test de « ' + aiEscapeHtml(m.name) + ' » en cours… (peut prendre quelques secondes)</div>';
+            var payload = { provider: provider, model: m.model };
+            if (provider === 'ollama') {
+                payload.url = document.getElementById('ollama_url').value.trim();
+            } else {
+                payload.api_key = document.getElementById(provider + '_api_key').value.trim();
+            }
+            fetch('{{ url_for("test_api_ai_model") }}', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }).then(function(r) { return r.json(); }).then(function(data) {
+                resultDiv.innerHTML = '<div class="alert ' + (data.success ? 'alert-success' : 'alert-danger') + ' py-1 px-2 mb-1 small">' +
+                    '<i class="bi ' + (data.success ? 'bi-check-circle' : 'bi-exclamation-triangle') + '"></i> ' + aiEscapeHtml(data.message) + '</div>';
+            }).catch(function(err) {
+                resultDiv.innerHTML = '<div class="alert alert-danger py-1 px-2 mb-1 small">Erreur de connexion : ' + aiEscapeHtml(String(err)) + '</div>';
+            });
+        }
+
+        ['groq', 'nvidia', 'ollama'].forEach(renderAiModelsBlock);
+        </script>
 
         <div class="card mt-4">
             <div class="card-header" style="background-color:#464775;color:#fff;">
@@ -501,63 +619,6 @@ function testGraphApi() {
     resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
 
     fetch('{{ url_for("test_api_graph") }}')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
-            } else {
-                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
-            }
-        })
-        .catch(error => {
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
-        });
-}
-
-function testGroqApi() {
-    const resultDiv = document.getElementById('test-result-groq');
-    resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours... (peut prendre quelques secondes)</div>';
-
-    fetch('{{ url_for("test_api_groq") }}')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
-            } else {
-                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
-            }
-        })
-        .catch(error => {
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
-        });
-}
-
-function testNvidiaApi() {
-    const resultDiv = document.getElementById('test-result-nvidia');
-    resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours... (peut prendre quelques secondes)</div>';
-
-    fetch('{{ url_for("test_api_nvidia") }}')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                resultDiv.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
-            } else {
-                resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> ' + data.message + '</div>';
-            }
-        })
-        .catch(error => {
-            resultDiv.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Erreur de connexion: ' + error + '</div>';
-        });
-}
-
-function testOllamaApi() {
-    const resultDiv = document.getElementById('test-result-ollama');
-    resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '<div class="alert alert-info">Test en cours...</div>';
-
-    fetch('{{ url_for("test_api_ollama") }}')
         .then(response => response.json())
         .then(data => {
             if (data.success) {
