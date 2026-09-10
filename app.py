@@ -1794,6 +1794,7 @@ def graph_get_auth_methods(upn):
         out.append({
             'type': _AUTH_METHOD_LABELS.get(t, t.replace('#microsoft.graph.', '').replace('AuthenticationMethod', '')),
             'raw_type': t,
+            'is_real_mfa': t not in _NON_MFA_METHOD_TYPES,
             'detail': it.get('displayName') or it.get('phoneNumber') or '',
             'created': it.get('createdDateTime'),
         })
@@ -1857,6 +1858,39 @@ def graph_set_per_user_mfa_state(upn, state):
     'disabled'."""
     graph_request('PATCH', f'https://graph.microsoft.com/beta/users/{_graph_quote(upn)}/authentication/requirements',
                   {'perUserMfaState': state})
+
+
+def graph_get_per_user_mfa_state(upn):
+    """Etat MFA "par utilisateur" (mecanisme historique) pour ce compte precis — endpoint
+    beta, meme permission que graph_set_per_user_mfa_state (UserAuthenticationMethod.Read.All
+    suffit pour la lecture). Retourne 'disabled' | 'enabled' | 'enforced'."""
+    data = graph_request('GET', f'https://graph.microsoft.com/beta/users/{_graph_quote(upn)}/authentication/requirements')
+    return data.get('perUserMfaState', 'disabled')
+
+
+def graph_get_security_defaults_enabled():
+    """Vrai si les Defauts de securite (Security Defaults) sont actifs sur le tenant —
+    parametre global qui, s'il est active, exige le MFA pour quasi tous les utilisateurs
+    (independamment de l'Acces conditionnel ou du MFA par utilisateur). Necessite
+    Policy.Read.All."""
+    data = graph_request('GET', '/policies/identitySecurityDefaultsEnforcementPolicy')
+    return bool(data.get('isEnabled'))
+
+
+def graph_get_conditional_access_mfa_policies():
+    """Liste les politiques d'Acces conditionnel ACTIVES qui exigent le MFA (controle
+    integre 'mfa') — a titre informatif : determiner si une politique donnee s'applique
+    reellement a UN compte precis demanderait d'evaluer ses inclusions/exclusions
+    (utilisateurs, groupes, applications...), non fait ici. Necessite Policy.Read.All."""
+    items = graph_get_all('/identity/conditionalAccess/policies', timeout=20, max_pages=5)
+    out = []
+    for p in items:
+        if p.get('state') != 'enabled':
+            continue
+        controls = ((p.get('grantControls') or {}).get('builtInControls')) or []
+        if 'mfa' in controls:
+            out.append({'displayName': p.get('displayName', ''), 'id': p.get('id', '')})
+    return out
 
 
 def sync_monitoring_pattern(pattern_row):
@@ -4919,6 +4953,12 @@ def account_firstaid(upn):
 
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     account, auth_methods, error, auth_methods_error = None, [], None, None
+    has_real_mfa = False
+    mfa_governance = {
+        'security_defaults': None, 'security_defaults_error': None,
+        'ca_policies': None, 'ca_policies_error': None,
+        'per_user_state': None, 'per_user_state_error': None,
+    }
     if graph_configured:
         try:
             account = graph_get_account_overview(upn)
@@ -4929,12 +4969,31 @@ def account_firstaid(upn):
         if account and account.get('id'):
             try:
                 auth_methods = graph_get_auth_methods(upn)
-                if not _has_real_mfa(auth_methods):
+                has_real_mfa = _has_real_mfa(auth_methods)
+                if not has_real_mfa:
                     registered = ', '.join(m['type'] for m in auth_methods) or 'aucune'
                     add_log('WARNING', 'PREMIERS_SECOURS', f'Aucun MFA réel enregistré : {upn}',
                             f'Méthodes enregistrées : {registered}', recipient=upn, username=session.get('username'))
             except Exception as e:
                 auth_methods_error = str(e)
+
+            # D'ou vient l'obligation de MFA (ou son absence) pour ce compte : trois
+            # mecanismes independants et cumulables cote Entra ID. Chacun est recupere
+            # separement (Policy.Read.All requis pour les deux premiers, distincte des
+            # permissions deja utilisees) : l'echec de l'un n'empeche pas d'afficher les
+            # autres — voir mfa_governance dans le template.
+            try:
+                mfa_governance['security_defaults'] = graph_get_security_defaults_enabled()
+            except Exception as e:
+                mfa_governance['security_defaults_error'] = str(e)
+            try:
+                mfa_governance['ca_policies'] = graph_get_conditional_access_mfa_policies()
+            except Exception as e:
+                mfa_governance['ca_policies_error'] = str(e)
+            try:
+                mfa_governance['per_user_state'] = graph_get_per_user_mfa_state(upn)
+            except Exception as e:
+                mfa_governance['per_user_state_error'] = str(e)
     else:
         error = "Configuration Microsoft Graph incomplète — voir Configuration."
 
@@ -4949,8 +5008,9 @@ def account_firstaid(upn):
 
     return render_template('account_firstaid.html', upn=upn, account=account, error=error,
                             auth_methods=auth_methods, auth_methods_error=auth_methods_error,
-                            boite=boite, monitored=monitored, recent_actions=recent_actions,
-                            graph_configured=graph_configured)
+                            has_real_mfa=has_real_mfa, mfa_governance=mfa_governance,
+                            boite=boite, monitored=monitored,
+                            recent_actions=recent_actions, graph_configured=graph_configured)
 
 
 @app.route('/admin/compte/<upn>/disable', methods=['POST'])

@@ -84,7 +84,16 @@
 
         <div class="col-lg-5">
             <div class="card h-100">
-                <div class="card-header"><i class="bi bi-shield-check"></i> Méthodes MFA enregistrées</div>
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-shield-check"></i> Méthodes MFA enregistrées</span>
+                    {% if not auth_methods_error %}
+                        {% if has_real_mfa %}
+                        <span class="badge bg-success"><i class="bi bi-check-circle-fill"></i> MFA actif</span>
+                        {% else %}
+                        <span class="badge bg-danger"><i class="bi bi-x-circle-fill"></i> Aucun MFA réel</span>
+                        {% endif %}
+                    {% endif %}
+                </div>
                 <div class="card-body">
                     {% if auth_methods_error %}
                     <div class="alert alert-secondary small mb-0">
@@ -99,8 +108,9 @@
                         {% for m in auth_methods %}
                         <li class="list-group-item d-flex justify-content-between align-items-start px-0">
                             <div>
+                                {% if m.is_real_mfa %}<i class="bi bi-check-circle-fill text-success" title="Facteur MFA valable"></i>{% else %}<i class="bi bi-dash-circle text-muted" title="Ne compte pas comme MFA"></i>{% endif %}
                                 <strong>{{ m.type }}</strong>
-                                {% if m.detail %}<br><small class="text-muted">{{ m.detail }}</small>{% endif %}
+                                {% if m.detail %}<br><small class="text-muted ms-4">{{ m.detail }}</small>{% endif %}
                             </div>
                             {% if m.created %}<small class="text-muted text-nowrap">{{ m.created|paris }}</small>{% endif %}
                         </li>
@@ -116,6 +126,65 @@
                     {% endif %}
                 </div>
             </div>
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-diagram-3"></i> Comment le MFA est géré</div>
+        <div class="card-body">
+            <p class="text-muted small">
+                Trois mécanismes indépendants (et cumulables) peuvent exiger le MFA. Le bouton « Forcer le MFA (legacy) »
+                ci-dessus n'agit que sur le troisième — sans effet si le MFA vient déjà des deux premiers.
+            </p>
+            <table class="table table-sm mb-0">
+                <tbody>
+                    <tr>
+                        <th class="text-muted" style="width:45%;">Défauts de sécurité (tenant entier)</th>
+                        <td>
+                            {% if mfa_governance.security_defaults_error %}
+                            <span class="text-muted"><i class="bi bi-question-circle"></i> Inconnu — {{ mfa_governance.security_defaults_error|friendly_graph_error or mfa_governance.security_defaults_error }}</span>
+                            {% elif mfa_governance.security_defaults %}
+                            <span class="badge bg-success">Activés</span> <small class="text-muted">MFA exigé pour la quasi-totalité des comptes du tenant</small>
+                            {% else %}
+                            <span class="badge bg-secondary">Désactivés</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th class="text-muted">Politiques d'Accès conditionnel actives exigeant le MFA</th>
+                        <td>
+                            {% if mfa_governance.ca_policies_error %}
+                            <span class="text-muted"><i class="bi bi-question-circle"></i> Inconnu — {{ mfa_governance.ca_policies_error|friendly_graph_error or mfa_governance.ca_policies_error }}</span>
+                            {% elif mfa_governance.ca_policies %}
+                            <span class="badge bg-success">{{ mfa_governance.ca_policies|length }} politique(s)</span>
+                            <ul class="mb-0 small mt-1">
+                                {% for p in mfa_governance.ca_policies %}<li>{{ p.displayName }}</li>{% endfor %}
+                            </ul>
+                            <small class="text-muted">Peut ne pas s'appliquer à ce compte précis selon ses inclusions/exclusions (utilisateurs, groupes...).</small>
+                            {% else %}
+                            <span class="badge bg-secondary">Aucune</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th class="text-muted">MFA par utilisateur (legacy) sur ce compte</th>
+                        <td>
+                            {% if mfa_governance.per_user_state_error %}
+                            <span class="text-muted"><i class="bi bi-question-circle"></i> Inconnu — {{ mfa_governance.per_user_state_error|friendly_graph_error or mfa_governance.per_user_state_error }}</span>
+                            {% elif mfa_governance.per_user_state in ('enabled', 'enforced') %}
+                            <span class="badge bg-success">{{ mfa_governance.per_user_state }}</span>
+                            {% else %}
+                            <span class="badge bg-secondary">disabled</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            {% if not mfa_governance.security_defaults and not mfa_governance.ca_policies and mfa_governance.per_user_state not in ('enabled', 'enforced') and not mfa_governance.security_defaults_error and not mfa_governance.ca_policies_error and not mfa_governance.per_user_state_error %}
+            <div class="alert alert-danger small mb-0 mt-3">
+                <i class="bi bi-exclamation-triangle-fill"></i> Aucun des trois mécanismes ne semble exiger le MFA pour ce compte — cohérent avec l'absence de MFA réel enregistré ci-dessus.
+            </div>
+            {% endif %}
         </div>
     </div>
 

@@ -119,6 +119,7 @@
                                 <li><code>User.ReadWrite.All</code> — actions d'urgence du menu <strong>Premiers secours</strong> (désactivation de compte, révocation des sessions, réinitialisation du mot de passe)</li>
                                 <li><code>UserAuthenticationMethod.Read.All</code> — consultation des méthodes MFA enregistrées sur la fiche "Premiers secours" (optionnel)</li>
                                 <li><code>UserAuthenticationMethod.ReadWrite.All</code> — action "Forcer le MFA (legacy)" sur la fiche "Premiers secours" (optionnel, sans effet si le MFA est géré par l'Accès conditionnel)</li>
+                                <li><code>Policy.Read.All</code> — affiche, sur la fiche "Premiers secours", comment le MFA est géré pour le compte (Défauts de sécurité activés ou non, politiques d'Accès conditionnel actives exigeant le MFA) — optionnel, sans cette permission ces deux lignes affichent "Inconnu"</li>
                             </ul>
                         </li>
                         <li>Cliquez sur <strong>Accorder un consentement admin</strong> pour le locataire (indispensable — sans ça les appels échouent en 403).</li>
