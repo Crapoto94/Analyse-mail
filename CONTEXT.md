@@ -1,5 +1,41 @@
 # CONTEXT - Analyse de Compromission
 
+## État de la session - 2026-09-10
+
+### Ajout : scan des règles de messagerie de tout le tenant + menu "Premiers secours"
+- **Règles de messagerie (tenant)** — `/monitoring/rules` : scanne (à la demande ou périodiquement,
+  fréquence réglable) les règles de messagerie de TOUS les comptes actifs du tenant (pas seulement
+  les boîtes déjà suivies), via `graph_list_tenant_mailbox_users` + un appel Graph par compte
+  (`/users/{upn}/mailFolders/inbox/messageRules`, pas d'endpoint tenant-wide pour les règles,
+  contrairement aux connexions). Moteur : `scan_tenant_mailbox_rules` (tourne toujours dans un thread
+  dédié, jamais dans la boucle du planificateur — peut prendre plusieurs minutes), tables
+  `tenant_rule_scans` (historique des passages, 10 derniers conservés) et `tenant_mailbox_rules`
+  (règles du dernier scan). Réutilise la détection de règle suspecte déjà existante
+  (`_map_graph_rule` : transfert/redirection sans condition, suppression définitive, suppression de
+  courrier lié à la sécurité). Alerte Teams (`send_teams_rule_alert`) sur toute règle suspecte
+  NOUVELLE par rapport au scan précédent. Toggle + fréquence dans `/monitoring/rules/settings`
+  (config `tenant_rules_scan_enabled` / `tenant_rules_scan_interval_minutes`), branché dans
+  `monitoring_scheduler_tick` (déjà existant, tick 60s). Page avec barre de progression en direct
+  (polling `/monitoring/rules/status`) pendant un scan en cours.
+- **Premiers secours** — `/admin/compte` (recherche) puis `/admin/compte/<upn>` : fiche de compte
+  Microsoft Entra ID (statut actif/désactivé, dernière connexion, licences, méthodes MFA
+  enregistrées via `graph_get_auth_methods`) + actions d'urgence : désactiver/réactiver le compte,
+  révoquer toutes les sessions/jetons (`revokeSignInSessions`), réinitialiser le mot de passe (mot
+  de passe temporaire généré, affiché une seule fois), forcer le MFA par utilisateur (mécanisme
+  legacy, endpoint bêta `/authentication/requirements`, **sans effet si le tenant utilise l'Accès
+  conditionnel** — documenté comme tel dans l'UI). Toute action est journalisée (`logs`, catégorie
+  `PREMIERS_SECOURS`, `recipient`=UPN) et listée sur la fiche du compte. Accessible depuis la nav
+  admin, depuis `/monitoring`, et depuis chaque fiche de boîte (`view_boite.html`).
+- **Nouvelles permissions Graph nécessaires** (documentées dans `/config`) : `User.ReadWrite.All`
+  (actions d'urgence — approuvé par l'utilisateur pour ajout côté App Registration Entra ID),
+  `UserAuthenticationMethod.Read.All` / `.ReadWrite.All` (optionnelles, MFA — dégradation propre si
+  absentes : message d'erreur Graph affiché plutôt que crash).
+- Nouveau helper générique `graph_request` (PATCH/POST/DELETE, une seule requête, pas de pagination)
+  à côté de `graph_get_all` (lecture, paginée) — toutes les actions d'écriture Graph passent par lui.
+- Testé : suite pytest existante (40 tests) toujours verte : `python -m pytest -q` ; smoke-test manuel
+  des nouvelles routes sur DB temporaire (voir historique de session) — pages s'affichent, garde-fous
+  "config Graph incomplète" fonctionnent (pas de crash, message clair).
+
 ## État de la session - 2026-09-09
 
 ### Ajout : import et analyse AuditLogs / InteractiveSignIns (Microsoft Entra ID)

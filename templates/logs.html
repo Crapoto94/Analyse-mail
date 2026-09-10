@@ -45,6 +45,7 @@
                 <th>Message</th>
                 <th>Détails</th>
                 <th>Destinataire</th>
+                <th>Compte</th>
             </tr>
         </thead>
         <tbody>
@@ -56,9 +57,10 @@
                 <td>{{ log.message }}</td>
                 <td><small class="text-muted">{{ log.details[:150] if log.details else '' }}{% if log.details and log.details|length > 150 %}...{% endif %}</small></td>
                 <td><small>{{ log.recipient or '' }}</small></td>
+                <td><small>{% if log.username %}<span class="badge bg-secondary"><i class="bi bi-person"></i> {{ log.username }}</span>{% endif %}</small></td>
             </tr>
             {% else %}
-            <tr><td colspan="6" class="text-center text-muted">Aucun log</td></tr>
+            <tr><td colspan="7" class="text-center text-muted">Aucun log</td></tr>
             {% endfor %}
         </tbody>
     </table>

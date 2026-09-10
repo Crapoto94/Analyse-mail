@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+{% block title %}Règles de messagerie (tenant){% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-envelope-arrow-up"></i> Règles de messagerie — tout le tenant</h1>
+    <div class="d-flex gap-2">
+        <button type="button" id="scan-now-btn" class="btn btn-outline-primary" {% if not graph_configured %}disabled{% endif %} onclick="startTenantRulesScan()">
+            <i class="bi bi-arrow-clockwise"></i> Scanner maintenant
+        </button>
+        <button type="button" class="btn btn-outline-secondary" data-bs-toggle="collapse" data-bs-target="#rules-settings">
+            <i class="bi bi-gear"></i> Paramètres
+        </button>
+        <a href="{{ url_for('view_monitoring') }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Surveillance
+        </a>
+    </div>
+</div>
+
+{% if not graph_configured %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i> Configuration Microsoft Graph incomplète — ce scan ne fonctionnera pas
+    tant qu'elle n'est pas renseignée dans <a href="{{ url_for('config') }}">Configuration</a>.
+</div>
+{% endif %}
+
+<div class="collapse mb-4" id="rules-settings">
+    <div class="card">
+        <div class="card-header">Paramètres</div>
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('update_tenant_rules_settings') }}" class="row g-3 align-items-end">
+                <div class="col-md-4">
+                    <div class="form-check form-switch mt-4">
+                        <input class="form-check-input" type="checkbox" role="switch" id="rules-enabled" name="enabled" {% if scan_enabled %}checked{% endif %}>
+                        <label class="form-check-label" for="rules-enabled">Scan périodique automatique</label>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label small mb-1">Fréquence (minutes)</label>
+                    <input type="number" class="form-control" name="interval_minutes" value="{{ scan_interval }}" min="30" max="10080">
+                    <div class="form-text">6h par défaut (360 min) — un scan complet interroge chaque compte individuellement.</div>
+                </div>
+                <div class="col-md-4 d-grid">
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> Enregistrer</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div class="alert alert-secondary small">
+    <i class="bi bi-info-circle"></i> Une règle est marquée <span class="badge bg-danger">Suspecte</span> si elle transfère ou redirige
+    <strong>sans aucune condition</strong> vers une adresse (technique classique d'exfiltration après compromission), supprime
+    définitivement du courrier, ou supprime automatiquement du courrier lié à la sécurité (alertes, notifications MFA...).
+    Un transfert limité par des conditions (expéditeur, sujet...) est généralement une redirection légitime et n'est pas signalé.
+    Vérifiez systématiquement chaque règle suspecte.
+</div>
+
+<div id="scan-progress-wrap" class="card mb-4" style="display:none;">
+    <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+            <span><i class="bi bi-hourglass-split"></i> Scan en cours…</span>
+            <span id="scan-progress-text" class="text-muted small"></span>
+        </div>
+        <div class="progress" style="height:10px;">
+            <div id="scan-progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%;"></div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ latest_scan.scanned_accounts if latest_scan else '-' }}</h3><small class="text-muted">Comptes scannés</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card"><div class="card-body text-center">
+            <h3>{{ latest_scan.accounts_with_rules if latest_scan else '-' }}</h3><small class="text-muted">Comptes avec règle(s)</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card" style="border-left-color:#dc3545;"><div class="card-body text-center">
+            <h3>{{ latest_scan.suspicious_count if latest_scan else '-' }}</h3><small class="text-muted">Règles suspectes</small>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card" style="border-left-color:#6c757d;"><div class="card-body text-center">
+            <h3>{{ rules|length }}</h3><small class="text-muted">Règles au total</small>
+        </div></div>
+    </div>
+</div>
+
+{% if latest_scan %}
+<p class="text-muted small">
+    Dernier scan {{ 'terminé' if latest_scan.status == 'done' else 'en erreur' }} : <strong>{{ latest_scan.finished_at|paris if latest_scan.finished_at else latest_scan.started_at|paris }}</strong>,
+    déclenché par <strong>{{ latest_scan.triggered_by or '—' }}</strong>
+    {% if latest_scan.error_count %} — <span class="text-warning">{{ latest_scan.error_count }} erreur(s) de scan par compte</span>{% endif %}
+    {% set l_err = latest_scan.last_error|friendly_graph_error %}
+    {% if l_err %} — <span class="text-danger" title="{{ latest_scan.last_error }}"><i class="bi bi-exclamation-circle"></i> {{ l_err }}</span>{% endif %}
+</p>
+{% elif not running_scan %}
+<div class="alert alert-info">Aucun scan effectué pour le moment. Cliquez sur <em>Scanner maintenant</em>, ou activez le scan périodique ci-dessus.</div>
+{% endif %}
+
+{% if rules %}
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        Règles ({{ rules|length }})
+        <div class="d-flex gap-2 align-items-center">
+            <select class="form-select form-select-sm" id="filter-suspicious" style="width:auto;" onchange="filterRules()">
+                <option value="">Toutes</option>
+                <option value="true">Suspectes uniquement</option>
+            </select>
+            <div class="input-group input-group-sm" style="width:280px;">
+                <input type="text" id="filter-rules" class="form-control" placeholder="Filtrer par compte, nom, transfert..." onkeyup="filterRules()">
+                <span class="input-group-text" id="rules-match-count">0</span>
+            </div>
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:650px; overflow-y:auto;">
+            <table class="table table-hover table-sm" id="rules-table">
+                <thead>
+                    <tr><th>Compte</th><th>Nom</th><th>Active</th><th>Conditions</th><th>Actions</th><th>Transfert vers</th></tr>
+                </thead>
+                <tbody>
+                    {% for r in rules %}
+                    <tr class="{% if r.is_suspicious == 'true' %}table-danger{% endif %}" data-suspicious="{{ r.is_suspicious }}">
+                        <td>
+                            <small>{{ r.user_display_name or r.user_upn }}</small><br>
+                            <a href="{{ url_for('account_firstaid', upn=r.user_upn) }}" class="small text-decoration-none">
+                                <i class="bi bi-life-preserver"></i> {{ r.user_upn }}
+                            </a>
+                        </td>
+                        <td>
+                            <small>{{ r.display_name }}</small>
+                            {% if r.is_suspicious == 'true' %}<span class="badge bg-danger">Suspecte</span>{% endif %}
+                        </td>
+                        <td>{% if r.is_enabled == 'true' %}<span class="badge bg-success">Oui</span>{% else %}<span class="badge bg-secondary">Non</span>{% endif %}</td>
+                        <td><small>{{ r.conditions_summary or '-' }}</small></td>
+                        <td><small>{{ r.actions_summary or '-' }}</small></td>
+                        <td><small>{{ r.forwards_to or '-' }}</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<script>
+function filterRules() {
+    var filter = document.getElementById('filter-rules').value.toLowerCase().trim();
+    var suspiciousOnly = document.getElementById('filter-suspicious').value;
+    var rows = document.querySelectorAll('#rules-table tbody tr');
+    var matchCount = 0;
+    rows.forEach(function(row) {
+        var text = row.textContent.toLowerCase();
+        var suspOk = !suspiciousOnly || row.getAttribute('data-suspicious') === suspiciousOnly;
+        var textOk = filter === '' || text.indexOf(filter) > -1;
+        if (suspOk && textOk) { row.style.display = ''; matchCount++; } else { row.style.display = 'none'; }
+    });
+    var counter = document.getElementById('rules-match-count');
+    if (counter) counter.textContent = matchCount + ' / ' + rows.length;
+}
+filterRules();
+
+var scanPollTimer = null;
+
+function startTenantRulesScan() {
+    var btn = document.getElementById('scan-now-btn');
+    btn.disabled = true;
+    fetch('{{ url_for("scan_tenant_rules_now") }}', { method: 'POST' })
+        .then(function(r) { return r.json().then(function(data) { return {ok: r.ok, data: data}; }); })
+        .then(function(res) {
+            if (!res.ok || res.data.error) { throw new Error(res.data.error || 'Erreur au démarrage du scan'); }
+            document.getElementById('scan-progress-wrap').style.display = '';
+            pollScanStatus();
+        })
+        .catch(function(err) { alert(err.message || String(err)); btn.disabled = false; });
+}
+
+function pollScanStatus() {
+    fetch('{{ url_for("tenant_rules_scan_status") }}')
+        .then(function(r) { return r.json(); })
+        .then(function(status) {
+            if (status.status === 'running') {
+                document.getElementById('scan-progress-wrap').style.display = '';
+                var total = status.total_accounts || 0;
+                var scanned = status.scanned_accounts || 0;
+                var pct = total > 0 ? Math.round(scanned / total * 100) : 0;
+                document.getElementById('scan-progress-bar').style.width = pct + '%';
+                document.getElementById('scan-progress-text').textContent = total > 0
+                    ? (scanned + ' / ' + total + ' comptes')
+                    : 'Récupération de la liste des comptes du tenant…';
+                scanPollTimer = setTimeout(pollScanStatus, 2000);
+            } else {
+                document.getElementById('scan-progress-wrap').style.display = 'none';
+                var btn = document.getElementById('scan-now-btn');
+                if (btn) btn.disabled = false;
+                if (status.status === 'done' || status.status === 'error') { window.location.reload(); }
+            }
+        })
+        .catch(function() { scanPollTimer = setTimeout(pollScanStatus, 3000); });
+}
+
+{% if running_scan %}
+document.getElementById('scan-now-btn').disabled = true;
+document.getElementById('scan-progress-wrap').style.display = '';
+pollScanStatus();
+{% endif %}
+</script>
+{% endblock %}

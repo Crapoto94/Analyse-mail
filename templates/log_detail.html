@@ -27,6 +27,13 @@
             <p>{{ log.recipient }}</p>
         </div>
         {% endif %}
+
+        {% if log.username %}
+        <div class="mb-3">
+            <label class="form-label"><strong>Compte à l'origine de l'action :</strong></label>
+            <p><span class="badge bg-secondary"><i class="bi bi-person"></i> {{ log.username }}</span></p>
+        </div>
+        {% endif %}
         
         {% if log.boite_id %}
         <div class="mb-3">

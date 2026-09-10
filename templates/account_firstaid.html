@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}Premiers secours{% if upn %} - {{ upn }}{% endif %}{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1><i class="bi bi-life-preserver"></i> Premiers secours{% if upn %} — {{ upn }}{% endif %}</h1>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('view_monitoring') }}" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Surveillance
+        </a>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <form method="GET" action="{{ url_for('account_firstaid_search') }}" class="row g-2 align-items-end">
+            <div class="col-md-9">
+                <label class="form-label small mb-1">Adresse email / UPN du compte</label>
+                <input type="email" class="form-control" name="q" placeholder="utilisateur@ivry94.fr" value="{{ upn or '' }}" required>
+            </div>
+            <div class="col-md-3 d-grid">
+                <button type="submit" class="btn btn-primary"><i class="bi bi-search"></i> Consulter</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% if not graph_configured %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i> Configuration Microsoft Graph incomplète — voir <a href="{{ url_for('config') }}">Configuration</a>.
+    Les actions d'urgence nécessitent en plus la permission d'application <code>User.ReadWrite.All</code>
+    (et <code>UserAuthenticationMethod.Read.All</code> / <code>.ReadWrite.All</code> pour la partie MFA),
+    avec consentement admin.
+</div>
+{% endif %}
+
+{% if upn %}
+    {% if error %}
+    <div class="alert alert-danger"><i class="bi bi-exclamation-octagon"></i> {{ error|friendly_graph_error or error }}</div>
+    {% endif %}
+
+    {% if account and account.id %}
+    <div class="row mb-4">
+        <div class="col-lg-7">
+            <div class="card h-100">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-person-badge"></i> Identité</span>
+                    {% if account.accountEnabled %}
+                        <span class="badge bg-success">Compte actif</span>
+                    {% else %}
+                        <span class="badge bg-danger">Compte désactivé</span>
+                    {% endif %}
+                </div>
+                <div class="card-body">
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr><th class="text-muted" style="width:40%;">Nom</th><td>{{ account.displayName or '-' }}</td></tr>
+                            <tr><th class="text-muted">UPN</th><td>{{ account.userPrincipalName or '-' }}</td></tr>
+                            <tr><th class="text-muted">Email</th><td>{{ account.mail or '-' }}</td></tr>
+                            <tr><th class="text-muted">Poste / service</th><td>{{ account.jobTitle or '-' }}{% if account.department %} — {{ account.department }}{% endif %}</td></tr>
+                            <tr><th class="text-muted">Site</th><td>{{ account.officeLocation or '-' }}</td></tr>
+                            <tr><th class="text-muted">Créé le</th><td>{{ account.createdDateTime|paris if account.createdDateTime else '-' }}</td></tr>
+                            <tr>
+                                <th class="text-muted">Dernière connexion</th>
+                                <td>
+                                    {% set sia = account.signInActivity %}
+                                    {% if sia and sia.lastSignInDateTime %}{{ sia.lastSignInDateTime|paris }}
+                                    {% elif sia and sia.lastNonInteractiveSignInDateTime %}{{ sia.lastNonInteractiveSignInDateTime|paris }} <small class="text-muted">(non interactive)</small>
+                                    {% else %}<span class="text-muted">Inconnue</span>{% endif %}
+                                </td>
+                            </tr>
+                            <tr><th class="text-muted">Licences</th><td>{{ account.license_names|join(', ') if account.license_names else '-' }}</td></tr>
+                            <tr><th class="text-muted">Synchronisé (AD local)</th><td>{{ 'Oui' if account.onPremisesSyncEnabled else 'Non' }}</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-5">
+            <div class="card h-100">
+                <div class="card-header"><i class="bi bi-shield-check"></i> Méthodes MFA enregistrées</div>
+                <div class="card-body">
+                    {% if auth_methods_error %}
+                    <div class="alert alert-secondary small mb-0">
+                        <i class="bi bi-info-circle"></i> {{ auth_methods_error|friendly_graph_error or auth_methods_error }}
+                    </div>
+                    {% elif auth_methods %}
+                    <ul class="list-group list-group-flush">
+                        {% for m in auth_methods %}
+                        <li class="list-group-item d-flex justify-content-between align-items-start px-0">
+                            <div>
+                                <strong>{{ m.type }}</strong>
+                                {% if m.detail %}<br><small class="text-muted">{{ m.detail }}</small>{% endif %}
+                            </div>
+                            {% if m.created %}<small class="text-muted text-nowrap">{{ m.created|paris }}</small>{% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    <p class="text-muted small mb-0 mt-2">
+                        <i class="bi bi-info-circle"></i> Vérifiez la date d'enregistrement de chaque méthode : une méthode
+                        (téléphone, Authenticator...) ajoutée récemment sans explication est un signe classique de persistance
+                        après compromission.
+                    </p>
+                    {% else %}
+                    <p class="text-muted mb-0">Aucune méthode retournée.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card mb-4 border-danger">
+        <div class="card-header bg-danger text-white"><i class="bi bi-exclamation-triangle-fill"></i> Actions d'urgence</div>
+        <div class="card-body">
+            <p class="text-muted small">Chaque action est journalisée (voir <a href="{{ url_for('view_logs') }}?category=PREMIERS_SECOURS">Logs</a>) et effective immédiatement sur le compte réel — vérifiez l'adresse ci-dessus avant de cliquer.</p>
+            <div class="d-flex flex-wrap gap-2">
+                {% if account.accountEnabled %}
+                <form method="POST" action="{{ url_for('account_firstaid_disable', upn=upn) }}"
+                      onsubmit="return confirm('Désactiver le compte {{ upn }} ? Toute nouvelle connexion sera bloquée immédiatement.')">
+                    <button type="submit" class="btn btn-danger"><i class="bi bi-person-x"></i> Désactiver le compte</button>
+                </form>
+                {% else %}
+                <form method="POST" action="{{ url_for('account_firstaid_enable', upn=upn) }}"
+                      onsubmit="return confirm('Réactiver le compte {{ upn }} ?')">
+                    <button type="submit" class="btn btn-outline-success"><i class="bi bi-person-check"></i> Réactiver le compte</button>
+                </form>
+                {% endif %}
+
+                <form method="POST" action="{{ url_for('account_firstaid_revoke', upn=upn) }}"
+                      onsubmit="return confirm('Révoquer TOUTES les sessions de {{ upn }} ? Déconnexion forcée immédiate de tous les appareils/applications (Outlook, mobile, navigateur...).')">
+                    <button type="submit" class="btn btn-warning"><i class="bi bi-shield-slash"></i> Révoquer toutes les sessions</button>
+                </form>
+
+                <button type="button" class="btn btn-outline-danger" data-bs-toggle="modal" data-bs-target="#resetPasswordModal">
+                    <i class="bi bi-key"></i> Réinitialiser le mot de passe
+                </button>
+
+                <form method="POST" action="{{ url_for('account_firstaid_require_mfa', upn=upn) }}"
+                      onsubmit="return confirm('Forcer le MFA par utilisateur (mécanisme historique) pour {{ upn }} ? Sans effet si votre tenant applique le MFA via l\'Accès conditionnel ou les Défauts de sécurité — voir la note ci-dessous.')">
+                    <button type="submit" class="btn btn-outline-secondary"><i class="bi bi-shield-lock"></i> Forcer le MFA (legacy)</button>
+                </form>
+            </div>
+            <p class="text-muted small mt-3 mb-0">
+                <i class="bi bi-info-circle"></i> « Forcer le MFA (legacy) » utilise le mécanisme <em>MFA par utilisateur</em> historique
+                (endpoint Graph bêta) : il n'a aucun effet si le MFA de ce compte est déjà géré par une politique d'Accès conditionnel
+                ou les Défauts de sécurité (cas le plus courant aujourd'hui) — dans ce cas, révoquer les sessions ci-dessus suffit à
+                imposer une nouvelle vérification MFA à la prochaine connexion.
+            </p>
+        </div>
+    </div>
+
+    <div class="modal fade" id="resetPasswordModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <form method="POST" action="{{ url_for('account_firstaid_reset_password', upn=upn) }}" id="reset-password-form"
+                  onsubmit="return confirm('Réinitialiser le mot de passe de {{ upn }} ? Le changement sera exigé à la prochaine connexion.')">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-key"></i> Réinitialiser le mot de passe — {{ upn }}</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="password_mode" id="pw-mode-random" value="random" checked
+                                   onchange="document.getElementById('pw-custom-wrap').style.display='none'; document.getElementById('pw-custom-input').required=false;">
+                            <label class="form-check-label" for="pw-mode-random">
+                                Générer un mot de passe temporaire aléatoire <span class="text-muted">(affiché une seule fois)</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="password_mode" id="pw-mode-custom" value="custom"
+                                   onchange="document.getElementById('pw-custom-wrap').style.display=''; document.getElementById('pw-custom-input').required=true;">
+                            <label class="form-check-label" for="pw-mode-custom">Saisir le mot de passe</label>
+                        </div>
+                        <div id="pw-custom-wrap" style="display:none;">
+                            <input type="password" class="form-control" id="pw-custom-input" name="password" minlength="8"
+                                   placeholder="Mot de passe (8 caractères minimum)" autocomplete="new-password">
+                            <div class="form-text">Doit respecter la politique de complexité de votre tenant (Microsoft Graph la fera respecter).</div>
+                        </div>
+                        <p class="text-muted small mb-0 mt-3">Dans tous les cas, le changement de mot de passe sera exigé à la prochaine connexion.</p>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Annuler</button>
+                        <button type="submit" class="btn btn-danger">Réinitialiser</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+    {% endif %}
+
+    {% if boite or monitored %}
+    <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-folder2-open"></i> Dans cette application</div>
+        <div class="card-body d-flex flex-wrap gap-2">
+            {% if boite %}
+            <a href="{{ url_for('view_boite', bid=boite.id) }}" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-envelope-exclamation"></i> Fiche d'investigation existante
+            </a>
+            {% endif %}
+            {% if monitored %}
+            <span class="btn btn-sm btn-outline-secondary disabled">
+                <i class="bi bi-eye"></i> Sous surveillance ({{ monitored.interval_minutes }} min{% if not monitored.is_active %}, en pause{% endif %})
+            </span>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if recent_actions %}
+    <div class="card">
+        <div class="card-header"><i class="bi bi-clock-history"></i> Dernières actions "premiers secours" sur ce compte</div>
+        <div class="card-body p-0">
+            <table class="table table-sm mb-0">
+                <tbody>
+                    {% for a in recent_actions %}
+                    <tr>
+                        <td class="text-nowrap"><small class="text-muted">{{ a.timestamp|paris }}</small></td>
+                        <td>{{ a.message }}</td>
+                        <td><small class="text-muted">{{ a.details or '' }}</small></td>
+                        <td class="text-nowrap"><span class="badge bg-secondary"><i class="bi bi-person"></i> {{ a.username or 'inconnu' }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+{% endif %}
+{% endblock %}

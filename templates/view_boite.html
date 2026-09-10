@@ -37,6 +37,11 @@
         <a href="{{ url_for('upload_csv', bid=boite.id) }}" class="btn btn-success">
             <i class="bi bi-cloud-upload"></i> Importer CSV
         </a>
+        {% if session.get('role') == 'admin' %}
+        <a href="{{ url_for('account_firstaid', upn=boite.user_email) }}" class="btn btn-outline-danger">
+            <i class="bi bi-life-preserver"></i> Premiers secours
+        </a>
+        {% endif %}
         <a href="{{ url_for('index') }}" class="btn btn-secondary">
             <i class="bi bi-arrow-left"></i> Retour
         </a>

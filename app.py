@@ -413,8 +413,17 @@ def init_db():
         details TEXT,
         boite_id INTEGER,
         recipient TEXT,
+        username TEXT,
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
+
+    # Migration : compte a l'origine de l'action journalisee (bases existantes ne l'ont pas
+    # encore) — renseigne explicitement par les actions "Premiers secours" (voir add_log),
+    # laisse vide pour les entrees automatiques du planificateur (pas d'acteur humain).
+    try:
+        c.execute('ALTER TABLE logs ADD COLUMN username TEXT')
+    except Exception:
+        pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS signin_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -521,6 +530,44 @@ def init_db():
         raw_json TEXT,
         FOREIGN KEY (boite_id) REFERENCES boites_compromises(id)
     )''')
+
+    # Scan periodique (ou a la demande) des regles de messagerie de TOUTES les boites du
+    # tenant (pas seulement les boites deja suivies/investiguees) — contrairement a
+    # mailbox_rules (une boite precise, liee a une fiche d'incident ou a la surveillance),
+    # ce scan interroge l'annuaire complet via Microsoft Graph. tenant_rule_scans garde un
+    # historique limite des passages (voir TENANT_RULES_SCAN_RETENTION), tenant_mailbox_rules
+    # les regles trouvees a chaque passage — voir scan_tenant_mailbox_rules et /monitoring/rules.
+    c.execute('''CREATE TABLE IF NOT EXISTS tenant_rule_scans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        triggered_by TEXT,
+        total_accounts INTEGER,
+        scanned_accounts INTEGER DEFAULT 0,
+        accounts_with_rules INTEGER DEFAULT 0,
+        suspicious_count INTEGER DEFAULT 0,
+        error_count INTEGER DEFAULT 0,
+        last_error TEXT
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS tenant_mailbox_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id INTEGER NOT NULL,
+        user_upn TEXT,
+        user_display_name TEXT,
+        rule_id TEXT,
+        display_name TEXT,
+        is_enabled TEXT,
+        sequence INTEGER,
+        conditions_summary TEXT,
+        actions_summary TEXT,
+        forwards_to TEXT,
+        is_suspicious TEXT,
+        raw_json TEXT,
+        FOREIGN KEY (scan_id) REFERENCES tenant_rule_scans(id)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tenant_mailbox_rules_scan ON tenant_mailbox_rules(scan_id)')
 
     # Actions de remediation deja realisees par la DSI sur une boite (ex: mot de passe
     # reinitialise, MFA renforce...) : saisies manuellement, elles sont a la fois
@@ -1188,11 +1235,15 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-def add_log(level, category, message, details=None, boite_id=None, recipient=None):
+def add_log(level, category, message, details=None, boite_id=None, recipient=None, username=None):
+    """`username` : compte a l'origine de l'action (ex: administrateur ayant declenche une
+    action "Premiers secours"). Laisse a None pour les entrees automatiques (planificateur,
+    imports periodiques...) qui n'ont pas d'acteur humain."""
     try:
         conn = get_db()
-        conn.execute('INSERT INTO logs (level, category, message, details, boite_id, recipient) VALUES (?, ?, ?, ?, ?, ?)',
-                     (level, category, message, details, boite_id, recipient))
+        conn.execute('''INSERT INTO logs (level, category, message, details, boite_id, recipient, username)
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                     (level, category, message, details, boite_id, recipient, username))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1323,6 +1374,39 @@ def graph_get_all(path, params=None, timeout=30, max_pages=25, retries=1):
             print(f"graph_get_all: arrêt après {pages} pages (max_pages atteint) pour {path}")
             break
     return results
+
+
+def _graph_quote(value):
+    import urllib.parse
+    return urllib.parse.quote(value or '')
+
+
+def graph_request(method, path, body=None, timeout=20):
+    """Effectue UNE requete d'ecriture (PATCH/POST/DELETE, sans pagination) sur Microsoft
+    Graph — a la difference de graph_get_all (lecture seule, paginee). Utilise pour les
+    actions d'urgence du menu "Premiers secours" (desactivation de compte, revocation de
+    sessions, reinitialisation de mot de passe...), qui necessitent la permission
+    d'application User.ReadWrite.All (voir /config)."""
+    import urllib.request
+    import urllib.error
+
+    token = get_graph_token()
+    url = path if path.startswith('http') else 'https://graph.microsoft.com/v1.0' + path
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        raise RuntimeError(f"Erreur Microsoft Graph (HTTP {e.code}) sur {method} {url} : {error_body}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(f"Microsoft Graph n'a pas répondu à temps sur {method} {url} : {e}")
 
 
 def _graph_status_text(status_obj):
@@ -1585,6 +1669,147 @@ def graph_list_users_by_prefix(prefix):
         '$top': '999',
     })
     return [it for it in items if it.get('userPrincipalName') and it.get('accountEnabled', True)]
+
+
+def graph_list_tenant_mailbox_users(max_pages=50):
+    """Liste TOUS les comptes membres actifs du tenant (candidats a posseder une boite
+    Exchange), utilise par le scan complet des regles de messagerie (voir
+    scan_tenant_mailbox_rules) — contrairement a graph_list_users_by_prefix, aucun filtre
+    sur l'UPN. Exclut les comptes invites (userType 'Guest') et desactives, qui n'ont
+    generalement pas de boite active a auditer. Necessite User.Read.All."""
+    items = graph_get_all('/users', params={
+        '$filter': "userType eq 'Member' and accountEnabled eq true",
+        '$select': 'id,userPrincipalName,displayName',
+        '$top': '999',
+    }, timeout=30, max_pages=max_pages)
+    return [it for it in items if it.get('userPrincipalName')]
+
+
+# ============================================================================
+# Menu "Premiers secours" (/admin/compte) : consultation rapide des infos cles d'un
+# compte et actions d'urgence en cas de compromission averee — desactivation du compte,
+# revocation de toutes les sessions/jetons, reinitialisation du mot de passe, consultation
+# des methodes MFA enregistrees. Necessite en plus la permission d'application
+# User.ReadWrite.All (ecriture), et UserAuthenticationMethod.Read.All (ReadWrite.All pour
+# l'action MFA) pour la partie methodes d'authentification — voir /config.
+# ============================================================================
+
+_sku_name_cache = {'map': None, 'expires_at': 0}
+
+
+def graph_get_sku_names():
+    """Traduit les identifiants de licence (skuId, un GUID) en nom lisible (skuPartNumber,
+    ex: 'ENTERPRISEPREMIUM') via /subscribedSkus — mis en cache 1h (comme le jeton Graph)
+    pour ne pas refaire cet appel a chaque consultation de compte."""
+    import time
+    now = time.time()
+    if _sku_name_cache['map'] is not None and _sku_name_cache['expires_at'] > now:
+        return _sku_name_cache['map']
+    try:
+        items = graph_get_all('/subscribedSkus', timeout=20, max_pages=3)
+        mapping = {it['skuId']: it.get('skuPartNumber', it['skuId']) for it in items if it.get('skuId')}
+    except Exception:
+        mapping = {}
+    _sku_name_cache['map'] = mapping
+    _sku_name_cache['expires_at'] = now + 3600
+    return mapping
+
+
+def graph_get_account_overview(upn):
+    """Recupere les informations cles d'un compte pour la page /admin/compte/<upn> :
+    identite, statut (actif/desactive), derniere connexion (signInActivity, necessite
+    AuditLog.Read.All, deja utilise ailleurs dans l'appli), licences affectees (traduites
+    en noms lisibles). Retourne {} si le compte n'existe pas dans l'annuaire."""
+    items = graph_get_all(f'/users/{_graph_quote(upn)}', params={
+        '$select': 'id,displayName,userPrincipalName,mail,accountEnabled,createdDateTime,jobTitle,'
+                    'department,officeLocation,onPremisesSyncEnabled,userType,assignedLicenses,signInActivity',
+    }, timeout=20, max_pages=1)
+    data = dict(items[0]) if items else {}
+    if data.get('id'):
+        sku_names = graph_get_sku_names()
+        data['license_names'] = [sku_names.get(l.get('skuId'), l.get('skuId')) for l in (data.get('assignedLicenses') or [])]
+    return data
+
+
+_AUTH_METHOD_LABELS = {
+    '#microsoft.graph.passwordAuthenticationMethod': 'Mot de passe',
+    '#microsoft.graph.phoneAuthenticationMethod': 'Téléphone',
+    '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod': 'Microsoft Authenticator',
+    '#microsoft.graph.fido2AuthenticationMethod': 'Clé de sécurité FIDO2',
+    '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod': 'Windows Hello Entreprise',
+    '#microsoft.graph.softwareOathAuthenticationMethod': 'Application OTP logicielle',
+    '#microsoft.graph.temporaryAccessPassAuthenticationMethod': "Pass d'accès temporaire",
+    '#microsoft.graph.emailAuthenticationMethod': 'E-mail (récupération)',
+}
+
+
+def graph_get_auth_methods(upn):
+    """Liste les methodes d'authentification (MFA) enregistrees pour un compte —
+    permet de reperer une methode ajoutee par un attaquant apres compromission (nouveau
+    telephone, nouvelle app Authenticator...). Necessite UserAuthenticationMethod.Read.All
+    (permission distincte de celles deja utilisees par l'appli, voir /config)."""
+    items = graph_get_all(f'/users/{_graph_quote(upn)}/authentication/methods', timeout=20, max_pages=3)
+    out = []
+    for it in items:
+        t = it.get('@odata.type', '')
+        out.append({
+            'type': _AUTH_METHOD_LABELS.get(t, t.replace('#microsoft.graph.', '').replace('AuthenticationMethod', '')),
+            'detail': it.get('displayName') or it.get('phoneNumber') or '',
+            'created': it.get('createdDateTime'),
+        })
+    return out
+
+
+def graph_set_account_enabled(upn, enabled):
+    """Active/desactive un compte (bloque toute nouvelle connexion, immediat). Necessite
+    User.ReadWrite.All."""
+    graph_request('PATCH', f'/users/{_graph_quote(upn)}', {'accountEnabled': bool(enabled)})
+
+
+def graph_revoke_sessions(upn):
+    """Revoque TOUS les jetons d'acces/actualisation deja emis pour ce compte (deconnexion
+    forcee partout, y compris sessions mobiles/Outlook deja ouvertes) — action classique de
+    premiers secours en cas de compromission averee. Necessite User.ReadWrite.All."""
+    return graph_request('POST', f'/users/{_graph_quote(upn)}/revokeSignInSessions')
+
+
+def graph_reset_password(upn, password=None):
+    """Reinitialise le mot de passe et force son changement a la prochaine connexion.
+    Si `password` est fourni (saisi par l'administrateur), il est utilise tel quel — sinon
+    un mot de passe temporaire aleatoire est genere. Retourne (mot_de_passe, was_generated) ;
+    le mot de passe genere doit etre affiche UNE SEULE FOIS a l'administrateur (jamais
+    stocke) — celui saisi manuellement, deja connu de l'administrateur, n'a pas besoin
+    d'etre reaffiche. Necessite User.ReadWrite.All ; peut echouer avec 'Insufficient
+    privileges' si le compte cible a un role d'administration plus eleve que le role
+    assigne a cette application, ou avec un message de politique de mots de passe si le
+    mot de passe saisi ne respecte pas les exigences de complexite du tenant."""
+    was_generated = not password
+    if was_generated:
+        import secrets
+        import string
+        pool_upper, pool_lower, pool_digits, pool_symbols = string.ascii_uppercase, string.ascii_lowercase, string.digits, '!@#$%*?-_'
+        chars = [secrets.choice(pool_upper), secrets.choice(pool_lower), secrets.choice(pool_digits), secrets.choice(pool_symbols)]
+        all_pool = pool_upper + pool_lower + pool_digits + pool_symbols
+        chars += [secrets.choice(all_pool) for _ in range(10)]
+        secrets.SystemRandom().shuffle(chars)
+        temp_password = ''.join(chars)
+    else:
+        temp_password = password
+    graph_request('PATCH', f'/users/{_graph_quote(upn)}', {
+        'passwordProfile': {'forceChangePasswordNextSignIn': True, 'password': temp_password}
+    })
+    return temp_password, was_generated
+
+
+def graph_set_per_user_mfa_state(upn, state):
+    """Positionne l'etat MFA "par utilisateur" (mecanisme historique, endpoint beta) —
+    SANS EFFET si le tenant applique le MFA via l'Acces conditionnel ou les Defauts de
+    securite (les deux mecanismes modernes, largement majoritaires aujourd'hui) plutot que
+    le MFA par utilisateur : dans ce cas l'appel reussit mais ne change rien de concret.
+    Necessite UserAuthenticationMethod.ReadWrite.All. `state` : 'enabled' | 'enforced' |
+    'disabled'."""
+    graph_request('PATCH', f'https://graph.microsoft.com/beta/users/{_graph_quote(upn)}/authentication/requirements',
+                  {'perUserMfaState': state})
 
 
 def sync_monitoring_pattern(pattern_row):
@@ -4097,13 +4322,225 @@ def refresh_tenant_signins():
     return new_rows
 
 
+# ============================================================================
+# Scan des regles de messagerie de TOUTES les boites du tenant (/monitoring/rules) : a la
+# demande, ou periodiquement si active (voir get_tenant_rules_scan_enabled). Contrairement
+# aux connexions (refresh_tenant_signins, un seul appel Graph tenant-wide), il n'existe pas
+# d'endpoint tenant-wide pour les regles de messagerie : chaque compte doit etre interroge
+# individuellement (/users/{upn}/mailFolders/inbox/messageRules), ce qui peut prendre
+# plusieurs minutes sur un tenant de grande taille — execute donc toujours dans un thread
+# dedie (jamais dans la boucle du planificateur elle-meme), avec suivi de progression dans
+# tenant_rule_scans pour que /monitoring/rules puisse afficher une barre de progression.
+# ============================================================================
+
+TENANT_RULES_SCAN_INTERVAL_MINUTES_DEFAULT = 360  # 6h : un scan complet interroge chaque
+# compte individuellement, contrairement aux connexions — intervalle par defaut plus long
+# pour limiter la charge sur Microsoft Graph.
+TENANT_RULES_SCAN_RETENTION = 10  # nombre de scans (et leurs regles) conserves en base
+
+_tenant_rules_scan_lock = threading.Lock()
+_tenant_rules_scan_running = False
+
+
+def get_tenant_rules_scan_enabled():
+    return get_config('tenant_rules_scan_enabled', 'false') == 'true'
+
+
+def get_tenant_rules_scan_interval_minutes():
+    raw = get_config('tenant_rules_scan_interval_minutes', '').strip()
+    try:
+        value = int(raw)
+        if 30 <= value <= 10080:
+            return value
+    except ValueError:
+        pass
+    return TENANT_RULES_SCAN_INTERVAL_MINUTES_DEFAULT
+
+
+def _latest_suspicious_rule_keys():
+    """Cle (user_upn::rule_id) de chaque regle suspecte trouvee lors du dernier scan
+    tenant TERMINE — sert a reperer les regles NOUVELLEMENT suspectes d'un scan a l'autre
+    (voir scan_tenant_mailbox_rules) pour ne relever/alerter que les vraies nouveautes."""
+    conn = get_db()
+    prev = conn.execute("SELECT id FROM tenant_rule_scans WHERE status='done' ORDER BY id DESC LIMIT 1").fetchone()
+    if not prev:
+        conn.close()
+        return set()
+    rows = conn.execute(
+        "SELECT user_upn, rule_id FROM tenant_mailbox_rules WHERE scan_id=? AND is_suspicious='true'",
+        (prev['id'],)).fetchall()
+    conn.close()
+    return {f"{r['user_upn']}::{r['rule_id']}" for r in rows}
+
+
+def send_teams_rule_alert(new_suspicious):
+    """Poste une alerte Teams quand un scan tenant des regles de messagerie decouvre de
+    NOUVELLES regles suspectes (absentes du scan precedent) — reutilise le webhook deja
+    configure pour les alertes de compromission (cle 'teams_webhook_url', voir
+    send_teams_alert). `new_suspicious` : liste de tuples (upn, display_name, rule_dict)."""
+    import urllib.request
+
+    webhook_url = get_config('teams_webhook_url', '').strip()
+    if not webhook_url:
+        return False
+
+    lines = []
+    for upn, display_name, d in new_suspicious[:10]:
+        who = display_name or upn
+        detail = f"transfert vers {d['forwards_to']}" if d['forwards_to'] else (d['actions_summary'] or '')
+        lines.append(f"- **{who}** ({upn}) : « {d['display_name']} » — {detail}")
+    if len(new_suspicious) > 10:
+        lines.append(f"- (+{len(new_suspicious) - 10} autre(s))")
+
+    base = get_config('public_base_url', '').strip().rstrip('/')
+    try:
+        path = url_for('view_tenant_rules')
+        lien = (base + path) if base else path
+    except Exception:
+        lien = None
+
+    text = (f"**{len(new_suspicious)} nouvelle(s) règle(s) de messagerie suspecte(s) détectée(s) "
+            f"sur le tenant**\n\n" + '\n'.join(lines))
+    if lien:
+        text += f"\n\n[Voir le détail]({lien})"
+
+    payload = {
+        '@type': 'MessageCard',
+        '@context': 'http://schema.org/extensions',
+        'summary': f'{len(new_suspicious)} règle(s) de messagerie suspecte(s)',
+        'themeColor': 'D9534F',
+        'title': '🚨 Règle(s) de messagerie suspecte(s) détectée(s)',
+        'text': text,
+    }
+    try:
+        req = urllib.request.Request(
+            webhook_url, data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response.read()
+        add_log('WARNING', 'TEAMS', f"Alerte Teams envoyée ({len(new_suspicious)} nouvelle(s) règle(s) suspecte(s))")
+        return True
+    except Exception as e:
+        add_log('ERROR', 'TEAMS', "Échec de l'envoi de l'alerte Teams (règles suspectes)", str(e))
+        return False
+
+
+def scan_tenant_mailbox_rules(triggered_by='scheduler'):
+    """Parcourt TOUS les comptes actifs du tenant et recupere leurs regles de messagerie
+    (boite de reception) via Microsoft Graph, un compte a la fois. Remplace entierement
+    l'instantane precedent en creant un nouveau scan (tenant_rule_scans +
+    tenant_mailbox_rules) ; les scans au-dela de TENANT_RULES_SCAN_RETENTION sont purges.
+    Alerte Teams (send_teams_rule_alert) sur toute regle suspecte NOUVELLE par rapport au
+    scan precedent. Ne fait rien (retourne None) si un scan est deja en cours."""
+    global _tenant_rules_scan_running
+    with _tenant_rules_scan_lock:
+        if _tenant_rules_scan_running:
+            return None
+        _tenant_rules_scan_running = True
+
+    try:
+        now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        conn = get_db()
+        conn.execute("INSERT INTO tenant_rule_scans (started_at, status, triggered_by) VALUES (?, 'running', ?)",
+                     (now_iso, triggered_by))
+        conn.commit()
+        scan_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.close()
+
+        previous_suspicious = _latest_suspicious_rule_keys()
+
+        try:
+            users = graph_list_tenant_mailbox_users()
+            conn = get_db()
+            conn.execute('UPDATE tenant_rule_scans SET total_accounts=? WHERE id=?', (len(users), scan_id))
+            conn.commit()
+            conn.close()
+
+            scanned, with_rules, suspicious_count, error_count = 0, 0, 0, 0
+            new_suspicious = []
+            for u in users:
+                upn = u['userPrincipalName']
+                try:
+                    items = graph_get_all(f'/users/{_graph_quote(upn)}/mailFolders/inbox/messageRules',
+                                           timeout=20, max_pages=5, retries=0)
+                    if items:
+                        with_rules += 1
+                        conn = get_db()
+                        for item in items:
+                            d = _map_graph_rule(item)
+                            conn.execute('''INSERT INTO tenant_mailbox_rules
+                                (scan_id, user_upn, user_display_name, rule_id, display_name, is_enabled,
+                                 sequence, conditions_summary, actions_summary, forwards_to, is_suspicious, raw_json)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                                (scan_id, upn, u.get('displayName', ''), d['rule_id'], d['display_name'],
+                                 d['is_enabled'], d['sequence'], d['conditions_summary'], d['actions_summary'],
+                                 d['forwards_to'], d['is_suspicious'], json.dumps(item, ensure_ascii=False)))
+                            if d['is_suspicious'] == 'true':
+                                suspicious_count += 1
+                                key = f"{upn}::{d['rule_id']}"
+                                if key not in previous_suspicious:
+                                    new_suspicious.append((upn, u.get('displayName', ''), d))
+                        conn.commit()
+                        conn.close()
+                except Exception as e:
+                    if not _is_no_mailbox_error(e):
+                        error_count += 1
+                scanned += 1
+                if scanned % 10 == 0 or scanned == len(users):
+                    conn = get_db()
+                    conn.execute('UPDATE tenant_rule_scans SET scanned_accounts=? WHERE id=?', (scanned, scan_id))
+                    conn.commit()
+                    conn.close()
+
+            finished_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            conn = get_db()
+            conn.execute('''UPDATE tenant_rule_scans SET finished_at=?, status='done', scanned_accounts=?,
+                accounts_with_rules=?, suspicious_count=?, error_count=? WHERE id=?''',
+                (finished_iso, scanned, with_rules, suspicious_count, error_count, scan_id))
+            old_ids = [r['id'] for r in conn.execute(
+                'SELECT id FROM tenant_rule_scans ORDER BY id DESC LIMIT -1 OFFSET ?',
+                (TENANT_RULES_SCAN_RETENTION,)).fetchall()]
+            if old_ids:
+                placeholders = ','.join('?' * len(old_ids))
+                conn.execute(f'DELETE FROM tenant_mailbox_rules WHERE scan_id IN ({placeholders})', old_ids)
+                conn.execute(f'DELETE FROM tenant_rule_scans WHERE id IN ({placeholders})', old_ids)
+            conn.commit()
+            conn.close()
+
+            set_config('tenant_rules_scan_last_run_at', finished_iso)
+            add_log('WARNING' if suspicious_count else 'INFO', 'TENANT_RULES',
+                    f"Scan des règles de messagerie (tenant complet) : {scanned} compte(s), "
+                    f"{suspicious_count} règle(s) suspecte(s)",
+                    f"{with_rules} compte(s) avec au moins une règle, {error_count} erreur(s)")
+
+            if new_suspicious:
+                send_teams_rule_alert(new_suspicious)
+
+            return scan_id
+        except Exception as e:
+            conn = get_db()
+            conn.execute("UPDATE tenant_rule_scans SET status='error', last_error=?, finished_at=? WHERE id=?",
+                         (str(e), datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), scan_id))
+            conn.commit()
+            conn.close()
+            add_log('ERROR', 'TENANT_RULES', 'Échec du scan des règles de messagerie (tenant complet)', str(e))
+            return scan_id
+    finally:
+        with _tenant_rules_scan_lock:
+            _tenant_rules_scan_running = False
+
+
 def monitoring_scheduler_tick():
     """Un passage du planificateur :
     1. resynchronise les motifs de decouverte automatique actifs dont l'intervalle est
        ecoule (ex: 'adm-*') pour ajouter les nouvelles boites correspondantes ;
     2. scanne toutes les boites surveillees actives dont l'intervalle est ecoule ;
     3. rafraichit le flux de connexions tenant (voir /connexions) toutes les
-       get_tenant_signins_refresh_minutes() minutes.
+       get_tenant_signins_refresh_minutes() minutes ;
+    4. si active (voir get_tenant_rules_scan_enabled), lance un scan complet des regles
+       de messagerie de tout le tenant (voir /monitoring/rules) toutes les
+       get_tenant_rules_scan_interval_minutes() minutes — dans un thread dedie, ce scan
+       pouvant prendre plusieurs minutes (une requete Graph par compte).
     Ne fait rien si la configuration Microsoft Graph est incomplete."""
     if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
         return
@@ -4142,6 +4579,17 @@ def monitoring_scheduler_tick():
     for row in rows:
         if _monitoring_scan_due(row, now):
             run_monitoring_scan(row)
+
+    if get_tenant_rules_scan_enabled() and not _tenant_rules_scan_running:
+        last_rules_scan = get_config('tenant_rules_scan_last_run_at', '')
+        rules_due = True
+        if last_rules_scan:
+            last = _parse_iso(last_rules_scan)
+            if last:
+                rules_due = (now - last).total_seconds() / 60 >= get_tenant_rules_scan_interval_minutes()
+        if rules_due:
+            threading.Thread(target=scan_tenant_mailbox_rules, kwargs={'triggered_by': 'scheduler'},
+                              daemon=True, name='tenant-rules-scan').start()
 
 
 def monitoring_scheduler_loop(tick_seconds=60):
@@ -4249,6 +4697,205 @@ def refresh_tenant_signins_now():
     except Exception as e:
         flash(f"Échec du rafraîchissement : {e}")
     return redirect(url_for('view_tenant_signins'))
+
+
+@app.route('/monitoring/rules')
+@admin_required
+def view_tenant_rules():
+    """Regles de messagerie de TOUTES les boites du tenant (dernier scan termine — voir
+    scan_tenant_mailbox_rules), avec detection des regles dangereuses (transfert externe
+    sans condition, suppression automatique de courrier lie a la securite... — voir
+    _map_graph_rule). Le scan peut etre lance a la demande (/monitoring/rules/scan) ou
+    periodiquement (voir /monitoring/rules/settings)."""
+    conn = get_db()
+    latest_scan = conn.execute(
+        "SELECT * FROM tenant_rule_scans WHERE status IN ('done','error') ORDER BY id DESC LIMIT 1").fetchone()
+    running_scan = conn.execute(
+        "SELECT * FROM tenant_rule_scans WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
+    rules = []
+    if latest_scan:
+        rules = conn.execute(
+            'SELECT * FROM tenant_mailbox_rules WHERE scan_id=? ORDER BY is_suspicious DESC, user_upn ASC',
+            (latest_scan['id'],)).fetchall()
+    conn.close()
+    graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+    return render_template('tenant_rules.html', rules=rules, latest_scan=latest_scan, running_scan=running_scan,
+                            graph_configured=graph_configured,
+                            scan_enabled=get_tenant_rules_scan_enabled(),
+                            scan_interval=get_tenant_rules_scan_interval_minutes())
+
+
+@app.route('/monitoring/rules/scan', methods=['POST'])
+@admin_required
+def scan_tenant_rules_now():
+    if not (get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')):
+        return jsonify({'error': 'Configuration Microsoft Graph incomplète — voir Configuration'}), 400
+    if _tenant_rules_scan_running:
+        return jsonify({'error': 'Un scan est déjà en cours'}), 409
+    threading.Thread(target=scan_tenant_mailbox_rules, kwargs={'triggered_by': session.get('username', 'admin')},
+                      daemon=True, name='tenant-rules-scan-manual').start()
+    return jsonify({'started': True})
+
+
+@app.route('/monitoring/rules/status')
+@admin_required
+def tenant_rules_scan_status():
+    """Etat du dernier scan (en cours ou termine), interroge en polling par la page
+    /monitoring/rules pendant un scan pour afficher une barre de progression."""
+    conn = get_db()
+    row = conn.execute('SELECT * FROM tenant_rule_scans ORDER BY id DESC LIMIT 1').fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'status': 'none'})
+    return jsonify({
+        'status': row['status'],
+        'total_accounts': row['total_accounts'],
+        'scanned_accounts': row['scanned_accounts'],
+        'suspicious_count': row['suspicious_count'],
+        'started_at': row['started_at'],
+        'finished_at': row['finished_at'],
+        'last_error': row['last_error'],
+    })
+
+
+@app.route('/monitoring/rules/settings', methods=['POST'])
+@admin_required
+def update_tenant_rules_settings():
+    set_config('tenant_rules_scan_enabled', 'true' if request.form.get('enabled') == 'on' else 'false')
+    try:
+        interval = int(request.form.get('interval_minutes', str(TENANT_RULES_SCAN_INTERVAL_MINUTES_DEFAULT)))
+        if 30 <= interval <= 10080:
+            set_config('tenant_rules_scan_interval_minutes', str(interval))
+    except ValueError:
+        pass
+    flash('Paramètres enregistrés')
+    return redirect(url_for('view_tenant_rules'))
+
+
+@app.route('/admin/compte', methods=['GET'])
+@admin_required
+def account_firstaid_search():
+    """Formulaire de recherche du menu "Premiers secours" — saisie de l'UPN/email d'un
+    compte pour acceder directement a sa fiche (/admin/compte/<upn>)."""
+    q = request.args.get('q', '').strip()
+    if q:
+        return redirect(url_for('account_firstaid', upn=q))
+    return render_template('account_firstaid.html', upn=None, graph_configured=bool(
+        get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', '')))
+
+
+@app.route('/admin/compte/<upn>')
+@admin_required
+def account_firstaid(upn):
+    """Fiche "premiers secours" d'un compte : infos cles issues de Microsoft Graph
+    (statut, derniere connexion, licences, methodes MFA enregistrees) et actions
+    d'urgence (desactivation, revocation des sessions, reinitialisation du mot de passe,
+    MFA). Fonctionne pour n'importe quel UPN du tenant, meme sans fiche d'incident."""
+    graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
+    account, auth_methods, error, auth_methods_error = None, [], None, None
+    if graph_configured:
+        try:
+            account = graph_get_account_overview(upn)
+            if not account.get('id'):
+                error = "Compte introuvable dans l'annuaire Microsoft Entra ID."
+        except Exception as e:
+            error = str(e)
+        if account and account.get('id'):
+            try:
+                auth_methods = graph_get_auth_methods(upn)
+            except Exception as e:
+                auth_methods_error = str(e)
+    else:
+        error = "Configuration Microsoft Graph incomplète — voir Configuration."
+
+    conn = get_db()
+    boite = conn.execute(
+        'SELECT * FROM boites_compromises WHERE user_email=? ORDER BY created_at DESC LIMIT 1', (upn,)).fetchone()
+    monitored = conn.execute('SELECT * FROM monitored_mailboxes WHERE user_email=?', (upn,)).fetchone()
+    recent_actions = conn.execute(
+        "SELECT * FROM logs WHERE category='PREMIERS_SECOURS' AND recipient=? ORDER BY timestamp DESC LIMIT 20",
+        (upn,)).fetchall()
+    conn.close()
+
+    return render_template('account_firstaid.html', upn=upn, account=account, error=error,
+                            auth_methods=auth_methods, auth_methods_error=auth_methods_error,
+                            boite=boite, monitored=monitored, recent_actions=recent_actions,
+                            graph_configured=graph_configured)
+
+
+@app.route('/admin/compte/<upn>/disable', methods=['POST'])
+@admin_required
+def account_firstaid_disable(upn):
+    try:
+        graph_set_account_enabled(upn, False)
+        add_log('WARNING', 'PREMIERS_SECOURS', f'Compte désactivé : {upn}', recipient=upn, username=session.get('username'))
+        flash(f'Compte {upn} désactivé.')
+    except Exception as e:
+        flash(f'Échec de la désactivation : {e}')
+    return redirect(url_for('account_firstaid', upn=upn))
+
+
+@app.route('/admin/compte/<upn>/enable', methods=['POST'])
+@admin_required
+def account_firstaid_enable(upn):
+    try:
+        graph_set_account_enabled(upn, True)
+        add_log('WARNING', 'PREMIERS_SECOURS', f'Compte réactivé : {upn}', recipient=upn, username=session.get('username'))
+        flash(f'Compte {upn} réactivé.')
+    except Exception as e:
+        flash(f'Échec de la réactivation : {e}')
+    return redirect(url_for('account_firstaid', upn=upn))
+
+
+@app.route('/admin/compte/<upn>/revoke-sessions', methods=['POST'])
+@admin_required
+def account_firstaid_revoke(upn):
+    try:
+        graph_revoke_sessions(upn)
+        add_log('WARNING', 'PREMIERS_SECOURS', f'Sessions révoquées : {upn}', recipient=upn, username=session.get('username'))
+        flash(f'Toutes les sessions de {upn} ont été révoquées (déconnexion forcée partout, jetons invalidés).')
+    except Exception as e:
+        flash(f'Échec de la révocation des sessions : {e}')
+    return redirect(url_for('account_firstaid', upn=upn))
+
+
+@app.route('/admin/compte/<upn>/reset-password', methods=['POST'])
+@admin_required
+def account_firstaid_reset_password(upn):
+    # Le champ 'password' reste dans le formulaire meme quand le mode "aleatoire" est
+    # selectionne (juste masque en CSS) : ne l'utiliser que si le mode "custom" est
+    # explicitement choisi, sinon un texte laisse par erreur dans le champ (puis le
+    # formulaire soumis en mode aleatoire) serait pris a tort pour le mot de passe voulu.
+    custom_mode = request.form.get('password_mode') == 'custom'
+    custom_password = request.form.get('password', '').strip() if custom_mode else ''
+    if custom_mode and len(custom_password) < 8:
+        flash('Le mot de passe saisi doit faire au moins 8 caractères.')
+        return redirect(url_for('account_firstaid', upn=upn))
+    try:
+        temp_password, was_generated = graph_reset_password(upn, password=custom_password or None)
+        details = 'Mot de passe généré aléatoirement' if was_generated else "Mot de passe saisi manuellement par l'administrateur"
+        add_log('WARNING', 'PREMIERS_SECOURS', f'Mot de passe réinitialisé : {upn}', details, recipient=upn, username=session.get('username'))
+        if was_generated:
+            flash(f"Mot de passe réinitialisé pour {upn}. Mot de passe temporaire (à communiquer de façon "
+                  f"sécurisée — il ne sera plus jamais affiché) : {temp_password}")
+        else:
+            flash(f'Mot de passe réinitialisé pour {upn} avec le mot de passe saisi (changement exigé à la prochaine connexion).')
+    except Exception as e:
+        flash(f'Échec de la réinitialisation du mot de passe : {e}')
+    return redirect(url_for('account_firstaid', upn=upn))
+
+
+@app.route('/admin/compte/<upn>/mfa/require', methods=['POST'])
+@admin_required
+def account_firstaid_require_mfa(upn):
+    try:
+        graph_set_per_user_mfa_state(upn, 'enforced')
+        add_log('WARNING', 'PREMIERS_SECOURS', f'MFA par utilisateur forcé : {upn}', recipient=upn, username=session.get('username'))
+        flash(f"MFA par utilisateur (mécanisme historique) activé pour {upn} — sans effet si votre tenant "
+              f"applique le MFA via l'Accès conditionnel ou les Défauts de sécurité.")
+    except Exception as e:
+        flash(f"Échec (probablement non applicable à votre configuration Azure AD) : {e}")
+    return redirect(url_for('account_firstaid', upn=upn))
 
 
 @app.route('/monitoring/patterns/add', methods=['POST'])
@@ -5021,8 +5668,8 @@ def view_logs():
         query += ' AND category=?'
         params.append(category_filter)
     if search:
-        query += ' AND (message LIKE ? OR details LIKE ? OR recipient LIKE ?)'
-        params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
+        query += ' AND (message LIKE ? OR details LIKE ? OR recipient LIKE ? OR username LIKE ?)'
+        params.extend([f'%{search}%', f'%{search}%', f'%{search}%', f'%{search}%'])
 
     query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
     params.extend([per_page, offset])
@@ -5038,8 +5685,8 @@ def view_logs():
         count_query += ' AND category=?'
         count_params.append(category_filter)
     if search:
-        count_query += ' AND (message LIKE ? OR details LIKE ? OR recipient LIKE ?)'
-        count_params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
+        count_query += ' AND (message LIKE ? OR details LIKE ? OR recipient LIKE ? OR username LIKE ?)'
+        count_params.extend([f'%{search}%', f'%{search}%', f'%{search}%', f'%{search}%'])
 
     total = conn.execute(count_query, count_params).fetchone()['cnt']
     total_pages = (total + per_page - 1) // per_page
