@@ -4829,20 +4829,111 @@ def view_tenant_signins():
     minutes par le planificateur (voir refresh_tenant_signins/monitoring_scheduler_tick).
     Chaque connexion est accompagnee d'un score de confiance 0-100 (voir
     compute_connection_trust_score) combinant IP de confiance, geographie et reputation."""
-    page_size = 100
+    ALLOWED_PAGE_SIZES = (10, 25, 50, 100, 200, 500, 1000)
+    try:
+        raw_per = request.args.get('per_page', '100')
+        if raw_per.lower() in ('all', '0', ''):
+            page_size = 0  # 0 = toutes les lignes
+        else:
+            page_size = int(raw_per)
+            if page_size not in ALLOWED_PAGE_SIZES:
+                page_size = 100
+    except (TypeError, ValueError):
+        page_size = 100
+
     try:
         page = max(1, int(request.args.get('page', 1)))
     except (TypeError, ValueError):
         page = 1
 
+    q = (request.args.get('q', '') or '').strip()
+    status_filter = request.args.get('status', '').strip()
+    if status_filter not in ('', 'Success', 'Failure'):
+        status_filter = ''
+    _pays_raw = request.args.get('pays', '').strip()
+    cnx_type = request.args.get('type', '').strip()
+    if cnx_type not in ('', 'fixe', 'mobile', 'vpn', 'dc', 'trusted', 'autre'):
+        cnx_type = ''
+
     conn = get_db()
-    nb_total = conn.execute('SELECT COUNT(*) as c FROM tenant_signins').fetchone()['c']
-    nb_failed = conn.execute("SELECT COUNT(*) as c FROM tenant_signins WHERE status != 'Success'").fetchone()['c']
-    nb_pages = max(1, (nb_total + page_size - 1) // page_size)
-    page = min(page, nb_pages)
-    offset = (page - 1) * page_size
-    rows = conn.execute('SELECT * FROM tenant_signins ORDER BY date_utc DESC LIMIT ? OFFSET ?',
-                        (page_size, offset)).fetchall()
+    countries = [dict(r) for r in conn.execute(
+        "SELECT country, COUNT(*) as nb FROM tenant_signins WHERE country IS NOT NULL AND country != '' GROUP BY country ORDER BY nb DESC").fetchall()]
+    _valid_pays = {c['country'] for c in countries}
+    if _pays_raw and _pays_raw not in ('FR', 'hors_france', 'inconnu') and _pays_raw not in _valid_pays:
+        if not re.fullmatch(r'[A-Z]{2}', _pays_raw):
+            _pays_raw = ''  # code pays invalide (ni ISO 2 lettres ni special) : on ignore
+    pays_filter = _pays_raw
+
+    where = []
+    params = []
+    if q:
+        like = f'%{q}%'
+        where.append('(user_display_name LIKE ? OR user_upn LIKE ? OR ip_address LIKE ? OR location LIKE ? OR application LIKE ? OR failure_reason LIKE ?)')
+        params += [like] * 6
+    if status_filter == 'Failure':
+        where.append("status != 'Success'")
+    elif status_filter == 'Success':
+        where.append("status = 'Success'")
+
+    join_ip = False
+    if pays_filter in ('FR', 'hors_france') or cnx_type in ('fixe', 'mobile', 'vpn', 'dc', 'autre'):
+        join_ip = True
+    if pays_filter == 'FR':
+        where.append("tenant_signins.country = 'FR'")
+    elif pays_filter == 'hors_france':
+        where.append("tenant_signins.country IS NOT NULL AND tenant_signins.country != '' AND tenant_signins.country != 'FR'")
+    elif pays_filter == 'inconnu':
+        where.append("(tenant_signins.country IS NULL OR tenant_signins.country = '')")
+    elif pays_filter:
+        where.append('tenant_signins.country = ?')
+        params.append(pays_filter)
+
+    if cnx_type == 'fixe':
+        where.append("ip_info.usage_type LIKE '%fixed%'")
+    elif cnx_type == 'mobile':
+        where.append("ip_info.usage_type LIKE '%mobile%'")
+    elif cnx_type == 'vpn':
+        where.append('ip_info.is_vpn = 1')
+    elif cnx_type == 'dc':
+        # Miroire du badge is_datacenter (ip_reputation_payload) : une IP de confiance
+        # (ex: IP du tenant hebergee chez un prestataire) n'est PAS un signal de
+        # datacenter suspect, meme si AbuseIPDB la classe ainsi.
+        where.append("""(ip_info.usage_type LIKE '%data center%')
+             AND tenant_signins.ip_address NOT IN (SELECT ip FROM trusted_ips)""")
+    elif cnx_type == 'trusted':
+        where.append('tenant_signins.ip_address IN (SELECT ip FROM trusted_ips)')
+    elif cnx_type == 'autre':
+        where.append("""(COALESCE(ip_info.usage_type, '') = ''
+             OR (ip_info.usage_type NOT LIKE '%fixed%' AND ip_info.usage_type NOT LIKE '%mobile%'
+                 AND ip_info.usage_type NOT LIKE '%data center%'))
+             AND COALESCE(ip_info.is_vpn, 0) != 1
+             AND tenant_signins.ip_address NOT IN (SELECT ip FROM trusted_ips)""")
+
+    from_sql = ('FROM tenant_signins LEFT JOIN ip_info ON ip_info.ip = tenant_signins.ip_address' if join_ip else 'FROM tenant_signins')
+    where_sql = ('WHERE ' + ' AND '.join(where)) if where else ''
+    # La jointure peut creer des doublons si ip_info n'est pas unique — jamais le cas ici
+    # (ip_info.ip est PRIMARY KEY), mais on garde SELECT DISTINCT en plus du join par securite
+    # sur les lignes, pas sur les comptes.
+
+    conn = get_db()
+    nb_total = conn.execute(f'SELECT COUNT(*) as c {from_sql} {where_sql}', params).fetchone()['c']
+    nb_all = conn.execute('SELECT COUNT(*) as c FROM tenant_signins').fetchone()['c']
+    failure_where = ' AND '.join(where + ["status != 'Success'"]) if where else "status != 'Success'"
+    nb_failed = conn.execute(f'SELECT COUNT(*) as c {from_sql} WHERE {failure_where}', params).fetchone()['c']
+
+    if page_size == 0:
+        nb_pages = 1
+        page = 1
+        offset = 0
+        limit_sql = ''
+        page_params = params
+    else:
+        nb_pages = max(1, (nb_total + page_size - 1) // page_size)
+        page = min(page, nb_pages)
+        offset = (page - 1) * page_size
+        limit_sql = ' LIMIT ? OFFSET ?'
+        page_params = params + [page_size, offset]
+    rows = conn.execute(f'SELECT tenant_signins.* {from_sql} {where_sql} ORDER BY date_utc DESC{limit_sql}', page_params).fetchall()
     conn.close()
 
     rows_with_trust = []
@@ -4860,12 +4951,14 @@ def view_tenant_signins():
 
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     last_refresh = get_config('tenant_signins_last_fetch_at', '')
-    return render_template('tenant_signins.html', rows=rows_with_trust, nb_total=nb_total, nb_failed=nb_failed,
+    return render_template('tenant_signins.html', rows=rows_with_trust, nb_total=nb_total, nb_all=nb_all, nb_failed=nb_failed,
                             graph_configured=graph_configured, last_refresh=last_refresh,
                             refresh_minutes=get_tenant_signins_refresh_minutes(),
                             retention_hours=get_tenant_signins_retention_hours(),
                             home_country_code=get_home_country_code(),
-                            page=page, nb_pages=nb_pages, page_size=page_size)
+                            page=page, nb_pages=nb_pages, page_size=page_size,
+                            q=q, status_filter=status_filter, pays_filter=pays_filter, cnx_type=cnx_type,
+                            countries=countries)
 
 
 @app.route('/connexions/settings', methods=['POST'])
