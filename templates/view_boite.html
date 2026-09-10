@@ -133,6 +133,13 @@
         {% if boite.ai_analysis %}
         <p class="text-muted small mb-2">
             Générée le {{ boite.ai_analysis_at|paris }} via <strong>{{ boite.ai_analysis_provider or 'Groq' }}</strong>, modèle <code>{{ boite.ai_analysis_model }}</code>.
+
+{{ _('Modèles configurés :') }}
+<ul class="list-unstyled small">
+  <li><strong>Groq :</strong> {{ groq_default_model }}</li>
+  <li><strong>NVIDIA :</strong> {{ nvidia_default_model }}</li>
+  <li><strong>Ollama :</strong> {{ ollama_default_model }}</li>
+</ul>
             <span class="text-warning"><i class="bi bi-exclamation-triangle"></i> Analyse générée par une IA à partir des données déjà collectées — à vérifier avant toute décision.</span>
         </p>
         <div id="ai-analysis-content" class="ai-analysis-md"></div>

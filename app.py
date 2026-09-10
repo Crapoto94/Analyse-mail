@@ -2969,6 +2969,9 @@ def view_boite(bid):
                          graph_configured=graph_configured, ai_configured=ai_configured,
                          groq_ai_configured=groq_ai_configured, nvidia_ai_configured=nvidia_ai_configured,
                          ollama_ai_configured=ollama_ai_configured,
+            groq_default_model=get_config('groq_model', '') or GROQ_DEFAULT_MODEL,
+            nvidia_default_model=get_config('nvidia_model', '') or NVIDIA_DEFAULT_MODEL,
+            ollama_default_model=get_config('ollama_model', '') or OLLAMA_DEFAULT_MODEL,
                          dsi_actions=dsi_actions, now_local_dt=_now_local_datetime_input(),
                          risk_score=risk_score, risk_verdict=risk_verdict, risk_findings_count=risk_findings_count,
                          rh_studio_configured=rh_studio_configured)
@@ -3504,40 +3507,40 @@ NVIDIA_DEFAULT_MODEL = 'mixtral-8x7b-instruct'
 #   Format B (ligne) : un modèle par ligne, soit "modèle_technique"
 #                    soit "nom_user|modèle_technique"
 # La fonction détecte automatiquement quel format est utilisé.
-def _parse_models(text, sep='|'):
+def _parse_models(text):
     """Retourne [{'name': ..., 'model': ...}, ...]"""
     if not text or not text.strip():
         return []
 
     text = text.strip()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # Essai Format B d'abord : chaque ligne est un modèle
-    lines = text.splitlines()
-    # Si toutes les lignes non-vides contiennent un '|', on suppose le Format A (pipe)
-    # Sinon, on suppose le Format B (ligne par ligne)
-    has_pipe_on_any_line = any('|' in line.strip() for line in lines if line.strip())
+    # Format B : si au moins une ligne contient un '|', on traite chaque ligne
+    # comme "nom|modèle" ou juste "modèle". On strippe pour enlever \r\n.
+    any_pipe = any('|' in line for line in lines)
 
-    if not has_pipe_on_any_line:
-        # Format B : ligne par ligne
+    if any_pipe:
         result = []
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-            # Si la ligne contient un '|', c'est "nom|modele", sinon c'est juste "modele"
             if '|' in line:
                 name, model = line.split('|', 1)
                 result.append({'name': name.strip(), 'model': model.strip()})
             else:
-                # Ligne sans '|' = juste le modèle, pas de nom friendly
                 result.append({'name': line, 'model': line})
         return result
 
-    # Format A : séparation par '|' (peut être sur plusieurs lignes)
-    parts = text.split(sep)
-    # Filtrer les parties vides (au cas où il y ait des sauts de ligne ou espaces en trop)
-    parts = [p.strip() for p in parts if p.strip()]
-    return [{'name': parts[i], 'model': parts[i+1]} for i in range(0, len(parts)-1, 2)]
+    # Format A : pas de '|' sur les lignes -> try pipe-separated on single line
+    if len(lines) == 1:
+        parts = text.split('|')
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) >= 2 and len(parts) % 2 == 0:
+            return [{'name': parts[i], 'model': parts[i+1]} for i in range(0, len(parts)-1, 2)]
+        return [{'name': text.strip(), 'model': text.strip()}]
+    # Plusieurs lignes sans '|' -> chaque ligne est un modèle
+    return [{'name': line, 'model': line} for line in lines]
 
 OLLAMA_DEFAULT_URL = 'http://10.103.130.166:11434'
 OLLAMA_DEFAULT_MODEL = 'gemma4:e4b'
