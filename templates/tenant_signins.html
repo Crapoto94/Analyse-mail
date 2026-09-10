@@ -62,6 +62,16 @@
     signalements).
 </p>
 
+<div class="alert alert-info py-2 small mb-3">
+    <i class="bi bi-info-circle"></i>
+    <strong>Délai de visibilité Microsoft Graph :</strong> les connexions apparaissent dans
+    <code>auditLogs/signIns</code> avec un retard pouvant atteindre ~2 h après l'événement réel.
+    Une connexion de ce matin peut donc apparaître l'après-midi : ce n'est pas une panne. Le
+    rafraîchissement automatique repart 3 h en arrière et déduplique, si bien qu'aucune
+    connexion n'est perdue — simplement affichée en différé.
+    {% if last_refresh %}Dernier rafraîchissement : <strong>{{ last_refresh }}</strong> (UTC).{% endif %}
+</div>
+
 <div class="row mb-4">
     <div class="col-md-6">
         <div class="card stat-card"><div class="card-body text-center">
