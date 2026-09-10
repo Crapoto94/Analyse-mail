@@ -157,16 +157,17 @@ function showGlobalLoadingFatalError(err) {
             <i class="bi bi-shield-exclamation"></i> Analyse Compromission
         </a>
         {% if session.get('user_id') %}
-        <form method="GET" action="{{ url_for('global_search') }}" class="d-none d-md-flex ms-auto me-3" style="max-width:320px;">
-            <input type="text" name="q" class="form-control form-control-sm" placeholder="Rechercher email, IP..." value="{{ request.args.get('q', '') }}">
-        </form>
-        {% endif %}
-        <div class="navbar-nav {% if not session.get('user_id') %}ms-auto{% endif %}">
-            {% if session.get('user_id') %}
+        <div class="d-flex align-items-center ms-auto">
+            <span class="navbar-text text-white d-none d-md-inline me-3">
+                <i class="bi bi-person-circle"></i> {{ session.get('username') }}
+                {% if session.get('role') == 'admin' %}<span class="badge bg-light text-primary ms-1">admin</span>{% endif %}
+            </span>
+            <form method="GET" action="{{ url_for('global_search') }}" class="d-none d-md-flex me-3" style="max-width:320px;">
+                <input type="text" name="q" class="form-control form-control-sm" placeholder="Rechercher email, IP..." value="{{ request.args.get('q', '') }}">
+            </form>
             <div class="nav-item dropdown">
                 <a class="nav-link text-white dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
-                    <i class="bi bi-person-circle"></i> {{ session.get('username') }}
-                    {% if session.get('role') == 'admin' %}<span class="badge bg-light text-primary ms-1">admin</span>{% endif %}
+                    <i class="bi bi-list"></i> Menu
                 </a>
                 <ul class="dropdown-menu dropdown-menu-end">
                     <li><a class="dropdown-item" href="{{ url_for('list_boites') }}"><i class="bi bi-folder2-open"></i> Boîtes</a></li>
@@ -195,8 +196,8 @@ function showGlobalLoadingFatalError(err) {
                     </li>
                 </ul>
             </div>
-            {% endif %}
         </div>
+        {% endif %}
     </div>
 </nav>
     <div class="app-container">
@@ -559,25 +560,42 @@ function showGlobalLoadingFatalError(err) {
             rhPendingEmails.clear();
             rhPendingNames = [];
             if (!emails.length && !names.length) return;
-            fetch('/api/rh-batch-status', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({emails: emails, names: names})
-            }).then(function(r) { return r.json(); })
-              .then(function(data) {
-                  Object.keys(data).forEach(function(key) {
-                      var info = data[key];
-                      rhStatusCache[key] = info;
-                      var selector = '.rh-email-text, .rh-name-text';
-                      document.querySelectorAll(selector).forEach(function(el) {
-                          var elKey = el.classList.contains('rh-email-text') ? el.textContent : (el.getAttribute('data-nom') + ' ' + el.getAttribute('data-prenom'));
-                          if (elKey === key && !el.parentElement.querySelector('.rh-badge')) {
-                              el.parentElement.insertAdjacentHTML('beforeend', badgeHtmlForStatus(info.status, info));
-                          }
+            // On construit une file mixte (emails + noms) et on envoie par lots de
+            // RH_BATCH_SIZE : le serveur plafonne a 50 par requete, donc au-dela on
+            // doit decouper cote client pour couvrir toute la page.
+            var queue = emails.map(function(e) { return {type: 'email', key: e}; })
+                             .concat(names.map(function(n) { return {type: 'name', key: n.key, nom: n.nom, prenom: n.prenom}; }));
+            var RH_BATCH_SIZE = 40;
+            var idx = 0;
+
+            function postBatch() {
+                if (idx >= queue.length) return;
+                var batch = queue.slice(idx, idx + RH_BATCH_SIZE);
+                idx += RH_BATCH_SIZE;
+                var bEmails = batch.filter(function(i) { return i.type === 'email'; }).map(function(i) { return i.key; });
+                var bNames = batch.filter(function(i) { return i.type === 'name'; }).map(function(i) { return {nom: i.nom, prenom: i.prenom}; });
+                fetch('/api/rh-batch-status', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({emails: bEmails, names: bNames})
+                }).then(function(r) { return r.json(); })
+                  .then(function(data) {
+                      Object.keys(data).forEach(function(key) {
+                          var info = data[key];
+                          rhStatusCache[key] = info;
+                          var selector = '.rh-email-text, .rh-name-text';
+                          document.querySelectorAll(selector).forEach(function(el) {
+                              var elKey = el.classList.contains('rh-email-text') ? el.textContent : (el.getAttribute('data-nom') + ' ' + el.getAttribute('data-prenom'));
+                              if (elKey === key && !el.parentElement.querySelector('.rh-badge')) {
+                                  el.parentElement.insertAdjacentHTML('beforeend', badgeHtmlForStatus(info.status, info));
+                              }
+                          });
                       });
-                  });
-              })
-              .catch(function() {});
+                  })
+                  .catch(function() {})
+                  .then(function() { postBatch(); });
+            }
+            postBatch();
         }
 
         var rhMoTimer = null;

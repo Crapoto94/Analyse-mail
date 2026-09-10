@@ -4481,11 +4481,14 @@ def refresh_tenant_signins():
     last_iso = get_config('tenant_signins_last_fetch_at', '')
     last_dt = _parse_iso(last_iso) if last_iso else None
     if last_dt:
-        # Petite marge de recouvrement (10 min) pour ne rien manquer entre deux passages —
-        # sans risque de doublon grace a la contrainte UNIQUE sur request_id.
-        since_dt = last_dt - timedelta(minutes=10)
+        # Les connexions apparaissent avec un DELAI D'INGESTION dans auditLogs/signIns
+        # (journalise jusqu'a ~2h apres l'evenement reel). Une marge de 10 minutes ne
+        # suffit pas : une connexion arrivee dans l'API apres que le since soit reparti
+        # serait PERDUE DEFINITIVEMENT. On repart donc 3h en arriere a chaque passage,
+        # et la contrainte UNIQUE sur request_id deduplique sans risque de doublon.
+        since_dt = last_dt - timedelta(hours=3)
     else:
-        since_dt = now_dt - timedelta(hours=1)
+        since_dt = now_dt - timedelta(hours=3)
     since = since_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     items = graph_get_all('/auditLogs/signIns', params={
@@ -4826,10 +4829,20 @@ def view_tenant_signins():
     minutes par le planificateur (voir refresh_tenant_signins/monitoring_scheduler_tick).
     Chaque connexion est accompagnee d'un score de confiance 0-100 (voir
     compute_connection_trust_score) combinant IP de confiance, geographie et reputation."""
+    page_size = 100
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (TypeError, ValueError):
+        page = 1
+
     conn = get_db()
-    rows = conn.execute('SELECT * FROM tenant_signins ORDER BY date_utc DESC LIMIT 1000').fetchall()
     nb_total = conn.execute('SELECT COUNT(*) as c FROM tenant_signins').fetchone()['c']
     nb_failed = conn.execute("SELECT COUNT(*) as c FROM tenant_signins WHERE status != 'Success'").fetchone()['c']
+    nb_pages = max(1, (nb_total + page_size - 1) // page_size)
+    page = min(page, nb_pages)
+    offset = (page - 1) * page_size
+    rows = conn.execute('SELECT * FROM tenant_signins ORDER BY date_utc DESC LIMIT ? OFFSET ?',
+                        (page_size, offset)).fetchall()
     conn.close()
 
     rows_with_trust = []
@@ -4851,7 +4864,8 @@ def view_tenant_signins():
                             graph_configured=graph_configured, last_refresh=last_refresh,
                             refresh_minutes=get_tenant_signins_refresh_minutes(),
                             retention_hours=get_tenant_signins_retention_hours(),
-                            home_country_code=get_home_country_code())
+                            home_country_code=get_home_country_code(),
+                            page=page, nb_pages=nb_pages, page_size=page_size)
 
 
 @app.route('/connexions/settings', methods=['POST'])
