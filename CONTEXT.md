@@ -1,5 +1,31 @@
 # CONTEXT - Analyse de Compromission
 
+## État de la session - 2026-09-11 (suite : cartes dashboard enrichies au zoom)
+
+### Ajout : contours des communes + noms de villes plafonnés, cartes remontées et agrandies
+- **Cartes reportées en row 3** du dashboard (juste sous les stat cards), hauteur **350px → 480px**.
+- **Hiérarchie administrative progressive au zoom** :
+  - carte monde (`map-world`) : noms des **pays** à zoom ≥ 3, noms des villes à zoom ≥ 10 ;
+  - carte France (`map-home`) : **départements** (noms + contours, déjà présents) à zoom ≥ 7,
+    **contours des communes** à zoom ≥ 9, noms des villes à zoom ≥ 10.
+- **Contours des communes** : asset local compact `static/maps/communes.topojson`
+  (**~6,6 Mo, 35 190 communes**), généré une fois via mapshaper
+  (`-simplify 25% visvalingam -o format=topojson precision=4`) depuis
+  `communes-version-simplifiee.geojson` (france-geojson). Chargé **à la demande** dans le JS
+  (premier passage à zoom ≥ 9, partagé entre re-rendus via `communeGeoJsonCache` — même pattern
+  que départements). Retiré quand on re-zoome en dessous du seuil. Style : contours bleu `#2f7fb8`,
+  `weight 0.5`, sans remplissage.
+  - Sécurité : `geo2topo`/`topojson-server` sans pénalité ; **ne pas** utiliser `precision=3`
+    (mapshaper effondre les polygones des petites communes → `geometry: null` pour presque tout).
+- **Noms de villes plafonnés à 10** : seules les **10 villes les plus actives** (volume de
+  connexions le plus élevé) reçoivent un tooltip permanent (`namedKeys` par tri `count` desc +
+  `slice(0,10)`), visible uniquement à **zoom ≥ 10** (les autres points restent cliquables,
+  popup intacte).
+- Hint des headers des cartes mis à jour (« zoom : départements, contours des villes (9+), noms
+  des 10 villes (10+) »).
+- Validé : rendu Jinja du template OK, `node --check` sur le JS inline extrait du HTML rendu,
+  `python -m pytest -q` → **41 passed**. Commit poussé `master` (voir `git log`).
+
 ## État de la session - 2026-09-10 (suite : dashboard connexions + acquittement)
 
 ### Ajout : filtres serveur + pagination + acquittement des lieux suspects (carte dashboard)

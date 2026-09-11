@@ -83,7 +83,7 @@
         <div class="card h-100">
             <div class="card-header">
                 <i class="bi bi-globe2"></i> Origine des connexions — monde
-                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect — zoom : noms des pays puis des villes)</span>
+                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect — zoom : noms des pays, noms des 10 villes au-delà)</span>
             </div>
             <div class="card-body p-0">
                 {% if connections_geo_world %}
@@ -98,7 +98,7 @@
         <div class="card h-100">
             <div class="card-header">
                 <i class="bi bi-geo-alt"></i> Origine des connexions — {{ home_country_code }}
-                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect — zoom : départements puis villes)</span>
+                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect — zoom : départements, contours des villes (9+), noms des 10 villes (10+))</span>
             </div>
             <div class="card-body p-0">
                 {% if connections_geo_home %}
@@ -442,13 +442,35 @@ function renderConnectionsMap(elId, points, view, zoom, opts) {
         });
     }
 
+    var communeLayer = null;
+    if (opts.communesZoom) {
+        var cPromise = communeGeoJsonCache ||
+            fetch({{ url_for('static', filename='maps/communes.topojson')|tojson }})
+                .then(function(r) { return r.json(); })
+                .then(function(topo) { return topojson.feature(topo, topo.objects['communes-src']); })
+                .catch(function() { return null; });
+        communeGeoJsonCache = cPromise;
+        cPromise.then(function(gj) {
+            if (!gj) return;
+            communeLayer = L.geoJSON(gj, {
+                style: { color: '#2f7fb8', weight: 0.5, opacity: 0.45, fill: false }
+            });
+        });
+    }
+
+    // Les noms de villes n'apparaissent qu'a fort zoom, et seulement pour les
+    // 10 villes les plus actives (volume de connexions le plus eleve).
+    var namedKeys = {};
+    points.slice().sort(function(a, b) { return (b.count || 0) - (a.count || 0); })
+         .slice(0, 10).forEach(function(np) { namedKeys[(np.city || '') + '|' + (np.country_code || '')] = true; });
+
     points.forEach(function(p) {
         var key = (p.city || '') + '|' + (p.country_code || '');
         markerData[key] = p;
         var marker = L.marker([p.lat, p.lon], { icon: buildMarkerIcon(p) }).addTo(map);
         marker.bindPopup(buildPopupHtml(p));
         var cityName = p.city || '';
-        if (cityName) {
+        if (cityName && namedKeys[key]) {
             marker.bindTooltip(esc(cityName), {
                 permanent: true, direction: 'top', offset: [0, -10],
                 className: 'city-label', interactive: false
@@ -464,20 +486,25 @@ function renderConnectionsMap(elId, points, view, zoom, opts) {
         var z = map.getZoom();
         cityLabelMarkers.forEach(function(o) { o.tooltip.setOpacity(z >= o.minZoom ? 1 : 0); });
         geoLabelMarkers.forEach(function(o) { o.marker.setOpacity(z >= o.minZoom ? 1 : 0); });
+        if (communeLayer) {
+            if (z >= opts.communesZoom && !map.hasLayer(communeLayer)) communeLayer.addTo(map);
+            else if (z < opts.communesZoom && map.hasLayer(communeLayer)) map.removeLayer(communeLayer);
+        }
     }
     map.on('zoomend', applyZoom);
     applyZoom();
 }
 
 var deptGeoJsonCache = null;
+var communeGeoJsonCache = null;
 
 {% if connections_geo_world %}
 renderConnectionsMap('map-world', {{ connections_geo_world|tojson }}, [20, 0], 2,
-    { countryLabels: true, countryLabelZoom: 3, cityLabelZoom: 5 });
+    { countryLabels: true, countryLabelZoom: 3, cityLabelZoom: 10 });
 {% endif %}
 {% if connections_geo_home %}
 renderConnectionsMap('map-home', {{ connections_geo_home|tojson }}, [46.6, 2.2], 5,
-    { departements: true, deptLabelZoom: 7, cityLabelZoom: 7 });
+    { departements: true, deptLabelZoom: 7, communesZoom: 9, cityLabelZoom: 10 });
 {% endif %}
 </script>
 {% endblock %}
