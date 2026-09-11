@@ -33,6 +33,24 @@
    de halo ni clignotement — reste visible a l'oeil nu mais ne fait plus paniquer. */
 .pulse-marker.acked .pulse-ring { display: none; }
 .pulse-marker.acked .pulse-core { animation: none; opacity: 1; }
+/* Etiquettes geographiques (noms de pays/departements/villes) affichees selon le zoom :
+   divIcon sans fond ni bordure, centrees au centroide, avec un hache ombre pour rester
+   lisibles sur le fond noir. */
+.threat-map .geo-label {
+    background: none; border: none; box-shadow: none;
+    white-space: nowrap; transform: translate(-50%, -50%);
+    font-weight: 600; line-height: 1;
+    text-shadow: 0 0 5px rgba(0,0,0,0.95), 0 0 2px rgba(0,0,0,0.95);
+    pointer-events: none;
+}
+.geo-label-map-pays { color: #5b88ac; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; }
+.geo-label-dept { color: #3f94cf; font-size: 11px; letter-spacing: 0.5px; }
+.leaflet-tooltip.city-label {
+    background: rgba(5,7,12,0.55); border: none; box-shadow: none; border-radius: 3px;
+    color: #e9f6ff; font-size: 11px; font-weight: 600; padding: 1px 5px;
+    text-shadow: 0 0 4px rgba(0,0,0,0.9);
+}
+.leaflet-tooltip.city-label::before { display: none; }
 </style>
 
 <div class="d-flex justify-content-between align-items-center mb-4">
@@ -57,6 +75,39 @@
         <div class="card stat-card" style="border-left-color:#fd7e14;"><div class="card-body text-center">
             <h3>{{ signin_failure_rate }}%</h3><small class="text-muted">Taux d'échec connexions ({{ signins_window_hours }}h, tenant)</small>
         </div></div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header">
+                <i class="bi bi-globe2"></i> Origine des connexions — monde
+                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect — zoom : noms des pays puis des villes)</span>
+            </div>
+            <div class="card-body p-0">
+                {% if connections_geo_world %}
+                <div id="map-world" class="threat-map" style="height:480px;"></div>
+                {% else %}
+                <p class="text-muted mb-0 p-3">Aucune connexion géolocalisable sur la fenêtre en cours.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header">
+                <i class="bi bi-geo-alt"></i> Origine des connexions — {{ home_country_code }}
+                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect — zoom : départements puis villes)</span>
+            </div>
+            <div class="card-body p-0">
+                {% if connections_geo_home %}
+                <div id="map-home" class="threat-map" style="height:480px;"></div>
+                {% else %}
+                <p class="text-muted mb-0 p-3">Aucune connexion géolocalisable en {{ home_country_code }} sur la fenêtre en cours.</p>
+                {% endif %}
+            </div>
+        </div>
     </div>
 </div>
 
@@ -127,39 +178,6 @@
             </div>
             <div class="card-footer">
                 <a href="{{ url_for('view_tenant_signins') }}" class="btn btn-sm btn-outline-secondary">Voir le détail</a>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div class="row mb-4">
-    <div class="col-md-6">
-        <div class="card h-100">
-            <div class="card-header">
-                <i class="bi bi-globe2"></i> Origine des connexions — monde
-                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect)</span>
-            </div>
-            <div class="card-body p-0">
-                {% if connections_geo_world %}
-                <div id="map-world" class="threat-map" style="height:350px;"></div>
-                {% else %}
-                <p class="text-muted mb-0 p-3">Aucune connexion géolocalisable sur la fenêtre en cours.</p>
-                {% endif %}
-            </div>
-        </div>
-    </div>
-    <div class="col-md-6">
-        <div class="card h-100">
-            <div class="card-header">
-                <i class="bi bi-geo-alt"></i> Origine des connexions — {{ home_country_code }}
-                <span class="text-muted small">({{ signins_window_hours }}h — taille = volume, clignotant = suspect)</span>
-            </div>
-            <div class="card-body p-0">
-                {% if connections_geo_home %}
-                <div id="map-home" class="threat-map" style="height:350px;"></div>
-                {% else %}
-                <p class="text-muted mb-0 p-3">Aucune connexion géolocalisable en {{ home_country_code }} sur la fenêtre en cours.</p>
-                {% endif %}
             </div>
         </div>
     </div>
@@ -351,10 +369,11 @@ function ackLocation(key) {
       }).catch(function() { alert('Échec de l\\\'acquittement.'); });
 }
 
-function renderConnectionsMap(elId, points, view, zoom) {
+function renderConnectionsMap(elId, points, view, zoom, opts) {
     var el = document.getElementById(elId);
     if (!el || !points.length) return;
-    var map = L.map(elId, { worldCopyJump: false }).setView(view, zoom);
+    opts = opts || {};
+    var map = L.map(elId, { worldCopyJump: false, maxZoom: 14 }).setView(view, zoom);
 
     worldGeoJsonPromise.then(function(geojson) {
         if (!geojson) return;
@@ -363,23 +382,102 @@ function renderConnectionsMap(elId, points, view, zoom) {
         }).addTo(map);
     });
 
-    // Rayon proportionnel a la racine carree du nombre de connexions (comparaison par
-    // AIRE plutot que par rayon, plus fidele visuellement qu'une echelle lineaire), avec
-    // un minimum pour qu'un lieu a une seule connexion reste visible.
+    var cityLabelMarkers = [];
+    var geoLabelMarkers = [];
+
+    function bboxCenter(f) {
+        if (!f || !f.geometry) return null;
+        var mnX=Infinity, mnY=Infinity, mxX=-Infinity, mxY=-Infinity;
+        function walk(c) {
+            if (typeof c[0]==='number') { if(c[0]<mnX) mnX=c[0]; if(c[0]>mxX) mxX=c[0]; if(c[1]<mnY) mnY=c[1]; if(c[1]>mxY) mxY=c[1]; }
+            else c.forEach(walk);
+        }
+        walk(f.geometry.coordinates);
+        if (mnX===Infinity) return null;
+        return [(mnY+mxY)/2, (mnX+mxX)/2];
+    }
+    function makeGeoLabel(text, latLon, cls) {
+        return L.marker(latLon, {
+            icon: L.divIcon({ html: '<span class="geo-label ' + esc(cls) + '">' + esc(text) + '</span>',
+                              className: '', iconSize: null }),
+            interactive: false
+        });
+    }
+
+    if (opts.departements) {
+        var deptPromise = deptGeoJsonCache ||
+            fetch('https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/departements-version-simplifiee.geojson')
+                .then(function(r) { return r.json(); }).catch(function() { return null; });
+        deptGeoJsonCache = deptPromise;
+        deptPromise.then(function(gj) {
+            if (!gj) return;
+            L.geoJSON(gj, {
+                style: { color: '#1791cf', weight: 0.6, opacity: 0.5, fill: false }
+            }).addTo(map);
+            gj.features.forEach(function(f) {
+                var name = f.properties && (f.properties.nom || f.properties.code);
+                var c = bboxCenter(f);
+                if (!name || !c) return;
+                var lab = makeGeoLabel(name, c, 'geo-label-dept');
+                lab.setOpacity(0);
+                lab.addTo(map);
+                geoLabelMarkers.push({ marker: lab, minZoom: opts.deptLabelZoom || 7 });
+            });
+        });
+    }
+
+    if (opts.countryLabels) {
+        worldGeoJsonPromise.then(function(gj) {
+            if (!gj) return;
+            gj.features.forEach(function(f) {
+                var name = f.properties && f.properties.name;
+                if (!name) return;
+                var c = bboxCenter(f);
+                if (!c) return;
+                var lab = makeGeoLabel(name, c, 'geo-label-map-pays');
+                lab.setOpacity(0);
+                lab.addTo(map);
+                geoLabelMarkers.push({ marker: lab, minZoom: opts.countryLabelZoom || 3 });
+            });
+        });
+    }
+
     points.forEach(function(p) {
         var key = (p.city || '') + '|' + (p.country_code || '');
         markerData[key] = p;
         var marker = L.marker([p.lat, p.lon], { icon: buildMarkerIcon(p) }).addTo(map);
         marker.bindPopup(buildPopupHtml(p));
+        var cityName = p.city || '';
+        if (cityName) {
+            marker.bindTooltip(esc(cityName), {
+                permanent: true, direction: 'top', offset: [0, -10],
+                className: 'city-label', interactive: false
+            });
+            var tt = marker.getTooltip();
+            tt.setOpacity(0);
+            cityLabelMarkers.push({ tooltip: tt, minZoom: opts.cityLabelZoom || 99 });
+        }
         mapMarkers[key] = marker;
     });
+
+    function applyZoom() {
+        var z = map.getZoom();
+        cityLabelMarkers.forEach(function(o) { o.tooltip.setOpacity(z >= o.minZoom ? 1 : 0); });
+        geoLabelMarkers.forEach(function(o) { o.marker.setOpacity(z >= o.minZoom ? 1 : 0); });
+    }
+    map.on('zoomend', applyZoom);
+    applyZoom();
 }
 
+var deptGeoJsonCache = null;
+
 {% if connections_geo_world %}
-renderConnectionsMap('map-world', {{ connections_geo_world|tojson }}, [20, 0], 2);
+renderConnectionsMap('map-world', {{ connections_geo_world|tojson }}, [20, 0], 2,
+    { countryLabels: true, countryLabelZoom: 3, cityLabelZoom: 5 });
 {% endif %}
 {% if connections_geo_home %}
-renderConnectionsMap('map-home', {{ connections_geo_home|tojson }}, [46.6, 2.2], 5);
+renderConnectionsMap('map-home', {{ connections_geo_home|tojson }}, [46.6, 2.2], 5,
+    { departements: true, deptLabelZoom: 7, cityLabelZoom: 7 });
 {% endif %}
 </script>
 {% endblock %}
