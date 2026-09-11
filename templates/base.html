@@ -176,8 +176,8 @@ function showGlobalLoadingFatalError(err) {
                     <li><a class="dropdown-item" href="{{ url_for('view_tenant_signins') }}"><i class="bi bi-shield-lock"></i> Monitoring connexions</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('view_tenant_rules') }}"><i class="bi bi-envelope-arrow-up"></i> Règles de messagerie (tenant)</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('account_firstaid_search') }}"><i class="bi bi-life-preserver"></i> Premiers secours</a></li>
-                    <li><a class="dropdown-item" href="{{ url_for('list_users') }}"><i class="bi bi-people"></i> Utilisateurs</a></li>
                     {% if session.get('is_superadmin') %}
+                    <li><a class="dropdown-item" href="{{ url_for('list_users') }}"><i class="bi bi-people"></i> Utilisateurs</a></li>
                     <li><a class="dropdown-item" href="{{ url_for('view_logs') }}"><i class="bi bi-journal-text"></i> Logs</a></li>
                     {% endif %}
                     <li><a class="dropdown-item" href="{{ url_for('config') }}"><i class="bi bi-gear"></i> Configuration</a></li>

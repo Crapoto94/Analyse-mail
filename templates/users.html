@@ -62,10 +62,11 @@
                             <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#pwd-{{ u.id }}">
                                 <i class="bi bi-key"></i> Mot de passe
                             </button>
-                            {% if session.get('is_superadmin') and u.role == 'admin' and not is_superadmin_username(u.username) %}
-                            <form method="POST" action="{{ url_for('toggle_superadmin', user_id=u.id) }}" class="d-inline">
-                                <button class="btn btn-sm btn-outline-danger" type="submit" title="{% if user_is_superadmin(u) %}Retirer{% else %}Qualifier{% endif %} super-administrateur (accès à /logs)">
-                                    <i class="bi bi-shield-lock{% if user_is_superadmin(u) %}-fill{% endif %}"></i>
+                            {% if session.get('is_superadmin') and u.role == 'admin' %}
+                            <form method="POST" action="{{ url_for('toggle_superadmin', user_id=u.id) }}" class="d-inline"
+                                  {% if user_is_superadmin(u) %}onsubmit="return confirm('Retirer le statut super-administrateur de {{ u.username }} ? C\'est effectif immédiatement.')"{% endif %}>
+                                <button class="btn btn-sm {% if user_is_superadmin(u) %}btn-outline-danger{% else %}btn-outline-success{% endif %}" type="submit" title="{% if user_is_superadmin(u) %}Retirer{% else %}Qualifier{% endif %} super-administrateur (accès à /users et /logs)">
+                                    {% if user_is_superadmin(u) %}<i class="bi bi-shield-slash"></i> Retirer{% else %}<i class="bi bi-shield-lock"></i> Qualifier{% endif %}
                                 </button>
                             </form>
                             {% endif %}

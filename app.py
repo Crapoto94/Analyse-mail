@@ -658,6 +658,14 @@ def init_db():
     except Exception:
         pass
 
+    # Migration : retrait effectif du statut super-administrateur. Un compte reconnu par
+    # son identifiant (admin, adm*@ivry94fr.onmicrosoft.com) reste super-admin par defaut ;
+    # superadmin_disabled=1 permet de lui RETIRER ce statut malgre l'auto-reconnaissance.
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN superadmin_disabled INTEGER NOT NULL DEFAULT 0')
+    except Exception:
+        pass
+
     c.execute('''CREATE TABLE IF NOT EXISTS monitored_mailboxes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_email TEXT UNIQUE NOT NULL,
@@ -2178,10 +2186,10 @@ def admin_required(f):
 
 
 # Motif reconnaissant automatiquement les comptes "super-administrateur" par leur
-# identifiant : les boites d'administration Microsoft dediees du tenant (ex:
-# adm-marc@ivry94fr.onmicrosoft.com). Ne depend d'aucune configuration — a adapter ici si
-# le domaine du tenant change.
-SUPERADMIN_USERNAME_RE = re.compile(r'^adm[^@]*@ivry94fr\.onmicrosoft\.com$', re.IGNORECASE)
+# identifiant : le compte admin racine et les boites d'administration Microsoft dediees
+# du tenant (ex: adm-marc@ivry94fr.onmicrosoft.com). Ne depend d'aucune configuration —
+# a adapter ici si le domaine du tenant change.
+SUPERADMIN_USERNAME_RE = re.compile(r'^(admin|adm[^@]*@ivry94fr\.onmicrosoft\.com)$', re.IGNORECASE)
 
 
 def is_superadmin_username(username):
@@ -2191,11 +2199,18 @@ def is_superadmin_username(username):
 def user_is_superadmin(user_row):
     """Vrai si le compte est reconnu super-administrateur : soit par son identifiant
     (voir SUPERADMIN_USERNAME_RE), soit parce qu'il a ete explicitement qualifie comme tel
-    par un super-administrateur existant (colonne is_superadmin, voir /users). Les
-    super-administrateurs sont seuls a pouvoir consulter /logs (donnees potentiellement
+    par un super-administrateur existant (colonne is_superadmin, voir /users). Le flag
+    superadmin_disabled (voir toggle_superadmin) permet de RETIRER effectivement ce statut,
+    meme pour un identifiant normalement auto-reconnu. Les super-administrateurs sont seuls
+    a pouvoir consulter /logs et gerer les comptes /users (donnees potentiellement
     sensibles : qui a consulte/agi sur quel compte, y compris via "Premiers secours")."""
     if not user_row:
         return False
+    try:
+        if bool(user_row['superadmin_disabled']):
+            return False
+    except (KeyError, IndexError):
+        pass
     if is_superadmin_username(user_row['username']):
         return True
     try:
@@ -2213,9 +2228,18 @@ def superadmin_required(f):
     def decorated_function(*args, **kwargs):
         if not session.get('user_id'):
             return redirect(url_for('login', next=request.path))
-        if not session.get('is_superadmin'):
+        # Re-verification en base a chaque demande : un retrait de super-admin (fait sur
+        # soi-meme ou par un autre) prend effet immediatement, sans attendre la prochaine
+        # connexion, et le flag de session reste coherent.
+        conn = get_db()
+        user = conn.execute('SELECT * FROM users WHERE id=?', (session['user_id'],)).fetchone()
+        conn.close()
+        if not user or not user_is_superadmin(user):
+            session.pop('is_superadmin', None)
             flash("Accès réservé aux super-administrateurs")
             return redirect(url_for('index'))
+        if not session.get('is_superadmin'):
+            session['is_superadmin'] = True
         return f(*args, **kwargs)
     return decorated_function
 
@@ -2451,7 +2475,7 @@ def microsoft_callback():
 
 
 @app.route('/users')
-@admin_required
+@superadmin_required
 def list_users():
     conn = get_db()
     users = conn.execute('SELECT * FROM users ORDER BY username').fetchall()
@@ -2460,7 +2484,7 @@ def list_users():
 
 
 @app.route('/users/add', methods=['POST'])
-@admin_required
+@superadmin_required
 def add_user():
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '')
@@ -2490,7 +2514,7 @@ def add_user():
 
 
 @app.route('/users/<int:user_id>/delete', methods=['POST'])
-@admin_required
+@superadmin_required
 def delete_user(user_id):
     if user_id == session.get('user_id'):
         flash('Vous ne pouvez pas supprimer votre propre compte')
@@ -2517,7 +2541,7 @@ def delete_user(user_id):
 
 
 @app.route('/users/<int:user_id>/toggle', methods=['POST'])
-@admin_required
+@superadmin_required
 def toggle_user(user_id):
     if user_id == session.get('user_id'):
         flash('Vous ne pouvez pas désactiver votre propre compte')
@@ -2545,10 +2569,11 @@ def toggle_user(user_id):
 @app.route('/users/<int:user_id>/toggle-superadmin', methods=['POST'])
 @superadmin_required
 def toggle_superadmin(user_id):
-    """Qualifie/retire manuellement un compte admin comme super-administrateur (seul
-    acces autorise a /logs) — reserve aux super-administrateurs existants. Sans effet sur
-    un compte deja reconnu automatiquement par son identifiant (voir SUPERADMIN_USERNAME_RE) :
-    il reste super-administrateur quel que soit cet indicateur."""
+    """Qualifie ou RETIRE le statut super-administrateur d'un compte admin (seul acces
+    autorise a /logs et /users) — reserve aux super-administrateurs existants. Le retrait
+    est effectif meme pour un identifiant normalement auto-reconnu (voir
+    SUPERADMIN_USERNAME_RE) via le flag superadmin_disabled, re-evalue a chaque requete
+    par superadmin_required : si l'on se retire soi-meme, l'acces tombe immediatement."""
     conn = get_db()
     target = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
     if not target:
@@ -2559,19 +2584,27 @@ def toggle_superadmin(user_id):
         conn.close()
         flash('Seul un compte administrateur peut être qualifié super-administrateur')
         return redirect(url_for('list_users'))
-    new_value = 0 if target['is_superadmin'] else 1
-    conn.execute('UPDATE users SET is_superadmin=? WHERE id=?', (new_value, user_id))
+    currently = user_is_superadmin(target)
+    if currently:
+        conn.execute('UPDATE users SET is_superadmin=0, superadmin_disabled=1 WHERE id=?', (user_id,))
+        label = 'retiré'
+    else:
+        conn.execute('UPDATE users SET is_superadmin=1, superadmin_disabled=0 WHERE id=?', (user_id,))
+        label = 'qualifié'
     conn.commit()
+    if user_id == session.get('user_id'):
+        updated = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+        session['is_superadmin'] = user_is_superadmin(updated)
     conn.close()
     add_log('WARNING', 'AUTH',
-            f"{target['username']} {'qualifié' if new_value else 'retiré'} super-administrateur",
+            f"{target['username']} {label} super-administrateur",
             username=session.get('username'))
-    flash(f"{target['username']} {'qualifié' if new_value else 'retiré'} super-administrateur")
+    flash(f"{target['username']} {label} super-administrateur")
     return redirect(url_for('list_users'))
 
 
 @app.route('/users/<int:user_id>/reset-password', methods=['POST'])
-@admin_required
+@superadmin_required
 def reset_user_password(user_id):
     new_password = request.form.get('new_password', '')
     if len(new_password) < 8:
