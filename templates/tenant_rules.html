@@ -121,25 +121,47 @@
         <div class="table-responsive" style="max-height:650px; overflow-y:auto;">
             <table class="table table-hover table-sm" id="rules-table">
                 <thead>
-                    <tr><th>Compte</th><th>Nom</th><th>Active</th><th>Conditions</th><th>Actions</th><th>Transfert vers</th></tr>
+                    <tr><th>Compte</th><th>Nom</th><th>Active</th><th>Conditions</th><th>Actions</th><th>Transfert vers</th><th></th></tr>
                 </thead>
                 <tbody>
+                    {% set processed_map = {} %}
+                    {% for p in processed_rules %}
+                        {% if processed_map.update({(p.user_upn, p.rule_id): p}) %}{% endif %}
+                    {% endfor %}
                     {% for r in rules %}
-                    <tr class="{% if r.is_suspicious == 'true' %}table-danger{% endif %}" data-suspicious="{{ r.is_suspicious }}">
+                    {% set is_exposed = session.get('is_superadmin') or r.user_upn in exposed_upns %}
+                    {% set is_rh_left = r.user_upn in exposed_upns and r.is_suspicious != 'true' %}
+                    {% set row_class = 'table-danger' if r.is_suspicious == 'true' else ('table-warning' if is_rh_left else '') %}
+                    {% set already_processed = processed_map.get((r.user_upn, r.rule_id)) %}
+                    <tr class="{{ row_class }}" data-suspicious="{{ r.is_suspicious }}" data-processed="{{ 'true' if already_processed else 'false' }}">
                         <td>
-                            <small>{{ r.user_display_name or r.user_upn }}</small><br>
+                            <small>{% if is_exposed %}{{ r.user_display_name or r.user_upn }}{% else %}*******{% endif %}</small><br>
+                            {% if is_exposed %}
                             <a href="{{ url_for('account_firstaid', upn=r.user_upn) }}" class="small text-decoration-none">
                                 <i class="bi bi-life-preserver"></i> {{ r.user_upn }}
                             </a>
+                            {% else %}
+                            <span class="small text-muted"><i class="bi bi-life-preserver"></i> *******</span>
+                            {% endif %}
                         </td>
                         <td>
                             <small>{{ r.display_name }}</small>
                             {% if r.is_suspicious == 'true' %}<span class="badge bg-danger">Suspecte</span>{% endif %}
+                            {% if is_rh_left %}<span class="badge bg-warning text-dark">Parti / introuvable</span>{% endif %}
+                            {% if already_processed %}<span class="badge bg-success"><i class="bi bi-check-lg"></i> Traité</span>{% endif %}
                         </td>
                         <td>{% if r.is_enabled == 'true' %}<span class="badge bg-success">Oui</span>{% else %}<span class="badge bg-secondary">Non</span>{% endif %}</td>
                         <td><small>{{ r.conditions_summary or '-' }}</small></td>
                         <td><small>{{ r.actions_summary or '-' }}</small></td>
                         <td><small>{{ r.forwards_to or '-' }}</small></td>
+                        <td>
+                            {% if r.is_suspicious == 'true' and not session.get('is_superadmin') %}
+                            <button type="button" class="btn btn-sm btn-outline-success" title="Marquer comme traité"
+                                    onclick="openRuleAck('{{ r.user_upn|e }}', '{{ r.rule_id|e }}', '{{ r.display_name|e }}')">
+                                <i class="bi bi-check-circle"></i>
+                            </button>
+                            {% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -148,6 +170,61 @@
     </div>
 </div>
 {% endif %}
+
+{% if processed_rules %}
+<div class="card mt-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <div><i class="bi bi-clock-history"></i> Règles traitées (historique — {{ processed_rules|length }})</div>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
+            <table class="table table-sm table-striped mb-0">
+                <thead>
+                    <tr><th>Date</th><th>Compte</th><th>Règle</th><th>Traité par</th><th>Commentaire</th></tr>
+                </thead>
+                <tbody>
+                    {% for p in processed_rules %}
+                    <tr>
+                        <td><small class="text-muted">{{ p.processed_at|paris }}</small></td>
+                        <td><small>{{ p.user_upn }}</small></td>
+                        <td><small>{{ p.rule_display_name or p.rule_id }}</small></td>
+                        <td><small>{{ p.processed_by }}</small></td>
+                        <td><small>{{ p.comment or '—' }}</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<div class="modal fade" id="ruleAckModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-check-circle"></i> Marquer la règle comme traitée</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="small text-muted mb-2">Règle : <strong id="ack-rule-name"></strong></p>
+                <p class="small text-muted mb-2">Compte : <code id="ack-rule-upn"></code></p>
+                <input type="hidden" id="ack-upn">
+                <input type="hidden" id="ack-rule-id">
+                <div class="mb-3">
+                    <label class="form-label">Commentaire <span class="text-muted">(optionnel)</span></label>
+                    <textarea class="form-control" id="ack-comment" rows="3" placeholder="Ex : règle légitime de delegation, supprimée par l'utilisateur..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Annuler</button>
+                <button type="button" class="btn btn-success" id="ack-submit-btn" onclick="submitRuleAck()">
+                    <i class="bi bi-check-lg"></i> Confirmer
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <script>
 function filterRules() {
@@ -203,6 +280,42 @@ function pollScanStatus() {
             }
         })
         .catch(function() { scanPollTimer = setTimeout(pollScanStatus, 3000); });
+}
+
+function openRuleAck(upn, ruleId, ruleName) {
+    document.getElementById('ack-upn').value = upn;
+    document.getElementById('ack-rule-id').value = ruleId;
+    document.getElementById('ack-rule-name').textContent = ruleName;
+    document.getElementById('ack-rule-upn').textContent = upn;
+    document.getElementById('ack-comment').value = '';
+    var modal = new bootstrap.Modal(document.getElementById('ruleAckModal'));
+    modal.show();
+}
+
+function submitRuleAck() {
+    var btn = document.getElementById('ack-submit-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Enregistrement...';
+    fetch('{{ url_for("rule_ack") }}', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            user_upn: document.getElementById('ack-upn').value,
+            rule_id: document.getElementById('ack-rule-id').value,
+            rule_display_name: document.getElementById('ack-rule-name').textContent,
+            comment: document.getElementById('ack-comment').value
+        })
+    })
+    .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
+    .then(function(res) {
+        if (!res.ok || res.data.error) { throw new Error(res.data.error || 'Erreur'); }
+        window.location.reload();
+    })
+    .catch(function(err) {
+        alert(err.message || String(err));
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-check-lg"></i> Confirmer';
+    });
 }
 
 {% if running_scan %}

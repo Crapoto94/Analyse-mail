@@ -583,6 +583,21 @@ def init_db():
     )''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_tenant_mailbox_rules_scan ON tenant_mailbox_rules(scan_id)')
 
+    # Historique des regles traitees (marquees comme examinaees par un administrateur) :
+    # persiste meme si la regle disparait lors du scan suivant (utilisateur supprime,
+    # regle modifiee/supprimee). Cle unique (user_upn, rule_id) — si une meme regle
+    # reapparait, le traitement est conserve.
+    c.execute('''CREATE TABLE IF NOT EXISTS tenant_rule_processed (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_upn TEXT NOT NULL,
+        rule_id TEXT NOT NULL,
+        rule_display_name TEXT,
+        comment TEXT,
+        processed_by TEXT NOT NULL,
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_upn, rule_id)
+    )''')
+
     # Actions de remediation deja realisees par la DSI sur une boite (ex: mot de passe
     # reinitialise, MFA renforce...) : saisies manuellement, elles sont a la fois
     # affichees sur la fiche de la boite ET injectees dans le prompt d'analyse IA pour
@@ -1470,6 +1485,36 @@ def rh_studio_check_presence(email=None, q=None, nom=None, prenom=None):
     ctx.verify_mode = ssl.CERT_NONE
     with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
         return json.loads(resp.read().decode('utf-8'))
+
+
+def rh_studio_batch_check(upns):
+    """Interroge RH Studio pour chaque UPN (email) et renvoie un dict
+    {upn: {'status': 'present'|'parti'|'not_found'|'error', ...}}.
+    Silencieux : en cas d'erreur API ou de config manquante, renvoie un dict vide."""
+    if not upns:
+        return {}
+    api_url = get_config('rh_studio_url', '').rstrip('/')
+    api_key = get_config('rh_studio_api_key', '')
+    if not api_url or not api_key:
+        return {}
+    results = {}
+    for upn in upns:
+        if not upn:
+            continue
+        try:
+            resp = rh_studio_check_presence(email=upn)
+            agent = resp.get('agent')
+            if not agent:
+                results[upn] = {'status': 'not_found'}
+            else:
+                results[upn] = {'status': agent.get('status', 'unknown')}
+        except Exception:
+            results[upn] = {'status': 'error'}
+    return results
+
+
+
+
 
 
 def _graph_status_text(status_obj):
@@ -5136,6 +5181,21 @@ def view_tenant_signins():
             display_location = r['location']
         rows_with_trust.append({'row': r, 'trust': trust, 'display_location': display_location})
 
+    # Masquage des noms : les UPNs ayant au moins une connexion echouee dans la page
+    # courante sont exposes (nom visible). Les autres sont verifies dans RH Studio :
+    # s'ils sont partis ou introuvables, ils sont aussi exposes (signalent une
+    # compromission potentielle). Les super-administrateurs voient tout.
+    exposed_upns = set()
+    for item in rows_with_trust:
+        r = item['row']
+        if r['status'] != 'Success':
+            exposed_upns.add(r['user_upn'])
+    non_exposed = {item['row']['user_upn'] for item in rows_with_trust} - exposed_upns
+    rh_status = rh_studio_batch_check(non_exposed)
+    for upn, info in rh_status.items():
+        if info.get('status') in ('parti', 'not_found'):
+            exposed_upns.add(upn)
+
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     last_refresh = get_config('tenant_signins_last_fetch_at', '')
     return render_template('tenant_signins.html', rows=rows_with_trust, nb_total=nb_total, nb_all=nb_all, nb_failed=nb_failed,
@@ -5145,7 +5205,7 @@ def view_tenant_signins():
                             home_country_code=get_home_country_code(),
                             page=page, nb_pages=nb_pages, page_size=page_size,
                             q=q, status_filter=status_filter, pays_filter=pays_filter, cnx_type=cnx_type,
-                            countries=countries)
+                            countries=countries, exposed_upns=exposed_upns)
 
 
 @app.route('/connexions/settings', methods=['POST'])
@@ -5233,11 +5293,35 @@ def view_tenant_rules():
             'SELECT * FROM tenant_mailbox_rules WHERE scan_id=? ORDER BY is_suspicious DESC, user_upn ASC',
             (latest_scan['id'],)).fetchall()
     conn.close()
+
+    # Masquage des noms : seules les regles suspectes et les utilisateurs partis/
+    # introuvables dans RH Studio sont exposes. Les super-administrateurs voient tout.
+    exposed_upns = set()
+    non_suspicious_upns = set()
+    for r in rules:
+        if r['is_suspicious'] == 'true':
+            exposed_upns.add(r['user_upn'])
+        else:
+            non_suspicious_upns.add(r['user_upn'])
+    rh_status = rh_studio_batch_check(non_suspicious_upns)
+    for upn, info in rh_status.items():
+        if info.get('status') in ('parti', 'not_found'):
+            exposed_upns.add(upn)
+
+    # Historique des regles meme si elles ont disparu du scan courant
+    processed_rules = []
+    conn2 = get_db()
+    processed_rules = conn2.execute(
+        'SELECT * FROM tenant_rule_processed ORDER BY processed_at DESC LIMIT 200').fetchall()
+    conn2.close()
+
     graph_configured = bool(get_config('graph_tenant_id', '') and get_config('graph_client_id', '') and get_config('graph_client_secret', ''))
     return render_template('tenant_rules.html', rules=rules, latest_scan=latest_scan, running_scan=running_scan,
                             graph_configured=graph_configured,
                             scan_enabled=get_tenant_rules_scan_enabled(),
-                            scan_interval=get_tenant_rules_scan_interval_minutes())
+                            scan_interval=get_tenant_rules_scan_interval_minutes(),
+                            exposed_upns=exposed_upns,
+                            processed_rules=processed_rules)
 
 
 @app.route('/monitoring/rules/scan', methods=['POST'])
@@ -5285,6 +5369,40 @@ def update_tenant_rules_settings():
         pass
     flash('Paramètres enregistrés')
     return redirect(url_for('view_tenant_rules'))
+
+
+@app.route('/api/rule-ack', methods=['POST'])
+@admin_required
+def rule_ack():
+    """Marque une regle de messagerie comme « traitee » par un administrateur.
+    Historise le commentaire et l'auteur, persiste meme si la regle disparaît
+    du scan suivant (suppression, modification)."""
+    data = request.get_json(silent=True) or {}
+    user_upn = (data.get('user_upn') or '').strip()
+    rule_id = (data.get('rule_id') or '').strip()
+    rule_display_name = (data.get('rule_display_name') or '').strip()[:300]
+    comment = (data.get('comment') or '').strip()[:1000]
+    if not user_upn or not rule_id:
+        return jsonify({'error': 'user_upn et rule_id requis'}), 400
+    by = session.get('username', 'admin')
+    conn = get_db()
+    conn.execute('''INSERT INTO tenant_rule_processed
+                    (user_upn, rule_id, rule_display_name, comment, processed_by)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_upn, rule_id) DO UPDATE SET
+                        comment=excluded.comment,
+                        processed_by=excluded.processed_by,
+                        processed_at=CURRENT_TIMESTAMP,
+                        rule_display_name=excluded.rule_display_name''',
+                 (user_upn, rule_id, rule_display_name, comment, by))
+    conn.commit()
+    processed = conn.execute(
+        'SELECT * FROM tenant_rule_processed WHERE user_upn=? AND rule_id=?',
+        (user_upn, rule_id)).fetchone()
+    conn.close()
+    add_log('INFO', 'TENANT_RULES', f'Regle marquée comme traitée par {by}',
+            f'Compte: {user_upn}, règle: {rule_display_name or rule_id}, commentaire: {comment or "(aucun)"}')
+    return jsonify({'success': True, 'processed': dict(processed) if processed else None})
 
 
 @app.route('/admin/compte', methods=['GET'])
