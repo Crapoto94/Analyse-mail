@@ -7560,8 +7560,12 @@ def api_v1_monitored_mailbox_detail(mailbox_id):
 @app.route('/api/v1/boites')
 @require_api_key
 def api_v1_boites():
+    email = request.args.get('email', '').strip().lower()
     conn = get_db()
-    rows = conn.execute('SELECT * FROM boites_compromises ORDER BY created_at DESC').fetchall()
+    if email:
+        rows = conn.execute('SELECT * FROM boites_compromises WHERE lower(user_email)=? ORDER BY created_at DESC', (email,)).fetchall()
+    else:
+        rows = conn.execute('SELECT * FROM boites_compromises ORDER BY created_at DESC').fetchall()
     conn.close()
     return jsonify([{
         'id': r['id'],
@@ -7594,6 +7598,10 @@ def api_v1_boite_detail(bid):
         'risk_verdict': analysis['verdict'],
         'findings': [{'severity': f['severity'], 'title': f['title'], 'description': f['description']}
                      for f in analysis['findings']],
+        'ai_analysis': boite['ai_analysis'],
+        'ai_analysis_model': boite['ai_analysis_model'],
+        'ai_analysis_provider': boite['ai_analysis_provider'],
+        'ai_analysis_at': boite['ai_analysis_at'],
     })
 
 
