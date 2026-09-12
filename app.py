@@ -7605,6 +7605,62 @@ def api_v1_boite_detail(bid):
     })
 
 
+@app.route('/api/v1/boites/<int:bid>/ai-analyze', methods=['POST'])
+@require_api_key
+def api_v1_boite_ai_analyze(bid):
+    """Lance (ou relance) l'analyse IA d'une boîte compromise pour une application
+    externe (ex: PGC) qui n'a pas de session utilisateur et ne peut donc pas utiliser
+    le bouton "Analyser avec l'IA" de l'interface ni /jobs/<job_id>/poll (protégés par
+    connexion, pas par clé API — voir le before_request qui exempte uniquement
+    /api/v1/*). Même moteur que ai_analyze_start, suivi via /api/v1/jobs/<job_id>.
+    Sans cet endpoint, une application externe ne pouvait QUE lire ai_analysis s'il
+    avait déjà été généré depuis l'interface — jamais le déclencher elle-même, ce qui
+    le laissait indéfiniment vide côté intégrations tierces."""
+    conn = get_db()
+    boite = conn.execute('SELECT user_email FROM boites_compromises WHERE id=?', (bid,)).fetchone()
+    conn.close()
+    if not boite:
+        return jsonify({'error': 'Boîte non trouvée'}), 404
+    if not any(m['active'] for m in get_all_ai_models()):
+        return jsonify({'error': "Aucun fournisseur IA configuré (Groq, NVIDIA ou Ollama) — demandez à un administrateur de le renseigner dans Configuration."}), 400
+
+    job_id = _job_create(['ai'])
+
+    def worker():
+        _job_step(job_id, 'ai', 'running')
+        try:
+            result_text, provider, model = run_ai_analysis(bid)
+            now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            conn2 = get_db()
+            conn2.execute('''UPDATE boites_compromises SET
+                ai_analysis=?, ai_analysis_at=?, ai_analysis_model=?, ai_analysis_provider=? WHERE id=?''',
+                          (result_text, now_iso, model, provider, bid))
+            conn2.commit()
+            conn2.close()
+            add_log('INFO', 'IA', f"Analyse IA (API externe) effectuée pour {boite['user_email']}", f'Fournisseur : {provider}, modèle : {model}', bid)
+            _job_step(job_id, 'ai', 'done')
+            _job_finish(job_id, result={'ok': True})
+        except Exception as e:
+            add_log('ERROR', 'IA', f"Échec de l'analyse IA (API externe) pour {boite['user_email']}", str(e), bid)
+            _job_step(job_id, 'ai', 'error')
+            _job_finish(job_id, error=str(e))
+
+    threading.Thread(target=worker, daemon=True, name=f'api-ai-analyze-{bid}').start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/api/v1/jobs/<job_id>')
+@require_api_key
+def api_v1_job_status(job_id):
+    """Etat d'un job en arrière-plan déclenché via l'API externe (ex:
+    /api/v1/boites/<bid>/ai-analyze) — équivalent de /jobs/<job_id>/poll mais
+    protégé par clé API au lieu d'une session utilisateur."""
+    job = _job_get(job_id)
+    if not job:
+        return jsonify({'error': 'not_found'}), 404
+    return jsonify({'status': job['status'], 'steps': job['steps'], 'order': job['order'], 'error': job['error']})
+
+
 @app.route('/api/v1/ip/<ip>')
 @require_api_key
 def api_v1_ip_reputation(ip):
