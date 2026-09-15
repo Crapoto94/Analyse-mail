@@ -2714,17 +2714,44 @@ def global_search():
 DASHBOARD_MAX_SCORED_BOITES = 100
 
 # Fenetre glissante sur laquelle sont calculees les statistiques de connexions du tableau
-# de bord (echecs, score de confiance moyen, top utilisateurs en echec...).
+# de bord (echecs, score de confiance moyen, top utilisateurs en echec...). Valeur par
+# defaut de la page d'accueil ; l'API externe peut demander une autre fenetre via
+# ?minutes= (voir DASHBOARD_ALLOWED_WINDOW_MINUTES et api_v1_kpis).
 DASHBOARD_SIGNINS_WINDOW_HOURS = 24
 
+# Fenetres (en minutes) proposees par les selecteurs de duree des tableaux de bord externes.
+# Liste blanche : evite qu'un appelant demande une fenetre arbitrairement large (cout du
+# recalcul par connexion).
+DASHBOARD_ALLOWED_WINDOW_MINUTES = (1, 10, 60, 240, 480, 1440, 2880, 10080)
 
-def compute_dashboard_kpis():
+
+def parse_window_minutes(raw):
+    """Convertit un parametre de fenetre en minutes. Retourne (minutes, erreur) : minutes
+    vaut None si aucun parametre, ou un entier de la liste blanche ; erreur non nulle si la
+    valeur fournie n'est pas autorisee."""
+    if raw is None or raw == '':
+        return None, None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None, 'parametre minutes invalide'
+    if value not in DASHBOARD_ALLOWED_WINDOW_MINUTES:
+        return None, 'parametre minutes non autorise'
+    return value, None
+
+
+def compute_dashboard_kpis(window_minutes=None):
     """Calcule tous les KPI du tableau de bord : incidents (tendance, signaux detectes, IPs
     partagees), surveillance automatisee (monitored_mailboxes) et monitoring connexions
     (tenant_signins). Point d'entree UNIQUE pour cette logique — utilise a la fois par la
     page d'accueil (rendu HTML) et par l'API externe (/api/v1/kpis, voir api_v1_kpis), pour
     garantir que les deux affichent exactement les memes chiffres. Ne retourne que des
-    types JSON-serialisables (dict/list/str/int/float/None), pas de sqlite3.Row."""
+    types JSON-serialisables (dict/list/str/int/float/None), pas de sqlite3.Row.
+
+    window_minutes : fenetre glissante des statistiques de connexions, en minutes. None
+    utilise la valeur par defaut (DASHBOARD_SIGNINS_WINDOW_HOURS)."""
+    if window_minutes is None:
+        window_minutes = DASHBOARD_SIGNINS_WINDOW_HOURS * 60
     conn = get_db()
 
     incidents_by_month = [dict(r) for r in conn.execute('''
@@ -2791,7 +2818,7 @@ def compute_dashboard_kpis():
     # de 24h. On calcule donc le seuil dans le meme format que les donnees stockees.
     from datetime import timedelta
     window_cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
-                     - timedelta(hours=DASHBOARD_SIGNINS_WINDOW_HOURS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                     - timedelta(minutes=window_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
     nb_signins_window = conn.execute(
         'SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= ?', (window_cutoff,)).fetchone()['c']
     nb_signins_failed_window = conn.execute(
@@ -2921,7 +2948,9 @@ def compute_dashboard_kpis():
         'nb_signins_window': nb_signins_window, 'nb_signins_failed_window': nb_signins_failed_window,
         'signin_failure_rate': signin_failure_rate, 'top_failed_users': top_failed_users,
         'nb_signins_foreign': nb_signins_foreign, 'avg_trust_score': avg_trust_score,
-        'nb_low_trust': nb_low_trust, 'signins_window_hours': DASHBOARD_SIGNINS_WINDOW_HOURS,
+        'nb_low_trust': nb_low_trust,
+        'signins_window_hours': (window_minutes // 60) if window_minutes % 60 == 0 else round(window_minutes / 60, 2),
+        'signins_window_minutes': window_minutes,
         'home_country_code': home_country,
         'connections_geo_world': connections_geo_world, 'connections_geo_home': connections_geo_home,
     }
@@ -7703,8 +7732,13 @@ def api_v1_ip_reputation(ip):
 @require_api_key
 def api_v1_kpis():
     """KPI du tableau de bord pour les applications externes — memes chiffres que la page
-    d'accueil (voir compute_dashboard_kpis, source unique partagee par les deux)."""
-    kpis = compute_dashboard_kpis()
+    d'accueil (voir compute_dashboard_kpis, source unique partagee par les deux). Le
+    parametre optionnel ?minutes= permet de choisir la fenetre glissante des statistiques
+    de connexions (1, 10, 60, 240, 480, 1440, 2880 ou 10080 minutes)."""
+    window_minutes, error = parse_window_minutes(request.args.get('minutes'))
+    if error:
+        return jsonify({'error': error, 'allowed_minutes': list(DASHBOARD_ALLOWED_WINDOW_MINUTES)}), 400
+    kpis = compute_dashboard_kpis(window_minutes=window_minutes)
     kpis['generated_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     return jsonify(kpis)
 
@@ -7831,6 +7865,9 @@ def api_v1_openapi():
                 'compromise_likely': {'type': 'integer'}, 'signals_to_check': {'type': 'integer'},
                 'no_strong_signal': {'type': 'integer'}, 'not_scanned': {'type': 'integer'}}},
             'signins_window_hours': {'type': 'integer'},
+            'signins_window_minutes': {'type': 'integer', 'description': (
+                "Fenetre glissante effective (en minutes) des statistiques de connexions. "
+                "Par defaut 1440 ; modifiable via le parametre ?minutes=.")},
             'nb_signins_window': {'type': 'integer'},
             'nb_signins_failed_window': {'type': 'integer'},
             'signin_failure_rate': {'type': 'integer', 'description': 'Pourcentage (0-100).'},
@@ -7942,9 +7979,16 @@ def api_v1_openapi():
             '/kpis': {'get': {
                 'summary': "KPI du tableau de bord (incidents, surveillance, connexions)",
                 'operationId': 'getKpis',
+                'parameters': [{
+                    'name': 'minutes', 'in': 'query', 'required': False,
+                    'description': 'Fenetre glissante des statistiques de connexions, en minutes.',
+                    'schema': {'type': 'integer', 'enum': list(DASHBOARD_ALLOWED_WINDOW_MINUTES),
+                               'default': DASHBOARD_SIGNINS_WINDOW_HOURS * 60},
+                }],
                 'responses': {
                     '200': {'description': 'OK', 'content': {'application/json': {'schema': {
                         '$ref': '#/components/schemas/Kpis'}}}},
+                    '400': {'description': 'Parametre minutes invalide ou non autorise'},
                     '401': {'$ref': '#/components/responses/Unauthorized'},
                 },
             }},

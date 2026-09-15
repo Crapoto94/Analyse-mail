@@ -30,6 +30,25 @@ def test_kpis_endpoint_requires_api_key(client):
     assert r.status_code == 401
 
 
+def test_kpis_window_minutes_param(client, app_module):
+    """La fenetre de connexions est selectionnable via ?minutes= (liste blanche), et la
+    valeur par defaut reste celle de la page d'accueil (24h)."""
+    login_as_default_admin(client)
+    r = client.post('/admin/api-keys/add', data={'name': 'Test', 'duration_days': ''}, follow_redirects=True)
+    raw_key = _extract_raw_key(r.get_data(as_text=True))
+
+    default = client.get('/api/v1/kpis', headers={'X-API-Key': raw_key})
+    assert default.status_code == 200
+    assert default.get_json()['signins_window_minutes'] == app_module.DASHBOARD_SIGNINS_WINDOW_HOURS * 60
+
+    chosen = client.get('/api/v1/kpis?minutes=60', headers={'X-API-Key': raw_key})
+    assert chosen.status_code == 200
+    assert chosen.get_json()['signins_window_minutes'] == 60
+
+    rejected = client.get('/api/v1/kpis?minutes=7', headers={'X-API-Key': raw_key})
+    assert rejected.status_code == 400
+
+
 def test_kpis_endpoint_matches_dashboard_numbers(client, app_module):
     login_as_default_admin(client)
     client.post('/boite/add', data={
