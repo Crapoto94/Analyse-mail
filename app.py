@@ -7798,6 +7798,9 @@ def api_v1_openapi():
             'trust_score': {'type': 'integer', 'minimum': 0, 'maximum': 100},
             'is_suspicious': {'type': 'boolean'},
             'lat': {'type': 'number'}, 'lon': {'type': 'number'},
+            'is_acknowledged': {'type': 'boolean', 'description': 'Lieu suspect déjà acquitté par un administrateur.'},
+            'acknowledged_by': {'type': 'string', 'nullable': True, 'description': 'Compte ayant acquitté (si is_acknowledged).'},
+            'acknowledged_at': {'type': 'string', 'format': 'date-time', 'nullable': True, 'description': 'Horodatage UTC de l\'acquittement.'},
         }
     }
 
