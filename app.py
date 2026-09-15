@@ -2784,21 +2784,29 @@ def compute_dashboard_kpis():
     ''').fetchone()['c']
 
     # --- KPI monitoring connexions (tenant_signins), fenetre glissante ------------------
-    window_clause = f"datetime('now','-{DASHBOARD_SIGNINS_WINDOW_HOURS} hour')"
+    # date_utc est stocke au format ISO 8601 avec 'T' et 'Z' final (voir refresh_tenant_signins),
+    # alors que datetime('now', ...) de SQLite produit 'YYYY-MM-DD HH:MM:SS' (espace, sans 'Z').
+    # Compares comme du texte, les deux formats divergent des le 11e caractere ('T' > ' '), donc
+    # le filtre laissait passer TOUTE la journee du seuil : la fenetre etait de 24 a 48h au lieu
+    # de 24h. On calcule donc le seuil dans le meme format que les donnees stockees.
+    from datetime import timedelta
+    window_cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                     - timedelta(hours=DASHBOARD_SIGNINS_WINDOW_HOURS)).strftime('%Y-%m-%dT%H:%M:%SZ')
     nb_signins_window = conn.execute(
-        f"SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= {window_clause}").fetchone()['c']
+        'SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= ?', (window_cutoff,)).fetchone()['c']
     nb_signins_failed_window = conn.execute(
-        f"SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= {window_clause} AND status != 'Success'"
-    ).fetchone()['c']
+        "SELECT COUNT(*) as c FROM tenant_signins WHERE date_utc >= ? AND status != 'Success'",
+        (window_cutoff,)).fetchone()['c']
     signin_failure_rate = round(100 * nb_signins_failed_window / nb_signins_window) if nb_signins_window else 0
-    top_failed_users = [dict(r) for r in conn.execute(f'''
+    top_failed_users = [dict(r) for r in conn.execute('''
         SELECT COALESCE(NULLIF(user_upn, ''), '(inconnu)') as user_upn, COUNT(*) as c
-        FROM tenant_signins WHERE date_utc >= {window_clause} AND status != 'Success'
-        GROUP BY user_upn ORDER BY c DESC LIMIT 5''').fetchall()]
+        FROM tenant_signins WHERE date_utc >= ? AND status != 'Success'
+        GROUP BY user_upn ORDER BY c DESC LIMIT 5''', (window_cutoff,)).fetchall()]
 
     home_country = get_home_country_code()
     signin_window_rows = conn.execute(
-        f"SELECT ip_address, country, city, lat, lon, status FROM tenant_signins WHERE date_utc >= {window_clause}").fetchall()
+        'SELECT ip_address, country, city, lat, lon, status FROM tenant_signins WHERE date_utc >= ?',
+        (window_cutoff,)).fetchall()
     acks = {((r['city'] or '').lower(), (r['country_code'] or '').upper()): dict(r) for r in
             conn.execute('SELECT city, country_code, acknowledged_by, acknowledged_at FROM signin_acks').fetchall()}
     conn.close()
@@ -2815,29 +2823,44 @@ def compute_dashboard_kpis():
     # confiance en priorite, puis ipwho.is en cache local) seulement si Graph n'a pas
     # fourni de coordonnees pour cet evenement.
     geo_buckets = {}
+    # Cache par IP : get_ip_reputation interroge AbuseIPDB et get_ip_info peut faire un appel
+    # reseau (ipwho.is, DNS inverse, timeouts de plusieurs secondes) ; sans cache ces appels
+    # etaient refaits pour CHAQUE ligne de connexion (souvent plusieurs milliers) a chaque
+    # affichage du tableau de bord, d'ou une page extremement lente. Idem pour get_trusted_ip
+    # et get_ip_geo (une requete SQLite chacune).
+    ip_reputation_cache = {}
+    trusted_ip_cache = {}
+    ip_geo_cache = {}
     for r in signin_window_rows:
+        ip = r['ip_address']
         row_country = (r['country'] or '').strip().upper()
         if row_country != home_country:
             nb_signins_foreign += 1
-        try:
-            ip_payload = ip_reputation_payload(r['ip_address'])
-        except Exception:
-            ip_payload = None
-        row_trust = compute_connection_trust_score(ip_payload, r['country'])
+        if ip not in ip_reputation_cache:
+            try:
+                ip_reputation_cache[ip] = ip_reputation_payload(ip)
+            except Exception:
+                ip_reputation_cache[ip] = None
+        ip_payload = ip_reputation_cache[ip]
+        row_trust = compute_connection_trust_score(ip_payload, r['country'], home_country)
         trust_scores.append(row_trust)
 
         city, country, country_code, lat, lon = r['city'], None, row_country, r['lat'], r['lon']
         # Une IP de confiance (localisation declaree manuellement) prime toujours, meme sur
         # les coordonnees Graph — c'est justement le cas ou l'admin sait mieux que quiconque.
-        trusted = get_trusted_ip(r['ip_address'])
+        if ip not in trusted_ip_cache:
+            trusted_ip_cache[ip] = get_trusted_ip(ip)
+        trusted = trusted_ip_cache[ip]
         if trusted and trusted.get('lat') is not None and trusted.get('lon') is not None:
             lat, lon = trusted['lat'], trusted['lon']
             city = trusted.get('city') or city
         elif lat is None or lon is None:
-            try:
-                geo = get_ip_geo(r['ip_address'])
-            except Exception:
-                geo = None
+            if ip not in ip_geo_cache:
+                try:
+                    ip_geo_cache[ip] = get_ip_geo(ip)
+                except Exception:
+                    ip_geo_cache[ip] = None
+            geo = ip_geo_cache[ip]
             if geo and geo.get('lat') is not None and geo.get('lon') is not None:
                 city, lat, lon = geo.get('city'), geo['lat'], geo['lon']
                 country_code = (geo.get('country_code') or country_code or '').upper()
@@ -4699,7 +4722,7 @@ def get_home_country_code():
     return raw if len(raw) == 2 else HOME_COUNTRY_CODE_DEFAULT
 
 
-def compute_connection_trust_score(ip_payload, country_code):
+def compute_connection_trust_score(ip_payload, country_code, home=None):
     """Score de confiance 0-100 pour une connexion, combinant trois signaux :
     1. IP de confiance declaree (Ville...) : 100%, point final — c'est une IP connue.
     2. Proximite geographique du pays de connexion par rapport au pays de reference
@@ -4707,12 +4730,14 @@ def compute_connection_trust_score(ip_payload, country_code):
     3. Reputation de l'IP (VPN/proxy/Tor detecte, score d'abus AbuseIPDB) : penalise le
        score de base determine par la geographie.
     `ip_payload` est le dict retourne par ip_reputation_payload (peut etre None si la
-    reputation n'a pas pu etre determinee — dans ce cas, seule la geographie compte)."""
+    reputation n'a pas pu etre determinee — dans ce cas, seule la geographie compte).
+    `home` permet de fournir le pays de reference deja resolu (evite une requete de
+    configuration par appel quand on calcule le score en boucle)."""
     if ip_payload and ip_payload.get('is_trusted'):
         return 100
 
     cc = (country_code or '').strip().upper()
-    home = get_home_country_code()
+    home = home or get_home_country_code()
     if cc and cc == home:
         score = 90
     elif cc in EUROPE_COUNTRY_CODES:

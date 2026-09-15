@@ -88,6 +88,36 @@ def test_connections_geo_groups_by_city_and_flags_suspicious(app_module, monkeyp
     assert 'Nowhere City' not in home_cities
 
 
+def test_dashboard_window_excludes_same_day_before_cutoff(app_module):
+    """Regression : la fenetre glissante doit comparer date_utc au MEME format que celui
+    stocke (ISO, 'T'/'Z'). Avant, le seuil etait produit par datetime('now', ...) au format
+    'YYYY-MM-DD HH:MM:SS' (espace, sans 'Z') ; compares comme du texte, les deux formats
+    divergent au 11e caractere ('T' > ' ') et une connexion plus vieille que 24h mais tombee
+    le meme jour calendaire que le seuil etait incluse a tort (carte passee de 24 a 48h)."""
+    from datetime import datetime, timezone, timedelta
+    conn = app_module.get_db()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff = now - timedelta(hours=app_module.DASHBOARD_SIGNINS_WINDOW_HOURS)
+    # Une seconde avant le seuil : si le seuil n'est pas exactement minuit, c'est le meme
+    # jour calendaire — exactement le cas que l'ancien format laissait passer.
+    just_before_cutoff = (cutoff - timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    recent = (now - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    conn.execute("INSERT INTO ip_info (ip, country, country_code, city, lat, lon) VALUES "
+                 "('203.0.113.5', 'France', 'FR', 'Testville', 48.0, 2.0)")
+    conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, country, status, fetched_at) "
+                 "VALUES ('win-old', ?, '203.0.113.5', 'FR', 'Success', ?)", (just_before_cutoff, just_before_cutoff))
+    conn.execute("INSERT INTO tenant_signins (request_id, date_utc, ip_address, country, status, fetched_at) "
+                 "VALUES ('win-new', ?, '203.0.113.5', 'FR', 'Success', ?)", (recent, recent))
+    conn.commit()
+    conn.close()
+
+    kpis = app_module.compute_dashboard_kpis()
+    assert kpis['nb_signins_window'] == 1
+    by_city = {p['city']: p for p in kpis['connections_geo_world']}
+    assert by_city['Testville']['count'] == 1
+
+
 def test_signin_ack_records_who_acknowledged(app_module, client):
     """Acquittement : un lieu suspect "à examiner" peut etre acquitte par un admin ; la
     route enregistre qui a valide, le point passe a is_acknowledged (rouge fixe reduit,
