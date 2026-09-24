@@ -2956,6 +2956,88 @@ def compute_dashboard_kpis(window_minutes=None):
     }
 
 
+# Liste "dernières connexions en erreur" exposée par l'API externe : fenêtre par défaut et
+# nombre maximum de lignes renvoyées (borné pour rester léger).
+API_FAILED_SIGNINS_DEFAULT_MINUTES = DASHBOARD_SIGNINS_WINDOW_HOURS * 60
+API_FAILED_SIGNINS_MAX_LIMIT = 200
+
+
+def list_failed_signins(window_minutes=None, limit=50):
+    """Dernières connexions en échec de tout le tenant (status != 'Success'), les plus
+    récentes d'abord, avec le maximum de détail : utilisateur, IP, localisation, application,
+    code d'erreur, raison de l'échec, résultat MFA, réputation IP et score de confiance."""
+    from datetime import timedelta
+    if window_minutes is None:
+        window_minutes = API_FAILED_SIGNINS_DEFAULT_MINUTES
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, API_FAILED_SIGNINS_MAX_LIMIT))
+
+    cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+              - timedelta(minutes=window_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    home = get_home_country_code()
+
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT date_utc, user_upn, user_display_name, ip_address, location, city, country,
+               status, error_code, failure_reason, application, client_app, mfa_result, flagged
+        FROM tenant_signins
+        WHERE date_utc >= ? AND status != 'Success'
+        ORDER BY date_utc DESC LIMIT ?''', (cutoff, limit)).fetchall()
+    conn.close()
+
+    signins = []
+    for r in rows:
+        try:
+            ip_payload = ip_reputation_payload(r['ip_address'])
+        except Exception:
+            ip_payload = None
+        reputation = None
+        if ip_payload:
+            reputation = {
+                'level': ip_payload.get('level'),
+                'level_label': ip_payload.get('level_label'),
+                'isp': ip_payload.get('isp'),
+                'org': ip_payload.get('org'),
+                'usage_type': ip_payload.get('usage_type'),
+                'is_vpn': ip_payload.get('is_vpn'),
+                'is_datacenter': ip_payload.get('is_datacenter'),
+                'is_trusted': ip_payload.get('is_trusted'),
+                'abuse_score': ip_payload.get('abuse_score'),
+                'country': ip_payload.get('country'),
+                'city': ip_payload.get('city'),
+            }
+        country = (r['country'] or '').strip()
+        signins.append({
+            'date_utc': r['date_utc'],
+            'user_upn': r['user_upn'] or '',
+            'user_display_name': r['user_display_name'] or '',
+            'ip_address': r['ip_address'] or '',
+            'location': r['location'] or '',
+            'city': r['city'] or '',
+            'country': country,
+            'is_foreign': bool(country) and country.upper() != home,
+            'status': r['status'] or '',
+            'error_code': r['error_code'] or '',
+            'failure_reason': r['failure_reason'] or '',
+            'application': r['application'] or '',
+            'client_app': r['client_app'] or '',
+            'mfa_result': r['mfa_result'] or '',
+            'flagged': r['flagged'] or '',
+            'trust_score': compute_connection_trust_score(ip_payload, country, home),
+            'ip_reputation': reputation,
+        })
+
+    return {
+        'signins_window_minutes': window_minutes,
+        'home_country_code': home,
+        'count': len(signins),
+        'failed_signins': signins,
+    }
+
+
 @app.route('/')
 def index():
     """Page d'accueil de l'application (pour tout le monde, pas seulement les admins) :
@@ -7703,16 +7785,68 @@ def api_v1_boite_ai_analyze(bid):
     return jsonify({'job_id': job_id})
 
 
+@app.route('/api/v1/scan', methods=['POST'])
+@require_api_key
+def api_v1_scan():
+    """Lance un scan rapide A LA DEMANDE d'une boite mail (analyse ephemere via
+    Microsoft Graph sur les N derniers jours, rien n'est ecrit en base) pour une
+    application externe (ex: AppDSI « Analyse mail ») qui veut connaitre le score de
+    risque d'un agent sans passer par l'interface.
+
+    Le scan pouvant durer plusieurs dizaines de secondes (plusieurs appels Graph), il
+    tourne en tache de fond : la reponse immediate contient un `job_id`, dont le
+    resultat (score, verdict, signaux) se recupere via /api/v1/jobs/<job_id> une fois
+    le statut passe a 'done'."""
+    payload = request.get_json(silent=True) or request.form or {}
+    email = (payload.get('email') or '').strip()
+    if not email or '@' not in email:
+        return jsonify({'error': 'Adresse email invalide pour le scan'}), 400
+    try:
+        days = max(1, min(int(payload.get('days', 7)), 90))
+    except (TypeError, ValueError):
+        days = 7
+
+    job_id = _job_create(['signins', 'audit', 'rules'])
+
+    def worker():
+        try:
+            result = quick_scan_mailbox(email, days, on_step=lambda s, st: _job_step(job_id, s, st))
+            add_log('INFO', 'GRAPH', f'Scan rapide (API externe) effectué pour {email}',
+                    f"score {result['score']}/10, verdict {result['verdict']}, {len(result['findings'])} signal(aux)")
+            payload_out = {
+                'email': email,
+                'score': result['score'],
+                'verdict': result['verdict'],
+                'verdict_label': VERDICT_LABELS.get(result['verdict']),
+                'findings': [{'severity': f['severity'], 'title': f['title'], 'description': f['description']}
+                             for f in result['findings']],
+                'nb_signins': result.get('nb_signins'),
+                'nb_audit': result.get('nb_audit'),
+                'nb_rules': result.get('nb_rules'),
+                'days': result.get('days'),
+                'errors': result.get('errors', []),
+            }
+            _job_finish(job_id, result=payload_out)
+        except Exception as e:
+            add_log('ERROR', 'GRAPH', f'Échec du scan rapide (API externe) pour {email}', str(e))
+            _job_finish(job_id, error=f"Erreur lors du scan via Microsoft Graph : {e}")
+
+    threading.Thread(target=worker, daemon=True, name=f'api-scan-{job_id[:8]}').start()
+    return jsonify({'job_id': job_id}), 202
+
+
 @app.route('/api/v1/jobs/<job_id>')
 @require_api_key
 def api_v1_job_status(job_id):
     """Etat d'un job en arrière-plan déclenché via l'API externe (ex:
-    /api/v1/boites/<bid>/ai-analyze) — équivalent de /jobs/<job_id>/poll mais
-    protégé par clé API au lieu d'une session utilisateur."""
+    /api/v1/boites/<bid>/ai-analyze ou /api/v1/scan) — équivalent de
+    /jobs/<job_id>/poll mais protégé par clé API au lieu d'une session utilisateur.
+    Inclut `result` (score/verdict/signaux) quand le job est terminé."""
     job = _job_get(job_id)
     if not job:
         return jsonify({'error': 'not_found'}), 404
-    return jsonify({'status': job['status'], 'steps': job['steps'], 'order': job['order'], 'error': job['error']})
+    return jsonify({'status': job['status'], 'steps': job['steps'], 'order': job['order'],
+                    'error': job['error'], 'result': job['result']})
 
 
 @app.route('/api/v1/ip/<ip>')
@@ -7741,6 +7875,23 @@ def api_v1_kpis():
     kpis = compute_dashboard_kpis(window_minutes=window_minutes)
     kpis['generated_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     return jsonify(kpis)
+
+
+@app.route('/api/v1/signins/failed')
+@require_api_key
+def api_v1_failed_signins():
+    """Dernières connexions en échec du tenant, avec le détail complet (utilisateur, IP,
+    localisation, application, code/raison d'échec, résultat MFA, réputation IP). Paramètres
+    optionnels ?minutes= (fenêtre, liste blanche) et ?limit= (nombre de lignes)."""
+    window_minutes, error = parse_window_minutes(request.args.get('minutes'))
+    if error:
+        return jsonify({'error': error, 'allowed_minutes': list(DASHBOARD_ALLOWED_WINDOW_MINUTES)}), 400
+    try:
+        limit = int(request.args.get('limit', 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, API_FAILED_SIGNINS_MAX_LIMIT))
+    return jsonify(list_failed_signins(window_minutes=window_minutes, limit=limit))
 
 
 @app.route('/api/v1/openapi.json')
@@ -7838,10 +7989,46 @@ def api_v1_openapi():
         }
     }
 
+    failed_signin_schema = {
+        'type': 'object',
+        'description': "Connexion en échec du tenant, avec le détail complet des signaux disponibles.",
+        'properties': {
+            'date_utc': {'type': 'string', 'format': 'date-time'},
+            'user_upn': {'type': 'string'}, 'user_display_name': {'type': 'string'},
+            'ip_address': {'type': 'string'},
+            'location': {'type': 'string'}, 'city': {'type': 'string'}, 'country': {'type': 'string'},
+            'is_foreign': {'type': 'boolean', 'description': 'Connexion hors du pays de référence.'},
+            'status': {'type': 'string'}, 'error_code': {'type': 'string'},
+            'failure_reason': {'type': 'string', 'description': "Motif d'échec fourni par Microsoft Graph."},
+            'application': {'type': 'string'}, 'client_app': {'type': 'string'},
+            'mfa_result': {'type': 'string'},
+            'flagged': {'type': 'string'},
+            'trust_score': {'type': 'integer', 'minimum': 0, 'maximum': 100},
+            'ip_reputation': {'type': 'object', 'nullable': True, 'description': 'Réputation IP résumée (ISP, type d\'usage, VPN, datacenter, score d\'abus).'},
+        }
+    }
+
+    scan_result_schema = {
+        'type': 'object',
+        'description': "Resultat d'un scan rapide a la demande (analyse ephemere, rien n'est ecrit en base).",
+        'properties': {
+            'email': {'type': 'string', 'format': 'email'},
+            'score': {'type': 'integer', 'minimum': 0, 'maximum': 10},
+            'verdict': {'type': 'string', 'enum': verdict_enum},
+            'verdict_label': {'type': 'string'},
+            'findings': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'severity': {'type': 'string', 'enum': ['low', 'medium', 'high', 'critical']},
+                'title': {'type': 'string'}, 'description': {'type': 'string'}}}},
+            'nb_signins': {'type': 'integer'}, 'nb_audit': {'type': 'integer'}, 'nb_rules': {'type': 'integer'},
+            'days': {'type': 'integer'},
+            'errors': {'type': 'array', 'items': {'type': 'string'},
+                       'description': "Sources Graph non lues (le score reste calcule sur les autres)."},
+        }
+    }
+
     kpis_schema = {
         'type': 'object',
-        'description': "Memes chiffres que la page d'accueil de l'application (tableau de bord).",
-        'properties': {
+        'description': "Memes chiffres que la page d'accueil de l'application (tableau de bord).",        'properties': {
             'nb_boites_total': {'type': 'integer', 'description': 'Nombre total d\'incidents confirmés.'},
             'incidents_by_month': {'type': 'array', 'items': {'type': 'object', 'properties': {
                 'month': {'type': 'string', 'example': '2026-01'}, 'c': {'type': 'integer'}}}},
@@ -7908,8 +8095,10 @@ def api_v1_openapi():
                 'Boite': boite_schema,
                 'BoiteDetail': boite_detail_schema,
                 'IpReputation': ip_reputation_schema,
+                'ScanResult': scan_result_schema,
                 'Kpis': kpis_schema,
                 'GeoPoint': geo_point_schema,
+                'FailedSignin': failed_signin_schema,
             },
             'responses': {
                 'Unauthorized': error_response,
@@ -7965,6 +8154,25 @@ def api_v1_openapi():
                     '404': {'description': 'Non trouvée'},
                 },
             }},
+            '/scan': {'post': {
+                'summary': "Lance un scan rapide à la demande d'une boîte mail (score de risque)",
+                'operationId': 'scanMailbox',
+                'description': ("Analyse éphémère via Microsoft Graph sur les N derniers jours (rien n'est "
+                                "écrit en base). Le scan tourne en tâche de fond : la réponse contient un "
+                                "`job_id` dont le résultat se récupère via GET /api/v1/jobs/{job_id} "
+                                "(statut `done` → champ `result`)."),
+                'requestBody': {'required': True, 'content': {'application/json': {'schema': {
+                    'type': 'object', 'required': ['email'], 'properties': {
+                        'email': {'type': 'string', 'format': 'email'},
+                        'days': {'type': 'integer', 'minimum': 1, 'maximum': 90, 'default': 7},
+                    }}}}},
+                'responses': {
+                    '202': {'description': 'Scan lancé', 'content': {'application/json': {'schema': {
+                        'type': 'object', 'properties': {'job_id': {'type': 'string'}}}}}},
+                    '400': {'description': 'Adresse email invalide'},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                },
+            }},
             '/ip/{ip}': {'get': {
                 'summary': "Réputation d'une IP (score d'abus, type d'usage, géolocalisation...)",
                 'operationId': 'getIpReputation',
@@ -7988,6 +8196,36 @@ def api_v1_openapi():
                 'responses': {
                     '200': {'description': 'OK', 'content': {'application/json': {'schema': {
                         '$ref': '#/components/schemas/Kpis'}}}},
+                    '400': {'description': 'Parametre minutes invalide ou non autorise'},
+                    '401': {'$ref': '#/components/responses/Unauthorized'},
+                },
+            }},
+            '/signins/failed': {'get': {
+                'summary': "Dernières connexions en échec du tenant (utilisateur, IP, localisation, motif)",
+                'operationId': 'getFailedSignins',
+                'parameters': [
+                    {
+                        'name': 'minutes', 'in': 'query', 'required': False,
+                        'description': 'Fenetre glissante, en minutes.',
+                        'schema': {'type': 'integer', 'enum': list(DASHBOARD_ALLOWED_WINDOW_MINUTES),
+                                   'default': DASHBOARD_SIGNINS_WINDOW_HOURS * 60},
+                    },
+                    {
+                        'name': 'limit', 'in': 'query', 'required': False,
+                        'description': 'Nombre maximum de lignes renvoyées.',
+                        'schema': {'type': 'integer', 'minimum': 1, 'maximum': API_FAILED_SIGNINS_MAX_LIMIT,
+                                   'default': 50},
+                    },
+                ],
+                'responses': {
+                    '200': {'description': 'OK', 'content': {'application/json': {'schema': {
+                        'type': 'object', 'properties': {
+                            'signins_window_minutes': {'type': 'integer'},
+                            'home_country_code': {'type': 'string'},
+                            'count': {'type': 'integer'},
+                            'failed_signins': {'type': 'array', 'items': {
+                                '$ref': '#/components/schemas/FailedSignin'}},
+                        }}}}},
                     '400': {'description': 'Parametre minutes invalide ou non autorise'},
                     '401': {'$ref': '#/components/responses/Unauthorized'},
                 },
